@@ -1,0 +1,19 @@
+[workspace]
+resolver = "3"
+members = ["crates/lnconv-core", "crates/lnconv-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+lnconv-core = { path = "crates/lnconv-core" }
+nexosim = "1.0"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+rand = "0.9"
+rand_chacha = "0.9"
+rustworkx-core = "0.17"

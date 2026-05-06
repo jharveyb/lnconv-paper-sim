@@ -1,0 +1,21 @@
+seed = 1
+
+[topology]
+kind = "k_regular"
+n = 20000
+k = 16
+
+[latency]
+dist = "constant"
+ms = 100
+
+[algo]
+kind = "flooding"
+
+[event]
+kind = "one_shot_single"
+node = 0
+
+[run]
+duration_seconds = 300
+mailbox_capacity = 2048

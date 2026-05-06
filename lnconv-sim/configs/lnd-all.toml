@@ -1,0 +1,23 @@
+seed = 1
+
+[topology]
+kind = "k_regular"
+n = 200
+k = 8
+
+[latency]
+dist = "constant"
+ms = 100
+
+[algo]
+kind = "lnd"
+stagger_ms = 1000
+trickle_ms = 100
+min_batch_size = 10
+
+[event]
+kind = "one_shot_all"
+
+[run]
+duration_seconds = 600
+mailbox_capacity = 4096

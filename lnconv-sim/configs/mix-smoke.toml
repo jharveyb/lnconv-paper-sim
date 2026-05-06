@@ -1,0 +1,36 @@
+# Mixed population: 70% LND-style, 30% c-lightning-style.
+seed = 1
+
+[topology]
+kind = "k_regular"
+n = 1000
+k = 8
+
+[latency]
+dist = "constant"
+ms = 100
+
+[algo]
+kind = "mix"
+[[algo.population]]
+fraction = 0.7
+[algo.population.algo]
+kind = "lnd"
+stagger_ms = 1000
+trickle_ms = 100
+min_batch_size = 10
+
+[[algo.population]]
+fraction = 0.3
+[algo.population.algo]
+kind = "cln"
+stagger_ms = 1000
+
+[event]
+kind = "one_shot_single"
+node = 0
+
+[run]
+duration_seconds = 60
+mailbox_capacity = 1024
+progress_interval_seconds = 5

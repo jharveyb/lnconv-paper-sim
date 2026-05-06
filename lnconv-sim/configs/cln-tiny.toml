@@ -1,0 +1,27 @@
+# Diameter-trace test: ring of 20 nodes, k=2 (each node has 1 neighbor each
+# side -> a literal cycle). Diameter = 10 hops. Stagger = 1s. Expectation:
+#   - "1 hop per tick" model -> p100 = 10s
+#   - full intra-tick cascade -> p100 = 1s
+# Anything in between reveals the partial-cascade artifact.
+seed = 1
+
+[topology]
+kind = "k_regular"
+n = 20
+k = 2
+
+[latency]
+dist = "constant"
+ms = 0
+
+[algo]
+kind = "cln"
+stagger_ms = 1000
+
+[event]
+kind = "one_shot_single"
+node = 0
+
+[run]
+duration_seconds = 60
+mailbox_capacity = 64

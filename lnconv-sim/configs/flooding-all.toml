@@ -1,0 +1,19 @@
+seed = 1
+
+[topology]
+kind = "k_regular"
+n = 200
+k = 8
+
+[latency]
+dist = "constant"
+ms = 100
+
+[algo]
+kind = "flooding"
+
+[event]
+kind = "one_shot_all"
+
+[run]
+duration_seconds = 120

@@ -1,0 +1,24 @@
+# Poisson event stream: 7 messages/sec from random nodes for the full run.
+seed = 1
+
+[topology]
+kind = "k_regular"
+n = 1000
+k = 8
+
+[latency]
+dist = "constant"
+ms = 100
+
+[algo]
+kind = "cln"
+stagger_ms = 1000
+
+[event]
+kind = "poisson_random"
+rate_per_sec = 7.0
+
+[run]
+duration_seconds = 60
+mailbox_capacity = 1024
+progress_interval_seconds = 10
