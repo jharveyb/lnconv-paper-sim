@@ -71,7 +71,7 @@ impl ClnNode {
     }
 
     /// Input port. BOLT 7 dedup, then queue for next tick.
-    pub fn recv(&mut self, wire: WireMessage, cx: &Context<Self>) {
+    pub async fn recv(&mut self, wire: WireMessage, cx: &Context<Self>) {
         for g in wire.iter_gossips() {
             let key = (g.scid, g.direction);
             if let Some(&stored) = self.lngraph.get(&key)
