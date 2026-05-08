@@ -6,15 +6,25 @@ use std::time::Duration;
 
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
+use statrs::distribution::{ContinuousCDF, Exp};
 
 use super::EventSchedule;
+use crate::channels::ChannelRegistry;
 use crate::message::{Gossip, GossipKind, NodeId};
 
 /// Poisson-process stream: messages arrive with exponential inter-arrival
-/// times of mean `1 / rate_per_sec`, originated by a uniformly-random node
-/// each time. Stream stops when its accumulated time exceeds the simulation's
-/// `duration_seconds`. Sampled deterministically from `seed` so reruns
-/// reproduce.
+/// times of mean `1 / rate_per_sec`. For each event we sample a
+/// `(scid, direction)` uniformly from the channel registry and look up
+/// the owner — that node is the originator. Stream stops when its
+/// accumulated time exceeds the simulation's `duration_seconds`. Sampled
+/// deterministically from `seed` so reruns reproduce.
+///
+/// Inter-arrivals are sampled by feeding a uniform `[0, 1)` from our
+/// `ChaCha8Rng` through `statrs::distribution::Exp::inverse_cdf`. The
+/// inverse-CDF route is needed because statrs's `Distribution::sample`
+/// targets a different `rand` major version than the rest of this
+/// workspace; it leaves statrs in charge of the actual distribution
+/// math while keeping a single `rand` ecosystem.
 pub struct PoissonRandom {
     pub rate_per_sec: f64,
     pub seed: u64,
@@ -22,25 +32,33 @@ pub struct PoissonRandom {
 }
 
 impl EventSchedule for PoissonRandom {
-    fn build(&self, num_nodes: usize, max: Duration) -> Vec<(Duration, NodeId, Gossip)> {
-        if self.rate_per_sec <= 0.0 || num_nodes == 0 {
+    fn build(
+        &self,
+        num_nodes: usize,
+        max: Duration,
+        registry: &ChannelRegistry,
+    ) -> Vec<(Duration, NodeId, Gossip)> {
+        if self.rate_per_sec <= 0.0 || num_nodes == 0 || registry.len() == 0 {
             return Vec::new();
         }
         let mut rng = ChaCha8Rng::seed_from_u64(self.seed);
-        let mut t_secs = 0.0_f64;
+        let exp = Exp::new(self.rate_per_sec).expect("rate must be positive");
         let max_secs = max.as_secs_f64();
+        let mut t_secs = 0.0_f64;
         let mut events = Vec::new();
-        let mut next_id: u64 = 0;
+        let mut next_id: u32 = 0;
+        let num_scids = registry.num_scids;
         loop {
-            // Exponential inter-arrival via inverse-CDF. random::<f64>() is
-            // [0, 1); we shift to (0, 1] so ln() never blows up.
-            let u: f64 = 1.0 - rng.random::<f64>();
-            let dt = -u.ln() / self.rate_per_sec;
+            // Strict (0, 1) so inverse_cdf never sees the boundary value.
+            let u = rng.random::<f64>().clamp(f64::EPSILON, 1.0 - f64::EPSILON);
+            let dt = exp.inverse_cdf(u);
             t_secs += dt;
             if t_secs > max_secs {
                 break;
             }
-            let origin = rng.random_range(0..num_nodes as u32);
+            let scid = rng.random_range(0..num_scids);
+            let direction: u8 = if rng.random::<bool>() { 1 } else { 0 };
+            let origin = registry.owner(scid, direction);
             events.push((
                 Duration::from_secs_f64(t_secs),
                 origin,
@@ -49,6 +67,9 @@ impl EventSchedule for PoissonRandom {
                     origin,
                     kind: GossipKind::Full,
                     size_bytes: self.size_bytes,
+                    scid,
+                    direction,
+                    timestamp: 0,
                 },
             ));
             next_id += 1;

@@ -34,6 +34,7 @@ use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
+use crate::channels::ChannelRegistry;
 use crate::config::{AlgoCfg, EventCfg, LatencyCfg, NodeAlgoKind, SimConfig, TopologyCfg};
 use crate::events::EventSchedule;
 use crate::events::oneshot::{OneShotAll, OneShotSingle};
@@ -53,17 +54,34 @@ pub struct RunResult {
 /// Top-level entry point: build the topology, choose the right node
 /// builder for the configured algorithm, kick off the chunked driver,
 /// return the (still-locked) metrics for post-run reporting.
-pub fn run(cfg: &SimConfig) -> Result<RunResult> {
+///
+/// `percentiles` is the list of fractions (in [0.0, 1.0]) that
+/// per-message convergence stats should be reported for; baked into the
+/// metrics handle now so finalized summaries can be computed
+/// incrementally as messages reach 100% coverage.
+pub fn run(cfg: &SimConfig, percentiles: Vec<f64>) -> Result<RunResult> {
     let topology = match &cfg.topology {
         TopologyCfg::KRegular { n, k } => synthetic::random_regular(*n, *k, cfg.seed),
     };
     let topo_stats = topology_metrics::compute(&topology, cfg.seed, 2000, 1000);
     println!("topology: {topo_stats:#?}");
-    let metrics = MetricsHandle::default();
     let n = topology.len();
+
+    // Build the channel registry that decides who originates each
+    // (scid, direction). Used by event-stream generators and printed
+    // here so a reviewer can sanity-check that channel coverage matches
+    // expectations.
+    let registry = ChannelRegistry::build(cfg.channels.count, n, cfg.seed);
+    println!(
+        "channels: count={} (mean {:.1} per node)",
+        registry.num_scids,
+        registry.mean_per_node()
+    );
+
+    let metrics = MetricsHandle::new(n, percentiles);
     let run_duration = Duration::from_secs(cfg.run.duration_seconds);
 
-    let event_tuples = build_events(cfg, n, run_duration);
+    let event_tuples = build_events(cfg, n, run_duration, &registry);
     println!(
         "events: scheduled {} message(s) over the run window",
         event_tuples.len()
@@ -105,6 +123,9 @@ pub fn run(cfg: &SimConfig) -> Result<RunResult> {
         }
     }
 
+    // Convert any messages still in-flight at the deadline into final
+    // stats with whatever partial coverage they reached.
+    metrics.finalize_remaining();
     Ok(RunResult { metrics, topology })
 }
 
@@ -114,19 +135,24 @@ fn latency_ms(c: &LatencyCfg) -> u64 {
     }
 }
 
-fn build_events(cfg: &SimConfig, n: usize, max: Duration) -> Vec<(Duration, u32, Gossip)> {
+fn build_events(
+    cfg: &SimConfig,
+    n: usize,
+    max: Duration,
+    registry: &ChannelRegistry,
+) -> Vec<(Duration, u32, Gossip)> {
     let mut tuples = match &cfg.event {
         EventCfg::OneShotSingle { node } => OneShotSingle {
             node: *node,
             at: Duration::ZERO,
             size_bytes: 1024,
         }
-        .build(n, max),
+        .build(n, max, registry),
         EventCfg::OneShotAll {} => OneShotAll {
             at: Duration::ZERO,
             size_bytes: 1024,
         }
-        .build(n, max),
+        .build(n, max, registry),
         EventCfg::PoissonRandom {
             rate_per_sec,
             size_bytes,
@@ -135,7 +161,7 @@ fn build_events(cfg: &SimConfig, n: usize, max: Duration) -> Vec<(Duration, u32,
             seed: cfg.seed ^ 0xE7E,
             size_bytes: *size_bytes,
         }
-        .build(n, max),
+        .build(n, max, registry),
     };
     tuples.sort_by_key(|(t, _, _)| *t);
     tuples
@@ -537,7 +563,13 @@ fn wire_connection(
 /// guaranteed at coincident times, so synchronous phases produce wildly
 /// faster propagation than the stagger algorithm should permit).
 fn sample_phase(rng: &mut ChaCha8Rng, stagger: Duration) -> Duration {
-    let max_ns = stagger.as_nanos() as u64;
-    let ns = rng.random_range(1..=max_ns.max(1));
-    Duration::from_nanos(ns)
+    use statrs::distribution::{ContinuousCDF, Uniform};
+    let stagger_secs = stagger.as_secs_f64();
+    let dist = Uniform::new(0.0, stagger_secs).expect("stagger must be positive");
+    // statrs samples via inverse-CDF — see the note in events/poisson.rs
+    // for why we don't call its `sample` directly. Floor at 1 ns so the
+    // first tick is strictly later than t=0.
+    let u = rng.random::<f64>().clamp(f64::EPSILON, 1.0 - f64::EPSILON);
+    let secs = dist.inverse_cdf(u).max(1e-9);
+    Duration::from_secs_f64(secs)
 }

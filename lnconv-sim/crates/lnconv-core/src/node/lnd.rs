@@ -1,7 +1,7 @@
 //! LND-style stagger node.
 //!
 //! Same lifecycle as [`super::cln::ClnNode`] (queue on recv/originate,
-//! periodic tick, random first-tick offset for phase mixing) plus two
+//! periodic tick, random first-tick offset, BOLT 7 dedup) plus two
 //! refinements that match the LND defaults:
 //!
 //! * **min_batch_size** — drained pending is split into chunks of this
@@ -16,14 +16,15 @@
 //! exercised by workloads with concurrent messages per tick (e.g.
 //! `OneShotAll`, `PoissonRandom` at high rate).
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::time::Duration;
 
 use nexosim::model::{Context, Model, schedulable};
 use nexosim::ports::Output;
+use nexosim::time::MonotonicTime;
 use serde::{Deserialize, Serialize};
 
-use crate::message::{Gossip, MsgId, NodeId, WireMessage};
+use crate::message::{Direction, Gossip, NodeId, Scid, WireMessage};
 use crate::metrics::MetricsHandle;
 
 #[derive(Default, Serialize, Deserialize)]
@@ -40,7 +41,9 @@ pub struct LndNode {
     min_batch_size: usize,
     #[serde(skip)]
     metrics: MetricsHandle,
-    seen: HashSet<MsgId>,
+    /// BOLT 7 LN graph state: latest timestamp seen per `(scid,
+    /// direction)`. Lifetime, not per-tick.
+    lngraph: HashMap<(Scid, Direction), u32>,
     pending: Vec<Gossip>,
 }
 
@@ -61,7 +64,7 @@ impl LndNode {
             trickle,
             min_batch_size: min_batch_size.max(1),
             metrics,
-            seen: HashSet::new(),
+            lngraph: HashMap::new(),
             pending: Vec::new(),
         }
     }
@@ -77,33 +80,48 @@ impl LndNode {
             .expect("schedule lnd tick");
     }
 
-    /// Input port. Queue any new gossip; sending is deferred to `tick`.
+    /// Input port. BOLT 7 dedup, then queue.
     pub fn recv(&mut self, wire: WireMessage, cx: &Context<Self>) {
         for g in wire.iter_gossips() {
-            if !self.seen.insert(g.id) {
-                continue;
-            }
-            self.metrics.record_first_seen(self.id, g.id, cx.time());
-            self.pending.push(g.clone());
+            let key = (g.scid, g.direction);
+            if let Some(&stored) = self.lngraph.get(&key)
+                && g.timestamp <= stored {
+                    continue;
+                }
+            self.lngraph.insert(key, g.timestamp);
+            self.metrics.record_first_seen(self.id, g, cx.time());
+            self.pending.push(*g);
         }
     }
 
-    /// Origination input. Like CLN, originated messages wait for the
-    /// next tick rather than going out immediately.
-    pub fn originate(&mut self, msg: Gossip, cx: &Context<Self>) {
-        if !self.seen.insert(msg.id) {
-            return;
-        }
-        self.metrics.record_first_seen(self.id, msg.id, cx.time());
-        self.pending.push(msg);
+    /// Origination input. Originated messages still wait for the next
+    /// stagger tick (they don't bypass it like CLN's do), but they're
+    /// pushed to the *front* of the pending queue so they go out in the
+    /// first chunk of the next tick — ahead of forwarded messages and
+    /// before any trickle delay applies. Matches LND's "give locally
+    /// originated updates priority over re-broadcast traffic".
+    /// Timestamp stamped from current sim time, bumped past any stored
+    /// entry to maintain strict monotonicity.
+    pub fn originate(&mut self, mut msg: Gossip, cx: &Context<Self>) {
+        let now_secs = cx
+            .time()
+            .duration_since(MonotonicTime::EPOCH)
+            .as_secs() as u32;
+        let key = (msg.scid, msg.direction);
+        let next_ts = match self.lngraph.get(&key) {
+            Some(&stored) => stored.saturating_add(1).max(now_secs),
+            None => now_secs,
+        };
+        msg.timestamp = next_ts;
+        self.lngraph.insert(key, next_ts);
+        self.metrics.record_first_seen(self.id, &msg, cx.time());
+        // Front of queue, not back — see method docstring.
+        self.pending.insert(0, msg);
     }
 
     /// Drain pending into batches of `min_batch_size`. Send the first
     /// batch immediately, then schedule each subsequent batch at offset
     /// `i * trickle` from now (`i` starts at 1 for the second batch).
-    /// Schedulable methods can take a `&Context<Self>` as their second
-    /// arg, which is what we use here to call `schedule_event` from
-    /// inside the tick.
     #[nexosim(schedulable)]
     async fn tick(&mut self, _: (), cx: &Context<Self>) {
         if self.pending.is_empty() {

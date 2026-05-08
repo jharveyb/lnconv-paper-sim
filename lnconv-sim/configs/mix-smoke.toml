@@ -6,6 +6,9 @@ kind = "k_regular"
 n = 1000
 k = 8
 
+[channels]
+count = 2000
+
 [latency]
 dist = "constant"
 ms = 100

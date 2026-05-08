@@ -13,6 +13,7 @@
 //! * [`topology`], [`events`], [`metrics`], [`config`] are supporting
 //!   modules — see each one's docstring.
 
+pub mod channels;
 pub mod config;
 pub mod events;
 pub mod latency;
@@ -22,4 +23,4 @@ pub mod node;
 pub mod sim;
 pub mod topology;
 
-pub use message::{Gossip, GossipKind, MsgId, NodeId, WireMessage};
+pub use message::{Direction, Gossip, GossipKind, MsgId, NodeId, Scid, WireMessage};

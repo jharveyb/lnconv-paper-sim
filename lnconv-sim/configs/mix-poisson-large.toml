@@ -1,25 +1,28 @@
-seed = 2
+# Heavy stress: 70% LND / 30% CLN over 20k nodes, Poisson-driven traffic
+# for the full hour. With per-tick dedup messages cycle through the graph
+# indefinitely, so this is a worst case for the bounded-memory metric
+# refactor.
+seed = 1
 
 [topology]
 kind = "k_regular"
-n = 16000
-k = 10
+n = 20000
+k = 8
 
 [channels]
-count = 41000
+count = 40000
 
 [latency]
 dist = "constant"
 ms = 100
 
-# Match the (old) estimates of implementation diversity on mainnet.
 [algo]
 kind = "mix"
 [[algo.population]]
 fraction = 0.7
 [algo.population.algo]
 kind = "lnd"
-stagger_ms = 90000
+stagger_ms = 60000
 trickle_ms = 5000
 min_batch_size = 10
 
@@ -31,9 +34,9 @@ stagger_ms = 60000
 
 [event]
 kind = "poisson_random"
-rate_per_sec = 10.0
+rate_per_sec = 7.0
 
 [run]
 duration_seconds = 3600
-mailbox_capacity = 1024
-progress_interval_seconds = 30
+mailbox_capacity = 8192
+progress_interval_seconds = 60

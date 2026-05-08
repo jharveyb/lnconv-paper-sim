@@ -1,4 +1,7 @@
-# Poisson event stream: 7 messages/sec from random nodes for the full run.
+# Small SCID pool to force supersession activity. With only 50 channels
+# and 60s of Poisson at 7/s ≈ 420 events, each (scid, direction) gets
+# ~4 updates → many MsgIds should finalize via supersession rather than
+# 100% coverage.
 seed = 1
 
 [topology]
@@ -7,7 +10,7 @@ n = 1000
 k = 8
 
 [channels]
-count = 2000
+count = 50
 
 [latency]
 dist = "constant"

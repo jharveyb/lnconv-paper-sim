@@ -39,6 +39,8 @@ Available smoke configs in [`configs/`](configs):
 | `lnd-all.toml` | LND with `OneShotAll` so trickle actually engages |
 | `mix-smoke.toml` | 70% LND / 30% CLN heterogeneous population |
 | `poisson-smoke.toml` | Poisson stream of 7 messages/sec from random nodes |
+| `poisson-tiny-pool.toml` | Poisson with a tiny `[channels].count = 50` to force BOLT 7 supersession |
+| `mix-poisson-large.toml` / `mixed-poisson-large.toml` | n≈20k, mix population, hour-long Poisson — long-run / memory stress |
 
 The example `cargo run --release --example diameter -p lnconv-core` prints
 BFS-derived diameters and mean path lengths for a sweep of `(n, k)` —
@@ -58,6 +60,11 @@ seed = 1                        # ChaCha8 seed; drives topology, phases, Poisson
 kind = "k_regular"              # currently the only generator
 n = 1000                        # number of nodes
 k = 8                           # exact degree of every node (true random regular)
+
+[channels]
+count = 2000                    # number of SCIDs in the LN graph; each gets two
+                                # directions, each owned by a random node.
+                                # Use >= n so every node owns at least one channel.
 
 [latency]
 dist = "constant"               # currently the only distribution
@@ -96,11 +103,17 @@ progress_interval_seconds = 10  # 0 to silence in-flight progress prints
 
 ### Algorithm semantics
 
+Every node — regardless of algorithm — keeps a per-node `lngraph:
+HashMap<(Scid, Direction), u32>` of the latest gossip timestamp it has
+seen for each channel. On `recv`, an arrival with timestamp ≤ stored is
+dropped (BOLT 7 supersession); strictly newer arrivals update the entry
+and re-broadcast.
+
 | Algorithm | What each node does |
 |---|---|
-| **Flooding** | On first sight of a new message, schedule a forward to all peers after `latency.ms`. |
-| **Cln** (c-lightning-style) | Pending queue per node. Periodic tick every `stagger_ms` drains the queue and broadcasts everything as a single batch. No trickle, no chunking. |
-| **Lnd** (LND-style) | Pending queue per node. Periodic tick splits into chunks of `min_batch_size`; first chunk goes immediately, subsequent chunks at `+i·trickle_ms`. |
+| **Flooding** | On a fresh `(scid, direction, timestamp)`, schedule a forward to all peers after `latency.ms`. Originated messages broadcast immediately. |
+| **Cln** (c-lightning-style) | Forwarded gossip waits in a `pending` queue and is sent in one big `Batch` per `stagger_ms` tick. **Originated messages bypass the queue and are broadcast immediately as `Single`** (matches CLN's "local updates aren't held by the broadcast window"). |
+| **Lnd** (LND-style) | Same per-tick batching as Cln, but pending is split into chunks of `min_batch_size`. First chunk goes immediately on tick; subsequent chunks at `+i·trickle_ms`. **Originated messages are inserted at the FRONT of `pending`**, so they ride out in the first chunk ahead of any forwarded traffic. |
 | **Mix** | Per-node assignment of Cln/Lnd from a fraction list; deterministic shuffle by `seed`. Connections between mixed nodes work because both `recv` methods take the same `WireMessage` type. |
 
 Each stagger node samples its first-tick offset uniformly in
@@ -109,11 +122,16 @@ cascades and makes per-hop wait time average ~`stagger_ms / 2`.
 
 ### Event sources
 
+For every event the originator is determined by the **channel registry**
+(`channels.rs`) — the `(scid, direction)` is sampled, then the registry
+looks up which node owns that channel side. Streams never "pick a node
+at random"; they pick a channel.
+
 | Kind | Behavior |
 |---|---|
-| `one_shot_single { node }` | One message originated by `node` at `t=0`. |
-| `one_shot_all` | Every node originates exactly one message at `t=0`. |
-| `poisson_random { rate_per_sec, size_bytes }` | Exponential inter-arrival with mean `1/rate_per_sec`; each message originated by a uniformly-random node; runs until `duration_seconds`. |
+| `one_shot_single { node }` | One message at `t=0`, on the first `(scid, direction)` that `node` owns. Skipped (with a warning) if `node` owns no channels. |
+| `one_shot_all` | Every node that owns at least one channel originates one message at `t=0`, using its first owned `(scid, direction)`. |
+| `poisson_random { rate_per_sec, size_bytes }` | Exponential inter-arrival with mean `1/rate_per_sec`; each event picks a uniformly-random `(scid, direction)` and uses its owner as the originator. Runs until `duration_seconds`. |
 
 ---
 
@@ -134,23 +152,43 @@ prints:
 - `first_seen` — total `(node, message)` first-seen events recorded so far.
 - `+delta` and `rate` — events accumulated since the previous print.
 
-When the run finishes, it prints per-message stats followed by
-mean-percentile aggregates across all messages that reached 100% coverage:
+When the run finishes the binary prints, in order:
+
+1. `simulation finished: N distinct messages` and `total first-seen events: …`.
+2. `superseded: K of N …` if any messages were killed mid-spread by a
+   newer `(scid, direction)` version (BOLT 7 supersession).
+3. A per-message table (first 5 messages) showing each percentile column;
+   `--` means the message never reached that absolute coverage.
+4. A **coverage distribution**: how many messages reached each tier.
+5. A **time-to-reach-coverage distribution per tier**: for each of
+   25%, 50%, 75%, 100%, the distribution *across messages* of the time
+   that message took to reach that coverage.
 
 ```
 msg     covg     covg%   p 5    p10    p25    p50    p75    p90    p99   p100
 0       1000   100.0%   ...
 
-aggregate over 352 messages that reached 100% coverage:
-  p 25: mean = 1.07s
-  p 50: mean = 1.22s
-  ...
-  p100: mean = 1.84s
+coverage distribution (messages reaching >= X% of 1000 nodes):
+  >=  25% (>=   250 nodes):    365 / 403 (90.6%)
+  >=  50% (>=   500 nodes):    361 / 403 (89.6%)
+  >=  75% (>=   750 nodes):    358 / 403 (88.8%)
+  >= 100% (>=  1000 nodes):    347 / 403 (86.1%)
+
+time to reach 25% coverage (>= 250 of 1000 nodes): 365 of 403 messages reached it
+  min:    427ms     p50:    1.05s     mean:    1.08s
+  p 5:    584ms     p75:    1.34s     max:     1.84s
+  p25:    817ms     p95:    1.59s
+
+time to reach 100% coverage (>= 1000 of 1000 nodes): 347 of 403
+  min:   1.17s      p50:    1.82s     mean:    1.84s     max: 2.63s
 ```
 
-Each percentile column is the time, measured from the first node to see
-the message, until that fraction of nodes had seen it. **p100 is the full
-network-convergence time for that message.** For a quick gut check:
+Each per-message percentile is the time, measured from the first node to
+see the message, until that fraction of *all `n` nodes* had received it
+(absolute — not relative to per-message coverage). When a message is
+killed mid-spread by BOLT 7 supersession, its lower percentiles are
+still defined while the higher ones come back as `--`. **p100 is the
+full network-convergence time for that message.** For a quick gut check:
 
 - For flooding, expect p100 ≈ `topology.diameter × latency.ms`.
 - For stagger algorithms, expect p100 ≈ `topology.mean_path_length × stagger_ms / 2`.
@@ -169,9 +207,10 @@ network-convergence time for that message.** For a quick gut check:
 │  ├─ sim.rs        chunked driver + population builder  │
 │  ├─ node/         FloodingNode | ClnNode | LndNode     │
 │  ├─ message.rs    Gossip + WireMessage (Single|Batch)  │
+│  ├─ channels.rs   (scid, direction) -> owner registry  │
 │  ├─ topology/     random k-regular + BFS metrics       │
 │  ├─ events/       OneShot* + PoissonRandom             │
-│  ├─ metrics.rs    per-node first-seen tracker          │
+│  ├─ metrics.rs    BOLT-7-aware first-seen tracker      │
 │  └─ config.rs     TOML schema (serde)                  │
 ├────────────────────────────────────────────────────────┤
 │  NeXosim 1.0  — discrete-event executor + ports        │
@@ -181,7 +220,7 @@ network-convergence time for that message.** For a quick gut check:
 ### NeXosim primer (for LN folks new to discrete-event sim)
 
 Each LN node is a NeXosim **`Model`**, an actor with:
-- private mutable state (`HashSet<MsgId>` for dedup, pending queue),
+- private mutable state (`lngraph` for BOLT 7 dedup, pending queue),
 - typed input ports (methods marked by `#[Model]` like `recv` and `originate`),
 - typed output ports (`Output<WireMessage>`) that broadcast to many peers.
 
@@ -224,8 +263,19 @@ touched; runtime cost is dominated by message dispatch.
 
 [`topology/metrics.rs`](crates/lnconv-core/src/topology/metrics.rs)
 computes degree stats, BFS-derived diameter and mean path length, and
-connectedness. Exact for `n ≤ 2000`; sampled (200 random sources) for
+connectedness. Exact for `n ≤ 2000`; sampled (1000 random sources) for
 larger graphs.
+
+### Channel registry
+
+[`channels.rs`](crates/lnconv-core/src/channels.rs) builds a
+`ChannelRegistry` once at sim init: for each of `[channels].count`
+SCIDs, two distinct random nodes are chosen and each takes one direction
+(`0` or `1`). The registry has `owner(scid, direction) -> NodeId` and
+`channels_for(node) -> &[(Scid, Direction)]`. Event-stream generators
+consult it so that any message with a given `(scid, direction)` always
+originates from the same node — mirroring how each side of a real LN
+channel emits its own `channel_update`s.
 
 ### The chunked sim driver
 
@@ -295,6 +345,11 @@ nodes can still parse what arrives.
   `Arc<Mutex<...>>` written from every node. At ~12M events/wall-second
   this hasn't been a bottleneck so far; if it becomes one, switch to
   per-node buffers + post-run merge.
+- **Per-node `lngraph` is a `HashMap`.** At LN scale (~20k nodes,
+  ~40k channels) the table fills as more channels see updates and the
+  aggregate cost reaches several GB. A flat `Vec<u32>` indexed by
+  `scid * 2 + direction` would cut per-entry overhead but pre-allocate
+  the full table at startup — not yet wired up.
 
 ---
 
@@ -310,6 +365,7 @@ lnconv-sim/
 │   │   ├── examples/diameter.rs   topology BFS sweep
 │   │   └── src/
 │   │       ├── lib.rs
+│   │       ├── channels.rs        (scid, direction) -> owner registry
 │   │       ├── config.rs          TOML schema
 │   │       ├── events/            event-stream generators
 │   │       ├── message.rs         Gossip + WireMessage

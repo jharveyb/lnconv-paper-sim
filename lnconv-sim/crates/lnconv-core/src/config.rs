@@ -12,10 +12,20 @@ use serde::Deserialize;
 pub struct SimConfig {
     pub seed: u64,
     pub topology: TopologyCfg,
+    pub channels: ChannelsCfg,
     pub latency: LatencyCfg,
     pub algo: AlgoCfg,
     pub event: EventCfg,
     pub run: RunCfg,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct ChannelsCfg {
+    /// Total number of `(scid)` channels in the registry. Each channel
+    /// has two directions, both owned by distinct random nodes assigned
+    /// at sim init. Should typically be `>= num_nodes` so most nodes own
+    /// at least one channel side.
+    pub count: u32,
 }
 
 #[derive(Deserialize, Debug)]
