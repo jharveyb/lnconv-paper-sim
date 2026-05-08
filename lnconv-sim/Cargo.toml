@@ -17,4 +17,8 @@ anyhow = "1"
 rand = "0.9"
 rand_chacha = "0.9"
 rustworkx-core = "0.17"
+# Pin to whatever rustworkx-core 0.17 brings in transitively so the
+# workspace and rustworkx-core agree on petgraph types.
+petgraph = "0.8"
 statrs = "0.18"
+scc = "3"

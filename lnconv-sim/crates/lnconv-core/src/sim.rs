@@ -39,12 +39,12 @@ use crate::config::{AlgoCfg, EventCfg, LatencyCfg, NodeAlgoKind, SimConfig, Topo
 use crate::events::EventSchedule;
 use crate::events::oneshot::{OneShotAll, OneShotSingle};
 use crate::events::poisson::PoissonRandom;
-use crate::message::Gossip;
+use crate::message::{Gossip, NodeId};
 use crate::metrics::MetricsHandle;
 use crate::node::cln::ClnNode;
 use crate::node::flooding::FloodingNode;
 use crate::node::lnd::LndNode;
-use crate::topology::{Topology, metrics as topology_metrics, synthetic};
+use crate::topology::{NodeAlgo, Topology, metrics as topology_metrics, synthetic};
 
 pub struct RunResult {
     pub metrics: MetricsHandle,
@@ -60,18 +60,29 @@ pub struct RunResult {
 /// metrics handle now so finalized summaries can be computed
 /// incrementally as messages reach 100% coverage.
 pub fn run(cfg: &SimConfig, percentiles: Vec<f64>) -> Result<RunResult> {
-    let topology = match &cfg.topology {
-        TopologyCfg::KRegular { n, k } => synthetic::random_regular(*n, *k, cfg.seed),
+    // Build the topology with a default algo derived from cfg.algo.
+    // For Mix we overwrite per-vertex algo just below.
+    let default_algo = default_algo_from(&cfg.algo);
+    let mut topology = match &cfg.topology {
+        TopologyCfg::KRegular { n, k } => synthetic::random_regular(*n, *k, cfg.seed, default_algo),
     };
     let topo_stats = topology_metrics::compute(&topology, cfg.seed, 2000, 1000);
     println!("topology: {topo_stats:#?}");
     let n = topology.len();
 
-    // Build the channel registry that decides who originates each
-    // (scid, direction). Used by event-stream generators and printed
-    // here so a reviewer can sanity-check that channel coverage matches
-    // expectations.
-    let registry = ChannelRegistry::build(cfg.channels.count, n, cfg.seed);
+    // For mix, replace per-vertex algos with the assigned distribution.
+    if let AlgoCfg::Mix { population } = &cfg.algo {
+        let assignments = assign_mix(n, population, cfg.seed);
+        for (i, kind) in assignments.iter().enumerate() {
+            topology.node_meta_mut(i as NodeId).algo = NodeAlgo::from(kind);
+        }
+        log_mix_summary(&assignments);
+    }
+
+    // Build the channel registry. Mutates the topology's `channels`
+    // graph in addition to caching owner-lookup tables for event
+    // streams.
+    let registry = ChannelRegistry::build(&mut topology, cfg.channels.count, cfg.seed);
     println!(
         "channels: count={} (mean {:.1} per node)",
         registry.num_scids,
@@ -97,29 +108,8 @@ pub fn run(cfg: &SimConfig, percentiles: Vec<f64>) -> Result<RunResult> {
             event_tuples,
             deadline,
         )?,
-        AlgoCfg::Cln { stagger_ms } => {
-            let assignments = vec![NodeAlgoKind::Cln { stagger_ms: *stagger_ms }; n];
-            run_stagger_population(cfg, &topology, metrics.clone(), assignments, event_tuples, deadline)?;
-        }
-        AlgoCfg::Lnd {
-            stagger_ms,
-            trickle_ms,
-            min_batch_size,
-        } => {
-            let assignments = vec![
-                NodeAlgoKind::Lnd {
-                    stagger_ms: *stagger_ms,
-                    trickle_ms: *trickle_ms,
-                    min_batch_size: *min_batch_size,
-                };
-                n
-            ];
-            run_stagger_population(cfg, &topology, metrics.clone(), assignments, event_tuples, deadline)?;
-        }
-        AlgoCfg::Mix { population } => {
-            let assignments = assign_mix(n, population, cfg.seed);
-            log_mix_summary(&assignments);
-            run_stagger_population(cfg, &topology, metrics.clone(), assignments, event_tuples, deadline)?;
+        AlgoCfg::Cln { .. } | AlgoCfg::Lnd { .. } | AlgoCfg::Mix { .. } => {
+            run_stagger_population(cfg, &topology, metrics.clone(), event_tuples, deadline)?;
         }
     }
 
@@ -129,9 +119,45 @@ pub fn run(cfg: &SimConfig, percentiles: Vec<f64>) -> Result<RunResult> {
     Ok(RunResult { metrics, topology })
 }
 
+/// Pick the per-vertex `NodeAlgo` to seed the topology with. For Mix
+/// this is just a placeholder (Cln-with-zero-stagger) — the runner
+/// overwrites every vertex's algo from `assign_mix` before any model is
+/// constructed, so the placeholder is never observed downstream.
+fn default_algo_from(cfg: &AlgoCfg) -> NodeAlgo {
+    match cfg {
+        AlgoCfg::Flooding {} => NodeAlgo::Flooding,
+        AlgoCfg::Cln { stagger_ms } => NodeAlgo::Cln {
+            stagger_ms: *stagger_ms,
+        },
+        AlgoCfg::Lnd {
+            stagger_ms,
+            trickle_ms,
+            min_batch_size,
+        } => NodeAlgo::Lnd {
+            stagger_ms: *stagger_ms,
+            trickle_ms: *trickle_ms,
+            min_batch_size: *min_batch_size,
+        },
+        AlgoCfg::Mix { .. } => NodeAlgo::Cln { stagger_ms: 0 },
+    }
+}
+
 fn latency_ms(c: &LatencyCfg) -> u64 {
     match c {
         LatencyCfg::Constant { ms } => *ms,
+    }
+}
+
+/// Build a `SimInit` with the executor thread count from `cfg.run.threads`.
+///
+/// `None` (the default) means "use NeXosim's default", which is all
+/// available logical cores. `Some(n)` pins the worker pool to `n`. The CLI
+/// `--threads` flag mutates `cfg.run.threads` before this is called, so a
+/// CLI flag always wins.
+fn new_sim_init(cfg: &SimConfig) -> SimInit {
+    match cfg.run.threads {
+        Some(n) if n > 0 => SimInit::with_num_threads(n),
+        _ => SimInit::new(),
     }
 }
 
@@ -349,13 +375,15 @@ fn run_flooding(
         .map(|_| Mailbox::with_capacity(cfg.run.mailbox_capacity))
         .collect();
 
-    for (i, peers) in topology.iter().enumerate() {
-        for &j in peers {
-            nodes[i].out.connect(FloodingNode::recv, &mboxes[j as usize]);
+    for src in topology.node_ids() {
+        for dst in topology.peer_ids(src) {
+            nodes[src as usize]
+                .out
+                .connect(FloodingNode::recv, &mboxes[dst as usize]);
         }
     }
 
-    let mut bench = SimInit::new();
+    let mut bench = new_sim_init(cfg);
     let originate_sources: Vec<EventId<Gossip>> = (0..n)
         .map(|i| {
             EventSource::<Gossip>::new()
@@ -384,7 +412,8 @@ fn run_flooding(
 }
 
 /// Build a simulation where every node runs a stagger algorithm — Cln,
-/// Lnd, or any mix of the two given by `assignments[i]`.
+/// Lnd, or any mix of the two read from per-vertex `NodeMeta::algo` on
+/// the topology graph.
 ///
 /// Heterogeneous populations need a bit more bookkeeping than the
 /// flooding case because each kind has its own concrete model type, so
@@ -401,12 +430,10 @@ fn run_stagger_population(
     cfg: &SimConfig,
     topology: &Topology,
     metrics: MetricsHandle,
-    assignments: Vec<NodeAlgoKind>,
     events: Vec<(Duration, u32, Gossip)>,
     deadline: MonotonicTime,
 ) -> Result<()> {
     let n = topology.len();
-    assert_eq!(assignments.len(), n);
 
     let mut cln_local: Vec<Option<usize>> = vec![None; n];
     let mut lnd_local: Vec<Option<usize>> = vec![None; n];
@@ -417,27 +444,28 @@ fn run_stagger_population(
 
     let mut rng = ChaCha8Rng::seed_from_u64(cfg.seed ^ 0xC1A);
 
-    for (i, algo) in assignments.iter().enumerate() {
+    for id in 0..n as NodeId {
+        let algo = &topology.node_meta(id).algo;
         let phase = sample_phase(&mut rng, stagger_of(algo));
         match algo {
-            NodeAlgoKind::Cln { stagger_ms } => {
-                cln_local[i] = Some(cln_nodes.len());
+            NodeAlgo::Cln { stagger_ms } => {
+                cln_local[id as usize] = Some(cln_nodes.len());
                 cln_nodes.push(ClnNode::new(
-                    i as u32,
+                    id,
                     Duration::from_millis(*stagger_ms),
                     phase,
                     metrics.clone(),
                 ));
                 cln_mboxes.push(Mailbox::with_capacity(cfg.run.mailbox_capacity));
             }
-            NodeAlgoKind::Lnd {
+            NodeAlgo::Lnd {
                 stagger_ms,
                 trickle_ms,
                 min_batch_size,
             } => {
-                lnd_local[i] = Some(lnd_nodes.len());
+                lnd_local[id as usize] = Some(lnd_nodes.len());
                 lnd_nodes.push(LndNode::new(
-                    i as u32,
+                    id,
                     Duration::from_millis(*stagger_ms),
                     phase,
                     Duration::from_millis(*trickle_ms),
@@ -446,17 +474,23 @@ fn run_stagger_population(
                 ));
                 lnd_mboxes.push(Mailbox::with_capacity(cfg.run.mailbox_capacity));
             }
+            NodeAlgo::Flooding => {
+                panic!(
+                    "run_stagger_population received a Flooding node \
+                     (id={id}); flooding populations should go through \
+                     run_flooding"
+                );
+            }
         }
     }
 
-    // Wire connections by (src_kind, dst_kind).
-    for (src, peers) in topology.iter().enumerate() {
-        for &dst in peers {
-            let dst = dst as usize;
+    // Wire connections by (src_kind, dst_kind) over the peer graph.
+    for src in topology.node_ids() {
+        for dst in topology.peer_ids(src) {
             wire_connection(
                 src,
                 dst,
-                &assignments,
+                topology,
                 &mut cln_nodes,
                 &mut lnd_nodes,
                 &cln_mboxes,
@@ -467,18 +501,26 @@ fn run_stagger_population(
         }
     }
 
-    let mut bench = SimInit::new();
+    let mut bench = new_sim_init(cfg);
 
     // Build originate sources before consuming nodes/mboxes.
     let mut originate_sources: Vec<Option<EventId<Gossip>>> = Vec::with_capacity(n);
-    for (i, algo) in assignments.iter().enumerate() {
+    for id in 0..n as NodeId {
+        let algo = &topology.node_meta(id).algo;
         let src = match algo {
-            NodeAlgoKind::Cln { .. } => EventSource::<Gossip>::new()
-                .connect(ClnNode::originate, &cln_mboxes[cln_local[i].unwrap()])
+            NodeAlgo::Cln { .. } => EventSource::<Gossip>::new()
+                .connect(
+                    ClnNode::originate,
+                    &cln_mboxes[cln_local[id as usize].unwrap()],
+                )
                 .register(&mut bench),
-            NodeAlgoKind::Lnd { .. } => EventSource::<Gossip>::new()
-                .connect(LndNode::originate, &lnd_mboxes[lnd_local[i].unwrap()])
+            NodeAlgo::Lnd { .. } => EventSource::<Gossip>::new()
+                .connect(
+                    LndNode::originate,
+                    &lnd_mboxes[lnd_local[id as usize].unwrap()],
+                )
                 .register(&mut bench),
+            NodeAlgo::Flooding => unreachable!("guarded above"),
         };
         originate_sources.push(Some(src));
     }
@@ -507,17 +549,19 @@ fn run_stagger_population(
     )
 }
 
-fn stagger_of(algo: &NodeAlgoKind) -> Duration {
+fn stagger_of(algo: &NodeAlgo) -> Duration {
     match algo {
-        NodeAlgoKind::Cln { stagger_ms } => Duration::from_millis(*stagger_ms),
-        NodeAlgoKind::Lnd { stagger_ms, .. } => Duration::from_millis(*stagger_ms),
+        NodeAlgo::Cln { stagger_ms } => Duration::from_millis(*stagger_ms),
+        NodeAlgo::Lnd { stagger_ms, .. } => Duration::from_millis(*stagger_ms),
+        NodeAlgo::Flooding => Duration::ZERO,
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn wire_connection(
-    src: usize,
-    dst: usize,
-    assignments: &[NodeAlgoKind],
+    src: NodeId,
+    dst: NodeId,
+    topology: &Topology,
     cln_nodes: &mut [ClnNode],
     lnd_nodes: &mut [LndNode],
     cln_mboxes: &[Mailbox<ClnNode>],
@@ -525,29 +569,30 @@ fn wire_connection(
     cln_local: &[Option<usize>],
     lnd_local: &[Option<usize>],
 ) {
-    let src_algo = &assignments[src];
-    let dst_algo = &assignments[dst];
+    let src_algo = &topology.node_meta(src).algo;
+    let dst_algo = &topology.node_meta(dst).algo;
     match (src_algo, dst_algo) {
-        (NodeAlgoKind::Cln { .. }, NodeAlgoKind::Cln { .. }) => {
-            let s = cln_local[src].unwrap();
-            let d = cln_local[dst].unwrap();
+        (NodeAlgo::Cln { .. }, NodeAlgo::Cln { .. }) => {
+            let s = cln_local[src as usize].unwrap();
+            let d = cln_local[dst as usize].unwrap();
             cln_nodes[s].out.connect(ClnNode::recv, &cln_mboxes[d]);
         }
-        (NodeAlgoKind::Cln { .. }, NodeAlgoKind::Lnd { .. }) => {
-            let s = cln_local[src].unwrap();
-            let d = lnd_local[dst].unwrap();
+        (NodeAlgo::Cln { .. }, NodeAlgo::Lnd { .. }) => {
+            let s = cln_local[src as usize].unwrap();
+            let d = lnd_local[dst as usize].unwrap();
             cln_nodes[s].out.connect(LndNode::recv, &lnd_mboxes[d]);
         }
-        (NodeAlgoKind::Lnd { .. }, NodeAlgoKind::Cln { .. }) => {
-            let s = lnd_local[src].unwrap();
-            let d = cln_local[dst].unwrap();
+        (NodeAlgo::Lnd { .. }, NodeAlgo::Cln { .. }) => {
+            let s = lnd_local[src as usize].unwrap();
+            let d = cln_local[dst as usize].unwrap();
             lnd_nodes[s].out.connect(ClnNode::recv, &cln_mboxes[d]);
         }
-        (NodeAlgoKind::Lnd { .. }, NodeAlgoKind::Lnd { .. }) => {
-            let s = lnd_local[src].unwrap();
-            let d = lnd_local[dst].unwrap();
+        (NodeAlgo::Lnd { .. }, NodeAlgo::Lnd { .. }) => {
+            let s = lnd_local[src as usize].unwrap();
+            let d = lnd_local[dst as usize].unwrap();
             lnd_nodes[s].out.connect(LndNode::recv, &lnd_mboxes[d]);
         }
+        _ => unreachable!("Flooding nodes are routed via run_flooding"),
     }
 }
 

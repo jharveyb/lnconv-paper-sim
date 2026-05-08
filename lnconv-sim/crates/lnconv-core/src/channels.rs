@@ -6,6 +6,10 @@
 //! and the other to `direction = 1`. This mirrors how each side of a
 //! Lightning channel emits its own `channel_update` for that direction.
 //!
+//! `ChannelRegistry::build` populates the topology's `channels` directed
+//! graph (one edge per direction) AND caches `owner` / `channels_for`
+//! lookup tables for O(1) access from event-stream generators.
+//!
 //! The registry is read-only after construction. It's consumed by the
 //! event-stream generators (to look up the originator for each
 //! `(scid, direction)` they sample) and at startup logging.
@@ -17,17 +21,24 @@ use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
 use crate::message::{Direction, NodeId, Scid};
+use crate::topology::Topology;
 
 pub struct ChannelRegistry {
     pub num_scids: u32,
     /// `channels[scid as usize] = (owner_for_dir_0, owner_for_dir_1)`.
+    /// Cached for O(1) `owner(scid, dir)`.
     channels: Vec<(NodeId, NodeId)>,
     /// `per_node[node] = list of (scid, direction)` this node owns.
+    /// Cached for O(1) `channels_for(node)`.
     per_node: Vec<Vec<(Scid, Direction)>>,
 }
 
 impl ChannelRegistry {
-    pub fn build(num_scids: u32, num_nodes: usize, seed: u64) -> Self {
+    /// Sample `num_scids` channels, populate the topology's `channels`
+    /// graph (one directed edge per direction), and cache the owner
+    /// lookup tables.
+    pub fn build(topology: &mut Topology, num_scids: u32, seed: u64) -> Self {
+        let num_nodes = topology.len();
         assert!(num_nodes >= 2, "need at least two nodes to form a channel");
         let mut rng = ChaCha8Rng::seed_from_u64(seed ^ 0xC4A);
         let mut channels: Vec<(NodeId, NodeId)> = Vec::with_capacity(num_scids as usize);
@@ -44,6 +55,10 @@ impl ChannelRegistry {
             channels.push((d0, d1));
             per_node[d0 as usize].push((scid, 0));
             per_node[d1 as usize].push((scid, 1));
+            // Mirror the (scid, direction) pair into the topology's
+            // channels graph: outgoing edge from d0, incoming edge into
+            // d1, both carrying `scid`.
+            topology.add_channel(scid, d0, d1);
         }
         Self {
             num_scids,
@@ -76,11 +91,18 @@ impl ChannelRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::topology::{NodeAlgo, Topology};
+
+    fn topo(n: usize) -> Topology {
+        Topology::empty(n, NodeAlgo::Flooding)
+    }
 
     #[test]
     fn build_is_deterministic() {
-        let a = ChannelRegistry::build(100, 50, 42);
-        let b = ChannelRegistry::build(100, 50, 42);
+        let mut t1 = topo(50);
+        let mut t2 = topo(50);
+        let a = ChannelRegistry::build(&mut t1, 100, 42);
+        let b = ChannelRegistry::build(&mut t2, 100, 42);
         for scid in 0..100 {
             assert_eq!(a.owner(scid, 0), b.owner(scid, 0));
             assert_eq!(a.owner(scid, 1), b.owner(scid, 1));
@@ -89,7 +111,8 @@ mod tests {
 
     #[test]
     fn owner_matches_channels_for() {
-        let r = ChannelRegistry::build(200, 30, 7);
+        let mut t = topo(30);
+        let r = ChannelRegistry::build(&mut t, 200, 7);
         for scid in 0..200u32 {
             for dir in [0u8, 1u8] {
                 let owner = r.owner(scid, dir);
@@ -100,9 +123,25 @@ mod tests {
 
     #[test]
     fn directions_are_distinct_nodes() {
-        let r = ChannelRegistry::build(50, 10, 1);
+        let mut t = topo(10);
+        let r = ChannelRegistry::build(&mut t, 50, 1);
         for scid in 0..50u32 {
             assert_ne!(r.owner(scid, 0), r.owner(scid, 1));
+        }
+    }
+
+    /// Cross-check: every (scid, direction) the registry says is owned
+    /// by node N must also be reachable from N's vertex in the topology
+    /// channels graph.
+    #[test]
+    fn topology_channels_match_registry() {
+        let mut t = topo(20);
+        let r = ChannelRegistry::build(&mut t, 80, 99);
+        for node in 0..20u32 {
+            let from_registry: std::collections::HashSet<_> =
+                r.channels_for(node).iter().copied().collect();
+            let from_graph: std::collections::HashSet<_> = t.channels_for(node).collect();
+            assert_eq!(from_registry, from_graph, "mismatch for node {node}");
         }
     }
 }

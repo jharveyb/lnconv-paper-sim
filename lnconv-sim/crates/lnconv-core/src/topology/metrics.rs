@@ -1,17 +1,18 @@
 //! Topology stats — degree, diameter, mean path length, connectedness.
 //!
-//! Computed via BFS from each (or a sample of) source node. Useful as a
-//! pre-flight check: propagation time for any algorithm scales with
-//! diameter, so if the printed diameter looks crazy (e.g. thousands)
-//! you're about to run a sim that won't converge.
+//! Computed via [`petgraph::algo::dijkstra`] on the peer graph (unit
+//! edge weights). Useful as a pre-flight check: propagation time for any
+//! algorithm scales with diameter, so if the printed diameter looks
+//! crazy (e.g. thousands) you're about to run a sim that won't converge.
 
-use std::collections::VecDeque;
+use petgraph::algo::dijkstra;
 
 use rand::SeedableRng;
 use rand::seq::IndexedRandom;
 use rand_chacha::ChaCha8Rng;
 
 use super::Topology;
+use crate::message::NodeId;
 
 #[derive(Debug)]
 pub struct TopologyMetrics {
@@ -44,18 +45,22 @@ pub fn compute(
     sample_sources: usize,
 ) -> TopologyMetrics {
     let n = topo.len();
-    let edges = topo.iter().map(|p| p.len()).sum::<usize>() / 2;
-    let degs: Vec<usize> = topo.iter().map(|p| p.len()).collect();
+    let edges = topo.peers.edge_count();
+    let degs: Vec<usize> = topo
+        .peers
+        .node_indices()
+        .map(|nx| topo.peers.neighbors(nx).count())
+        .collect();
     let min_degree = *degs.iter().min().unwrap_or(&0);
     let max_degree = *degs.iter().max().unwrap_or(&0);
     let mean_degree = degs.iter().sum::<usize>() as f64 / n.max(1) as f64;
 
     let exact = n <= max_exact_n;
-    let sources: Vec<u32> = if exact {
-        (0..n as u32).collect()
+    let sources: Vec<NodeId> = if exact {
+        (0..n as NodeId).collect()
     } else {
         let mut rng = ChaCha8Rng::seed_from_u64(seed ^ 0xBF5);
-        let pool: Vec<u32> = (0..n as u32).collect();
+        let pool: Vec<NodeId> = (0..n as NodeId).collect();
         pool.choose_multiple(&mut rng, sample_sources.min(n))
             .copied()
             .collect()
@@ -67,15 +72,15 @@ pub fn compute(
     let mut largest_component = 0usize;
     let mut connected = true;
     for &src in &sources {
-        let dist = bfs_distances(topo, src);
-        let mut reachable = 0usize;
-        for &d in &dist {
-            if d != u32::MAX {
-                max_dist = max_dist.max(d);
-                total_dist += d as u64;
-                total_pairs += 1;
-                reachable += 1;
-            }
+        // dijkstra with unit edge weights == BFS distance, with the
+        // benefit of a tested implementation. Returns a HashMap of
+        // NodeIndex → distance for every reachable node.
+        let dists = dijkstra(&topo.peers, Topology::nidx(src), None, |_| 1u32);
+        let reachable = dists.len();
+        for &d in dists.values() {
+            max_dist = max_dist.max(d);
+            total_dist += d as u64;
+            total_pairs += 1;
         }
         largest_component = largest_component.max(reachable);
         if reachable < n {
@@ -102,22 +107,4 @@ pub fn compute(
         connected,
         largest_component_seen: largest_component,
     }
-}
-
-fn bfs_distances(topo: &Topology, src: u32) -> Vec<u32> {
-    let n = topo.len();
-    let mut dist = vec![u32::MAX; n];
-    dist[src as usize] = 0;
-    let mut q = VecDeque::new();
-    q.push_back(src);
-    while let Some(u) = q.pop_front() {
-        let d = dist[u as usize];
-        for &v in &topo[u as usize] {
-            if dist[v as usize] == u32::MAX {
-                dist[v as usize] = d + 1;
-                q.push_back(v);
-            }
-        }
-    }
-    dist
 }

@@ -12,4 +12,6 @@ anyhow.workspace = true
 rand.workspace = true
 rand_chacha.workspace = true
 rustworkx-core.workspace = true
+petgraph.workspace = true
 statrs.workspace = true
+scc.workspace = true
