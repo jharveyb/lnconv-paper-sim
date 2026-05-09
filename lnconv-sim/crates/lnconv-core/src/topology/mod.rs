@@ -12,6 +12,7 @@
 //! [`graph`] for details.
 
 pub mod graph;
+pub mod ln_data;
 pub mod metrics;
 pub mod synthetic;
 

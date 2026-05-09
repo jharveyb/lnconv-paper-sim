@@ -22,9 +22,12 @@ fn main() {
         // Vertex algo doesn't matter for the BFS — pass anything.
         let g = synthetic::random_regular(n, k, seed, NodeAlgo::Flooding);
         let m = metrics::compute(&g, seed, 2000, 1000);
+        // Synthetic random_regular has no channels yet, so only peers
+        // matters; print its block.
+        let p = &m.peers;
         println!(
             "{:>8} {:>4}   {:>9} {:>9.2} {:>10} {:>9}",
-            n, k, m.diameter, m.mean_path_length, m.edges, m.exact
+            n, k, p.diameter, p.mean_path_length, p.edges, p.exact
         );
     }
 }

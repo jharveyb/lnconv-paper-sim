@@ -34,11 +34,11 @@ pub struct PoissonRandom {
 impl EventSchedule for PoissonRandom {
     fn build(
         &self,
-        num_nodes: usize,
+        nodes: &[NodeId],
         max: Duration,
         registry: &ChannelRegistry,
     ) -> Vec<(Duration, NodeId, Gossip)> {
-        if self.rate_per_sec <= 0.0 || num_nodes == 0 || registry.len() == 0 {
+        if self.rate_per_sec <= 0.0 || nodes.is_empty() || registry.is_empty() {
             return Vec::new();
         }
         let mut rng = ChaCha8Rng::seed_from_u64(self.seed);
@@ -47,7 +47,6 @@ impl EventSchedule for PoissonRandom {
         let mut t_secs = 0.0_f64;
         let mut events = Vec::new();
         let mut next_id: u32 = 0;
-        let num_scids = registry.num_scids;
         loop {
             // Strict (0, 1) so inverse_cdf never sees the boundary value.
             let u = rng.random::<f64>().clamp(f64::EPSILON, 1.0 - f64::EPSILON);
@@ -56,9 +55,7 @@ impl EventSchedule for PoissonRandom {
             if t_secs > max_secs {
                 break;
             }
-            let scid = rng.random_range(0..num_scids);
-            let direction: u8 = if rng.random::<bool>() { 1 } else { 0 };
-            let origin = registry.owner(scid, direction);
+            let (scid, direction, origin) = registry.random_channel(&mut rng);
             events.push((
                 Duration::from_secs_f64(t_secs),
                 origin,

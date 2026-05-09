@@ -24,6 +24,7 @@
 //! (the soonest of: deadline, next scheduled event, next progress tick),
 //! then handling whatever became due.
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -60,29 +61,99 @@ pub struct RunResult {
 /// metrics handle now so finalized summaries can be computed
 /// incrementally as messages reach 100% coverage.
 pub fn run(cfg: &SimConfig, percentiles: Vec<f64>) -> Result<RunResult> {
-    // Build the topology with a default algo derived from cfg.algo.
-    // For Mix we overwrite per-vertex algo just below.
+    // Topology build is split into three phases so per-vertex algo
+    // can drive the per-vertex peer-build `k`:
+    //   1. Vertices are added with `default_algo`.
+    //   2. For Mix, per-vertex algos are replaced from `assign_mix`.
+    //   3. Channels are loaded; the peer graph is built using each
+    //      vertex's (now-final) algo to look up its `k`.
+    //
+    // KRegular's vertex degree is fixed at config.topology.k for ALL
+    // vertices regardless of algo (true k-regular guarantee), so step
+    // 3 is collapsed into step 1 for that variant.
     let default_algo = default_algo_from(&cfg.algo);
-    let mut topology = match &cfg.topology {
-        TopologyCfg::KRegular { n, k } => synthetic::random_regular(*n, *k, cfg.seed, default_algo),
+    let (mut topology, snap_for_csv) = match &cfg.topology {
+        TopologyCfg::KRegular { n, k } => (
+            synthetic::random_regular(*n, *k, cfg.seed, default_algo.clone()),
+            None,
+        ),
+        TopologyCfg::FromCsv {
+            nodes_csv,
+            channels_csv,
+            ..
+        } => {
+            if cfg.channels.is_some() {
+                eprintln!(
+                    "warning: [channels] block is ignored when topology.kind = \"from_csv\"; \
+                     the CSV provides the channel set"
+                );
+            }
+            let snap = crate::topology::ln_data::load(nodes_csv, channels_csv, cfg.seed)
+                .map_err(|e| anyhow::anyhow!("CSV load failed: {e}"))?;
+            println!(
+                "loaded {} nodes, {} channels from CSVs",
+                snap.nodes.len(),
+                snap.channels.len()
+            );
+            let mut topo = Topology::with_capacity(snap.nodes.len());
+            for &id in &snap.nodes {
+                topo.add_node(id, default_algo.clone());
+            }
+            (topo, Some(snap))
+        }
     };
-    let topo_stats = topology_metrics::compute(&topology, cfg.seed, 2000, 1000);
-    println!("topology: {topo_stats:#?}");
-    let n = topology.len();
 
-    // For mix, replace per-vertex algos with the assigned distribution.
+    // Step 2: Mix per-vertex algo assignment. Must happen *before* the
+    // FromCsv peer graph is built so per-impl `k` resolves correctly.
+    let n = topology.len();
     if let AlgoCfg::Mix { population } = &cfg.algo {
         let assignments = assign_mix(n, population, cfg.seed);
-        for (i, kind) in assignments.iter().enumerate() {
-            topology.node_meta_mut(i as NodeId).algo = NodeAlgo::from(kind);
+        for (nx, kind) in topology.peers.node_indices().zip(assignments.iter()) {
+            topology.peers[nx].algo = NodeAlgo::from(kind);
         }
         log_mix_summary(&assignments);
     }
 
-    // Build the channel registry. Mutates the topology's `channels`
-    // graph in addition to caching owner-lookup tables for event
-    // streams.
-    let registry = ChannelRegistry::build(&mut topology, cfg.channels.count, cfg.seed);
+    // Step 3: channels + peer graph (FromCsv only — KRegular finished in step 1).
+    let registry = match &cfg.topology {
+        TopologyCfg::KRegular { .. } => {
+            let num_scids = cfg
+                .channels
+                .as_ref()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("[channels] block is required for topology.kind = \"k_regular\"")
+                })?
+                .count;
+            ChannelRegistry::build(&mut topology, num_scids, cfg.seed)
+        }
+        TopologyCfg::FromCsv {
+            k,
+            enforce_hub_cap,
+            ..
+        } => {
+            let snap = snap_for_csv.expect("snap is Some for FromCsv");
+            let registry = ChannelRegistry::from_iter(&mut topology, snap.channels.iter().copied());
+            let k_cln = k.cln;
+            let k_lnd = k.lnd;
+            let k_flooding = k.flooding;
+            let k_for = move |a: &NodeAlgo| match a {
+                NodeAlgo::Flooding => k_flooding,
+                NodeAlgo::Cln { .. } => k_cln,
+                NodeAlgo::Lnd { .. } => k_lnd,
+            };
+            crate::topology::synthetic::build_peer_graph(
+                &mut topology,
+                k_for,
+                cfg.seed,
+                *enforce_hub_cap,
+            );
+            registry
+        }
+    };
+
+    let topo_stats = topology_metrics::compute(&topology, cfg.seed, 2000, 1000);
+    println!("topology: {topo_stats:#?}");
+
     println!(
         "channels: count={} (mean {:.1} per node)",
         registry.num_scids,
@@ -92,7 +163,11 @@ pub fn run(cfg: &SimConfig, percentiles: Vec<f64>) -> Result<RunResult> {
     let metrics = MetricsHandle::new(n, percentiles);
     let run_duration = Duration::from_secs(cfg.run.duration_seconds);
 
-    let event_tuples = build_events(cfg, n, run_duration, &registry);
+    // Snapshot the topology's NodeIds in NodeIdx order so event
+    // streams can address nodes by vertex index (OneShotSingle) or
+    // iterate them all (OneShotAll, PoissonRandom).
+    let nodes_in_order: Vec<NodeId> = topology.node_ids().collect();
+    let event_tuples = build_events(cfg, &nodes_in_order, run_duration, &registry);
     println!(
         "events: scheduled {} message(s) over the run window",
         event_tuples.len()
@@ -163,22 +238,22 @@ fn new_sim_init(cfg: &SimConfig) -> SimInit {
 
 fn build_events(
     cfg: &SimConfig,
-    n: usize,
+    nodes: &[NodeId],
     max: Duration,
     registry: &ChannelRegistry,
-) -> Vec<(Duration, u32, Gossip)> {
+) -> Vec<(Duration, NodeId, Gossip)> {
     let mut tuples = match &cfg.event {
         EventCfg::OneShotSingle { node } => OneShotSingle {
             node: *node,
             at: Duration::ZERO,
             size_bytes: 1024,
         }
-        .build(n, max, registry),
+        .build(nodes, max, registry),
         EventCfg::OneShotAll {} => OneShotAll {
             at: Duration::ZERO,
             size_bytes: 1024,
         }
-        .build(n, max, registry),
+        .build(nodes, max, registry),
         EventCfg::PoissonRandom {
             rate_per_sec,
             size_bytes,
@@ -187,7 +262,7 @@ fn build_events(
             seed: cfg.seed ^ 0xE7E,
             size_bytes: *size_bytes,
         }
-        .build(n, max, registry),
+        .build(nodes, max, registry),
     };
     tuples.sort_by_key(|(t, _, _)| *t);
     tuples
@@ -266,8 +341,8 @@ fn log_mix_summary(assignments: &[NodeAlgoKind]) {
 /// pattern) so we never re-scan them.
 fn drive_simulation(
     simu: &mut Simulation,
-    originate_sources: Vec<EventId<Gossip>>,
-    events: Vec<(Duration, u32, Gossip)>,
+    originate_sources: HashMap<NodeId, EventId<Gossip>>,
+    events: Vec<(Duration, NodeId, Gossip)>,
     metrics: &MetricsHandle,
     deadline: MonotonicTime,
     progress_interval_secs: u64,
@@ -308,7 +383,10 @@ fn drive_simulation(
             let event_time = MonotonicTime::EPOCH + peek.0;
             if event_time <= simu.time() {
                 let (_t, src, msg) = next_event.take().unwrap();
-                simu.process_event(&originate_sources[src as usize], msg)
+                let event_id = originate_sources
+                    .get(&src)
+                    .ok_or_else(|| anyhow::anyhow!("no originate source for node id {src}"))?;
+                simu.process_event(event_id, msg)
                     .map_err(|e| anyhow::anyhow!("process_event failed: {e:?}"))?;
                 next_event = events_iter.next();
             } else {
@@ -364,35 +442,44 @@ fn run_flooding(
     topology: &Topology,
     metrics: MetricsHandle,
     forward_delay: Duration,
-    events: Vec<(Duration, u32, Gossip)>,
+    events: Vec<(Duration, NodeId, Gossip)>,
     deadline: MonotonicTime,
 ) -> Result<()> {
     let n = topology.len();
-    let mut nodes: Vec<FloodingNode> = (0..n)
-        .map(|i| FloodingNode::new(i as u32, forward_delay, metrics.clone()))
+    // Drive construction by NodeIndex so `idx` is dense 0..n while
+    // `id` is whatever NodeMeta carries (dense for synthetic, sparse
+    // u64 hash for CSV-loaded).
+    let mut nodes: Vec<FloodingNode> = topology
+        .peers
+        .node_indices()
+        .map(|nx| {
+            let meta = &topology.peers[nx];
+            FloodingNode::new(meta.id, meta.idx, forward_delay, metrics.clone())
+        })
         .collect();
     let mboxes: Vec<Mailbox<FloodingNode>> = (0..n)
         .map(|_| Mailbox::with_capacity(cfg.run.mailbox_capacity))
         .collect();
 
-    for src in topology.node_ids() {
-        for dst in topology.peer_ids(src) {
-            nodes[src as usize]
+    for nx in topology.peers.node_indices() {
+        for ny in topology.peers.neighbors(nx) {
+            nodes[nx.index()]
                 .out
-                .connect(FloodingNode::recv, &mboxes[dst as usize]);
+                .connect(FloodingNode::recv, &mboxes[ny.index()]);
         }
     }
 
     let mut bench = new_sim_init(cfg);
-    let originate_sources: Vec<EventId<Gossip>> = (0..n)
-        .map(|i| {
-            EventSource::<Gossip>::new()
-                .connect(FloodingNode::originate, &mboxes[i])
-                .register(&mut bench)
-        })
-        .collect();
+    let mut originate_sources: HashMap<NodeId, EventId<Gossip>> = HashMap::with_capacity(n);
+    for nx in topology.peers.node_indices() {
+        let id = topology.peers[nx].id;
+        let event_id = EventSource::<Gossip>::new()
+            .connect(FloodingNode::originate, &mboxes[nx.index()])
+            .register(&mut bench);
+        originate_sources.insert(id, event_id);
+    }
 
-    for (i, (node, mbox)) in nodes.into_iter().zip(mboxes.into_iter()).enumerate() {
+    for (i, (node, mbox)) in nodes.into_iter().zip(mboxes).enumerate() {
         let name = format!("n{i}");
         bench = bench.add_model(node, mbox, &name);
     }
@@ -430,11 +517,15 @@ fn run_stagger_population(
     cfg: &SimConfig,
     topology: &Topology,
     metrics: MetricsHandle,
-    events: Vec<(Duration, u32, Gossip)>,
+    events: Vec<(Duration, NodeId, Gossip)>,
     deadline: MonotonicTime,
 ) -> Result<()> {
     let n = topology.len();
 
+    // cln_local[i] / lnd_local[i] map a vertex's NodeIndex (dense
+    // 0..n) to its position in the per-type Vec<ClnNode> /
+    // Vec<LndNode>. We can't unify those two vectors because the model
+    // types differ.
     let mut cln_local: Vec<Option<usize>> = vec![None; n];
     let mut lnd_local: Vec<Option<usize>> = vec![None; n];
     let mut cln_nodes: Vec<ClnNode> = Vec::new();
@@ -444,14 +535,18 @@ fn run_stagger_population(
 
     let mut rng = ChaCha8Rng::seed_from_u64(cfg.seed ^ 0xC1A);
 
-    for id in 0..n as NodeId {
-        let algo = &topology.node_meta(id).algo;
+    for nx in topology.peers.node_indices() {
+        let meta = &topology.peers[nx];
+        let id = meta.id;
+        let idx = meta.idx;
+        let algo = &meta.algo;
         let phase = sample_phase(&mut rng, stagger_of(algo));
         match algo {
             NodeAlgo::Cln { stagger_ms } => {
-                cln_local[id as usize] = Some(cln_nodes.len());
+                cln_local[nx.index()] = Some(cln_nodes.len());
                 cln_nodes.push(ClnNode::new(
                     id,
+                    idx,
                     Duration::from_millis(*stagger_ms),
                     phase,
                     metrics.clone(),
@@ -463,9 +558,10 @@ fn run_stagger_population(
                 trickle_ms,
                 min_batch_size,
             } => {
-                lnd_local[id as usize] = Some(lnd_nodes.len());
+                lnd_local[nx.index()] = Some(lnd_nodes.len());
                 lnd_nodes.push(LndNode::new(
                     id,
+                    idx,
                     Duration::from_millis(*stagger_ms),
                     phase,
                     Duration::from_millis(*trickle_ms),
@@ -485,11 +581,11 @@ fn run_stagger_population(
     }
 
     // Wire connections by (src_kind, dst_kind) over the peer graph.
-    for src in topology.node_ids() {
-        for dst in topology.peer_ids(src) {
+    for nx in topology.peers.node_indices() {
+        for ny in topology.peers.neighbors(nx) {
             wire_connection(
-                src,
-                dst,
+                nx.index(),
+                ny.index(),
                 topology,
                 &mut cln_nodes,
                 &mut lnd_nodes,
@@ -503,35 +599,35 @@ fn run_stagger_population(
 
     let mut bench = new_sim_init(cfg);
 
-    // Build originate sources before consuming nodes/mboxes.
-    let mut originate_sources: Vec<Option<EventId<Gossip>>> = Vec::with_capacity(n);
-    for id in 0..n as NodeId {
-        let algo = &topology.node_meta(id).algo;
-        let src = match algo {
+    // Build originate sources keyed by NodeId. The driver's
+    // `process_event` looks them up by id; for CSV-loaded sparse ids
+    // a HashMap is necessary, and it works for synthetic too.
+    let mut originate_sources: HashMap<NodeId, EventId<Gossip>> = HashMap::with_capacity(n);
+    for nx in topology.peers.node_indices() {
+        let meta = &topology.peers[nx];
+        let event_id = match &meta.algo {
             NodeAlgo::Cln { .. } => EventSource::<Gossip>::new()
                 .connect(
                     ClnNode::originate,
-                    &cln_mboxes[cln_local[id as usize].unwrap()],
+                    &cln_mboxes[cln_local[nx.index()].unwrap()],
                 )
                 .register(&mut bench),
             NodeAlgo::Lnd { .. } => EventSource::<Gossip>::new()
                 .connect(
                     LndNode::originate,
-                    &lnd_mboxes[lnd_local[id as usize].unwrap()],
+                    &lnd_mboxes[lnd_local[nx.index()].unwrap()],
                 )
                 .register(&mut bench),
             NodeAlgo::Flooding => unreachable!("guarded above"),
         };
-        originate_sources.push(Some(src));
+        originate_sources.insert(meta.id, event_id);
     }
-    let originate_sources: Vec<EventId<Gossip>> =
-        originate_sources.into_iter().map(|s| s.unwrap()).collect();
 
     // Add models.
-    for (local_idx, (node, mbox)) in cln_nodes.into_iter().zip(cln_mboxes.into_iter()).enumerate() {
+    for (local_idx, (node, mbox)) in cln_nodes.into_iter().zip(cln_mboxes).enumerate() {
         bench = bench.add_model(node, mbox, &format!("cln{local_idx}"));
     }
-    for (local_idx, (node, mbox)) in lnd_nodes.into_iter().zip(lnd_mboxes.into_iter()).enumerate() {
+    for (local_idx, (node, mbox)) in lnd_nodes.into_iter().zip(lnd_mboxes).enumerate() {
         bench = bench.add_model(node, mbox, &format!("lnd{local_idx}"));
     }
 
@@ -559,8 +655,8 @@ fn stagger_of(algo: &NodeAlgo) -> Duration {
 
 #[allow(clippy::too_many_arguments)]
 fn wire_connection(
-    src: NodeId,
-    dst: NodeId,
+    src: usize,
+    dst: usize,
     topology: &Topology,
     cln_nodes: &mut [ClnNode],
     lnd_nodes: &mut [LndNode],
@@ -569,27 +665,27 @@ fn wire_connection(
     cln_local: &[Option<usize>],
     lnd_local: &[Option<usize>],
 ) {
-    let src_algo = &topology.node_meta(src).algo;
-    let dst_algo = &topology.node_meta(dst).algo;
+    let src_algo = &topology.peers[petgraph::graph::NodeIndex::new(src)].algo;
+    let dst_algo = &topology.peers[petgraph::graph::NodeIndex::new(dst)].algo;
     match (src_algo, dst_algo) {
         (NodeAlgo::Cln { .. }, NodeAlgo::Cln { .. }) => {
-            let s = cln_local[src as usize].unwrap();
-            let d = cln_local[dst as usize].unwrap();
+            let s = cln_local[src].unwrap();
+            let d = cln_local[dst].unwrap();
             cln_nodes[s].out.connect(ClnNode::recv, &cln_mboxes[d]);
         }
         (NodeAlgo::Cln { .. }, NodeAlgo::Lnd { .. }) => {
-            let s = cln_local[src as usize].unwrap();
-            let d = lnd_local[dst as usize].unwrap();
+            let s = cln_local[src].unwrap();
+            let d = lnd_local[dst].unwrap();
             cln_nodes[s].out.connect(LndNode::recv, &lnd_mboxes[d]);
         }
         (NodeAlgo::Lnd { .. }, NodeAlgo::Cln { .. }) => {
-            let s = lnd_local[src as usize].unwrap();
-            let d = cln_local[dst as usize].unwrap();
+            let s = lnd_local[src].unwrap();
+            let d = cln_local[dst].unwrap();
             lnd_nodes[s].out.connect(ClnNode::recv, &cln_mboxes[d]);
         }
         (NodeAlgo::Lnd { .. }, NodeAlgo::Lnd { .. }) => {
-            let s = lnd_local[src as usize].unwrap();
-            let d = lnd_local[dst as usize].unwrap();
+            let s = lnd_local[src].unwrap();
+            let d = lnd_local[dst].unwrap();
             lnd_nodes[s].out.connect(LndNode::recv, &lnd_mboxes[d]);
         }
         _ => unreachable!("Flooding nodes are routed via run_flooding"),

@@ -6,13 +6,19 @@
 //! `seed` via xor'd subseeds, so two runs with the same TOML produce
 //! bit-identical output.
 
+use std::path::PathBuf;
+
 use serde::Deserialize;
 
 #[derive(Deserialize, Debug)]
 pub struct SimConfig {
     pub seed: u64,
     pub topology: TopologyCfg,
-    pub channels: ChannelsCfg,
+    /// Optional when `topology.kind = "from_csv"` — the channel set is
+    /// then determined by the CSV instead. Required for synthetic
+    /// `topology.kind = "k_regular"`.
+    #[serde(default)]
+    pub channels: Option<ChannelsCfg>,
     pub latency: LatencyCfg,
     pub algo: AlgoCfg,
     pub event: EventCfg,
@@ -33,6 +39,40 @@ pub struct ChannelsCfg {
 pub enum TopologyCfg {
     /// True k-regular random graph (no parallel edges, no self-loops).
     KRegular { n: usize, k: usize },
+    /// Load nodes + channels from CSV files (real LN snapshot). The
+    /// channel graph is taken verbatim; the peer graph is built from
+    /// it via the `k`-driven rule (see `topology::synthetic::build_peer_graph`):
+    ///
+    /// - nodes with > 100 channel counterparties: keep 100 random ones as peers.
+    /// - nodes with `k <= c <= 100` counterparties: keep all (no extra strangers).
+    /// - nodes with `c < k` counterparties: keep all + `k - c - 1` strangers.
+    ///
+    /// `k` is per-impl-type — different gossip algorithms target
+    /// different peer-degrees in real LN (LND nodes are typically
+    /// thinner than CLN). For `algo.kind = "mix"`, each vertex's k is
+    /// resolved from its assigned algorithm.
+    ///
+    /// `enforce_hub_cap` (default false): when true, hubs (`c > 100`)
+    /// pre-commit to their 100 picks and any peer-edge into a hub from
+    /// a node *not* in that pick set is silently dropped. Each dropped
+    /// edge is replaced with a stranger in a phase-3 top-up so total
+    /// edge count is preserved.
+    FromCsv {
+        nodes_csv: PathBuf,
+        channels_csv: PathBuf,
+        k: KByAlgo,
+        #[serde(default)]
+        enforce_hub_cap: bool,
+    },
+}
+
+/// Per-impl-type peer-build threshold `k`. Used by `FromCsv` topology
+/// to give different gossip algorithms different target peer-degrees.
+#[derive(Deserialize, Debug, Clone)]
+pub struct KByAlgo {
+    pub flooding: usize,
+    pub cln: usize,
+    pub lnd: usize,
 }
 
 #[derive(Deserialize, Debug)]
@@ -84,7 +124,10 @@ pub enum NodeAlgoKind {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EventCfg {
     OneShotSingle {
-        node: u32,
+        /// Vertex *index* into the topology's NodeId order (0..n). For
+        /// synthetic configs this matches the NodeId numerically; for
+        /// CSV-loaded configs it picks the n-th row of `node_list.csv`.
+        node: usize,
     },
     OneShotAll {},
     /// Poisson-process stream of `rate_per_sec` messages from random nodes,
@@ -109,6 +152,11 @@ pub struct RunCfg {
     /// seconds. 0 disables progress output.
     #[serde(default = "default_progress_interval")]
     pub progress_interval_seconds: u64,
+    /// NeXosim executor worker-thread count. `None` (the default) lets
+    /// NeXosim use all logical cores. The CLI's `--threads` flag
+    /// overrides this when set.
+    #[serde(default)]
+    pub threads: Option<usize>,
 }
 
 fn default_mailbox_capacity() -> usize {

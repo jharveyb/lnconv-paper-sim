@@ -23,4 +23,4 @@ pub mod node;
 pub mod sim;
 pub mod topology;
 
-pub use message::{Direction, Gossip, GossipKind, MsgId, NodeId, Scid, WireMessage};
+pub use message::{Direction, Gossip, GossipKind, MsgId, NodeId, NodeIdx, Scid, WireMessage};

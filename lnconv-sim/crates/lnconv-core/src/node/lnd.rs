@@ -32,12 +32,13 @@ use nexosim::ports::Output;
 use nexosim::time::MonotonicTime;
 use serde::{Deserialize, Serialize};
 
-use crate::message::{Direction, Gossip, NodeId, Scid, WireMessage};
+use crate::message::{Direction, Gossip, NodeId, NodeIdx, Scid, WireMessage};
 use crate::metrics::MetricsHandle;
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct LndNode {
     pub id: NodeId,
+    pub idx: NodeIdx,
     pub out: Output<WireMessage>,
     stagger: Duration,
     /// Sampled offset of this node's first stagger tick — see
@@ -58,6 +59,7 @@ pub struct LndNode {
 impl LndNode {
     pub fn new(
         id: NodeId,
+        idx: NodeIdx,
         stagger: Duration,
         first_tick: Duration,
         trickle: Duration,
@@ -66,6 +68,7 @@ impl LndNode {
     ) -> Self {
         Self {
             id,
+            idx,
             out: Output::default(),
             stagger,
             first_tick,
@@ -97,7 +100,7 @@ impl LndNode {
                     continue;
                 }
             self.lngraph.insert(key, g.timestamp);
-            self.metrics.record_first_seen(self.id, g, cx.time());
+            self.metrics.record_first_seen(self.idx, g, cx.time());
             self.pending.push(*g);
         }
     }
@@ -122,7 +125,7 @@ impl LndNode {
         };
         msg.timestamp = next_ts;
         self.lngraph.insert(key, next_ts);
-        self.metrics.record_first_seen(self.id, &msg, cx.time());
+        self.metrics.record_first_seen(self.idx, &msg, cx.time());
         // Front of queue, not back — see method docstring.
         self.pending.insert(0, msg);
     }

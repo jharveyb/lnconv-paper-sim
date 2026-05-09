@@ -18,6 +18,11 @@ struct Cli {
     /// Path to the TOML simulation config.
     #[arg(short, long)]
     config: PathBuf,
+    /// Override the executor's worker-thread count. If unset, uses
+    /// `[run].threads` from the config (or NeXosim's default — all
+    /// logical cores — when neither is set).
+    #[arg(short, long)]
+    threads: Option<usize>,
 }
 
 /// Per-message percentiles: time at which X% of *all* nodes had received
@@ -31,7 +36,10 @@ const COVERAGE_TIERS: &[f64] = &[0.25, 0.50, 0.75, 1.00];
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let cfg = SimConfig::from_path(&cli.config)?;
+    let mut cfg = SimConfig::from_path(&cli.config)?;
+    if let Some(n) = cli.threads {
+        cfg.run.threads = Some(n);
+    }
     println!("config: {cfg:#?}");
 
     let result = sim::run(&cfg, PERCENTILES.to_vec())?;

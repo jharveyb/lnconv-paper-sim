@@ -14,7 +14,7 @@ use nexosim::ports::Output;
 use nexosim::time::MonotonicTime;
 use serde::{Deserialize, Serialize};
 
-use crate::message::{Direction, Gossip, NodeId, Scid, WireMessage};
+use crate::message::{Direction, Gossip, NodeId, NodeIdx, Scid, WireMessage};
 use crate::metrics::MetricsHandle;
 
 /// NeXosim requires `Serialize + Deserialize` on every `Model` (for
@@ -23,7 +23,11 @@ use crate::metrics::MetricsHandle;
 /// `#[serde(skip)]` and rely on `Default` for deserialization.
 #[derive(Default, Serialize, Deserialize)]
 pub struct FloodingNode {
+    /// Stable identifier (sparse u64 hash for CSV; dense 0..n for
+    /// synthetic). Used as `gossip.origin` on outgoing messages.
     pub id: NodeId,
+    /// Dense index `0..n_nodes` used by metrics for `Vec` storage.
+    pub idx: NodeIdx,
     /// Broadcast port. Wired up at sim init: `out.connect(peer_recv,
     /// &peer_mailbox)` once per peer, then a single `out.send(...)` fans
     /// out to all of them.
@@ -40,9 +44,15 @@ pub struct FloodingNode {
 }
 
 impl FloodingNode {
-    pub fn new(id: NodeId, forward_delay: Duration, metrics: MetricsHandle) -> Self {
+    pub fn new(
+        id: NodeId,
+        idx: NodeIdx,
+        forward_delay: Duration,
+        metrics: MetricsHandle,
+    ) -> Self {
         Self {
             id,
+            idx,
             out: Output::default(),
             forward_delay,
             metrics,
@@ -67,7 +77,7 @@ impl FloodingNode {
                     continue;
                 }
             self.lngraph.insert(key, g.timestamp);
-            self.metrics.record_first_seen(self.id, g, cx.time());
+            self.metrics.record_first_seen(self.idx, g, cx.time());
             cx.schedule_event(
                 self.forward_delay,
                 schedulable!(Self::do_send),
@@ -95,7 +105,7 @@ impl FloodingNode {
         };
         msg.timestamp = next_ts;
         self.lngraph.insert(key, next_ts);
-        self.metrics.record_first_seen(self.id, &msg, cx.time());
+        self.metrics.record_first_seen(self.idx, &msg, cx.time());
         self.out.send(WireMessage::Single(msg)).await;
     }
 

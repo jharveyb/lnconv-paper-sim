@@ -22,3 +22,6 @@ rustworkx-core = "0.17"
 petgraph = "0.8"
 statrs = "0.18"
 scc = "3"
+csv = "1"
+twox-hash = { version = "2", features = ["xxhash3_64"] }
+thiserror = "2"

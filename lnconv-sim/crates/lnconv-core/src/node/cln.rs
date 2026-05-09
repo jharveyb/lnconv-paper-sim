@@ -20,12 +20,13 @@ use nexosim::ports::Output;
 use nexosim::time::MonotonicTime;
 use serde::{Deserialize, Serialize};
 
-use crate::message::{Direction, Gossip, NodeId, Scid, WireMessage};
+use crate::message::{Direction, Gossip, NodeId, NodeIdx, Scid, WireMessage};
 use crate::metrics::MetricsHandle;
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct ClnNode {
     pub id: NodeId,
+    pub idx: NodeIdx,
     pub out: Output<WireMessage>,
     /// Period between drain ticks.
     stagger: Duration,
@@ -44,12 +45,14 @@ pub struct ClnNode {
 impl ClnNode {
     pub fn new(
         id: NodeId,
+        idx: NodeIdx,
         stagger: Duration,
         first_tick: Duration,
         metrics: MetricsHandle,
     ) -> Self {
         Self {
             id,
+            idx,
             out: Output::default(),
             stagger,
             first_tick,
@@ -79,7 +82,7 @@ impl ClnNode {
                     continue;
                 }
             self.lngraph.insert(key, g.timestamp);
-            self.metrics.record_first_seen(self.id, g, cx.time());
+            self.metrics.record_first_seen(self.idx, g, cx.time());
             self.pending.push(*g);
         }
     }
@@ -105,7 +108,7 @@ impl ClnNode {
         };
         msg.timestamp = next_ts;
         self.lngraph.insert(key, next_ts);
-        self.metrics.record_first_seen(self.id, &msg, cx.time());
+        self.metrics.record_first_seen(self.idx, &msg, cx.time());
         self.out.send(WireMessage::Single(msg)).await;
     }
 

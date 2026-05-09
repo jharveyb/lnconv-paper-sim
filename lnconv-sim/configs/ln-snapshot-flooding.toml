@@ -1,0 +1,35 @@
+# Real LN snapshot loaded from CSV; flooding propagation from a
+# single seed node. The peer graph is built from the channel graph via
+# the per-impl-type k rule (see topology::synthetic::build_peer_graph).
+seed = 1
+
+[topology]
+kind = "from_csv"
+nodes_csv = "init_data/node_list.csv"
+channels_csv = "init_data/channel_list.csv"
+
+# Per-impl-type peer-build threshold k. For homogeneous-flooding configs
+# only `flooding` is used; for `algo.kind = "mix"` runs each vertex
+# resolves its own k from its assigned impl.
+[topology.k]
+flooding = 5
+cln = 10
+lnd = 3
+
+[latency]
+dist = "constant"
+ms = 100
+
+[algo]
+kind = "flooding"
+
+# OneShotSingle uses the dense vertex order — node 0 is whatever pubkey
+# appears on the first row of node_list.csv, hashed.
+[event]
+kind = "one_shot_single"
+node = 0
+
+[run]
+duration_seconds = 10
+mailbox_capacity = 1024
+progress_interval_seconds = 0

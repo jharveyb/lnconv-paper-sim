@@ -1,11 +1,20 @@
-//! Topology stats — degree, diameter, mean path length, connectedness.
+//! Topology stats — degree, diameter, mean path length, connectedness,
+//! reported separately for the **peer** graph (used by gossip
+//! propagation) and the **channels** graph (the underlying LN payment
+//! topology).
 //!
-//! Computed via [`petgraph::algo::dijkstra`] on the peer graph (unit
-//! edge weights). Useful as a pre-flight check: propagation time for any
-//! algorithm scales with diameter, so if the printed diameter looks
-//! crazy (e.g. thousands) you're about to run a sim that won't converge.
+//! Computed via [`petgraph::algo::dijkstra`] with unit edge weights.
+//! Useful as a pre-flight check: propagation time for any algorithm
+//! scales with the peer-graph diameter, so if the printed diameter
+//! looks crazy (e.g. thousands) you're about to run a sim that won't
+//! converge.
+//!
+//! The channels graph is internally a `DiGraph` (one directed edge per
+//! channel; source = dir-0 owner) but propagation reality is
+//! bidirectional, so we project to an undirected graph for stats.
 
 use petgraph::algo::dijkstra;
+use petgraph::graph::UnGraph;
 
 use rand::SeedableRng;
 use rand::seq::IndexedRandom;
@@ -16,6 +25,12 @@ use crate::message::NodeId;
 
 #[derive(Debug)]
 pub struct TopologyMetrics {
+    pub peers: GraphMetrics,
+    pub channels: GraphMetrics,
+}
+
+#[derive(Debug)]
+pub struct GraphMetrics {
     pub n: usize,
     pub edges: usize,
     pub min_degree: usize,
@@ -26,31 +41,40 @@ pub struct TopologyMetrics {
     /// Number of source nodes BFS'd from; equal to `n` when `exact` is true.
     pub bfs_sources: usize,
     pub exact: bool,
-    /// True iff the graph is a single connected component.
+    /// True iff the graph is a single connected component (within the
+    /// sample).
     pub connected: bool,
     /// Largest reached component size (across the BFS sources).
     pub largest_component_seen: usize,
 }
 
-/// Compute topology stats. BFS exhaustively when `n <= max_exact_n` —
-/// O(N · (N + E)) and tractable to a few thousand nodes. For larger
-/// graphs, sample `sample_sources` random source nodes; the resulting
-/// diameter is a *lower bound* (true diameter could be larger if both
-/// endpoints of the longest shortest path were missed) but tight enough
-/// for a sanity check at our typical sample size.
+/// Compute peer-graph and channel-graph stats. The channel graph is
+/// projected to an undirected view first (real LN channels are
+/// bidirectional for propagation purposes).
 pub fn compute(
     topo: &Topology,
     seed: u64,
     max_exact_n: usize,
     sample_sources: usize,
 ) -> TopologyMetrics {
-    let n = topo.len();
-    let edges = topo.peers.edge_count();
-    let degs: Vec<usize> = topo
-        .peers
-        .node_indices()
-        .map(|nx| topo.peers.neighbors(nx).count())
-        .collect();
+    let peers = stats_undirected(&topo.peers, seed, max_exact_n, sample_sources);
+    let channels_un = project_channels_undirected(topo);
+    let channels = stats_undirected(&channels_un, seed ^ 0xC0FFEE, max_exact_n, sample_sources);
+    TopologyMetrics { peers, channels }
+}
+
+/// Generic stats for any `UnGraph<N, E>` — works for the peer graph
+/// directly, and for the projected channel graph after we drop edge
+/// metadata.
+fn stats_undirected<N, E>(
+    g: &UnGraph<N, E>,
+    seed: u64,
+    max_exact_n: usize,
+    sample_sources: usize,
+) -> GraphMetrics {
+    let n = g.node_count();
+    let edges = g.edge_count();
+    let degs: Vec<usize> = g.node_indices().map(|nx| g.neighbors(nx).count()).collect();
     let min_degree = *degs.iter().min().unwrap_or(&0);
     let max_degree = *degs.iter().max().unwrap_or(&0);
     let mean_degree = degs.iter().sum::<usize>() as f64 / n.max(1) as f64;
@@ -72,10 +96,8 @@ pub fn compute(
     let mut largest_component = 0usize;
     let mut connected = true;
     for &src in &sources {
-        // dijkstra with unit edge weights == BFS distance, with the
-        // benefit of a tested implementation. Returns a HashMap of
-        // NodeIndex → distance for every reachable node.
-        let dists = dijkstra(&topo.peers, Topology::nidx(src), None, |_| 1u32);
+        let src_idx = petgraph::graph::NodeIndex::new(src as usize);
+        let dists = dijkstra(g, src_idx, None, |_| 1u32);
         let reachable = dists.len();
         for &d in dists.values() {
             max_dist = max_dist.max(d);
@@ -94,7 +116,7 @@ pub fn compute(
         0.0
     };
 
-    TopologyMetrics {
+    GraphMetrics {
         n,
         edges,
         min_degree,
@@ -107,4 +129,35 @@ pub fn compute(
         connected,
         largest_component_seen: largest_component,
     }
+}
+
+/// Build a temporary undirected projection of `topo.channels`: same
+/// vertices, one undirected edge per directed edge (parallel
+/// edges in either direction collapse). NodeIndex is preserved.
+fn project_channels_undirected(topo: &Topology) -> UnGraph<(), ()> {
+    let mut un: UnGraph<(), ()> = UnGraph::with_capacity(topo.channels.node_count(), 0);
+    for _ in 0..topo.channels.node_count() {
+        un.add_node(());
+    }
+    use std::collections::HashSet;
+    let mut seen: HashSet<(usize, usize)> = HashSet::new();
+    for e in topo.channels.edge_indices() {
+        let (a, b) = topo.channels.edge_endpoints(e).unwrap();
+        let (lo, hi) = if a.index() < b.index() {
+            (a.index(), b.index())
+        } else {
+            (b.index(), a.index())
+        };
+        if lo == hi {
+            continue;
+        }
+        if seen.insert((lo, hi)) {
+            un.add_edge(
+                petgraph::graph::NodeIndex::new(lo),
+                petgraph::graph::NodeIndex::new(hi),
+                (),
+            );
+        }
+    }
+    un
 }

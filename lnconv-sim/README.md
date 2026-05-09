@@ -30,7 +30,7 @@ cargo build --release
 Available smoke configs in [`configs/`](configs):
 
 | Config | What it tests |
-|---|---|
+| --- | --- |
 | `flooding-smoke.toml` | Flooding on n=1000 random k=8 graph, single-origin one-shot |
 | `flooding-large.toml` | Flooding on n=20000 (scale check) |
 | `cln-smoke.toml` | CLN-style 1s stagger, single-origin |
@@ -41,6 +41,7 @@ Available smoke configs in [`configs/`](configs):
 | `poisson-smoke.toml` | Poisson stream of 7 messages/sec from random nodes |
 | `poisson-tiny-pool.toml` | Poisson with a tiny `[channels].count = 50` to force BOLT 7 supersession |
 | `mix-poisson-large.toml` / `mixed-poisson-large.toml` | n≈20k, mix population, hour-long Poisson — long-run / memory stress |
+| `ln-snapshot-flooding.toml` | Real LN snapshot from `init_data/` (~12k nodes, ~42k channels), flooding from one origin |
 
 The example `cargo run --release --example diameter -p lnconv-core` prints
 BFS-derived diameters and mean path lengths for a sweep of `(n, k)` —
@@ -57,14 +58,23 @@ A run is fully described by a TOML file with five sections plus a global
 seed = 1                        # ChaCha8 seed; drives topology, phases, Poisson stream
 
 [topology]
-kind = "k_regular"              # currently the only generator
+kind = "k_regular"              # one of: "k_regular" | "from_csv"
 n = 1000                        # number of nodes
 k = 8                           # exact degree of every node (true random regular)
+
+# Or, to load a real LN snapshot:
+# [topology]
+# kind = "from_csv"
+# nodes_csv = "init_data/node_list.csv"
+# channels_csv = "init_data/channel_list.csv"
+# k = 5                         # peer-build threshold + sparse-node fallback
 
 [channels]
 count = 2000                    # number of SCIDs in the LN graph; each gets two
                                 # directions, each owned by a random node.
                                 # Use >= n so every node owns at least one channel.
+                                # OPTIONAL when topology.kind = "from_csv" — the
+                                # CSV provides the channel set.
 
 [latency]
 dist = "constant"               # currently the only distribution
@@ -99,7 +109,12 @@ rate_per_sec = 7.0              # only for poisson_random
 duration_seconds = 600          # simulated time window
 mailbox_capacity = 1024         # per-node NeXosim mailbox slots; raise if you see Deadlock errors
 progress_interval_seconds = 10  # 0 to silence in-flight progress prints
+# threads = 24                  # optional; pin executor pool to N. Defaults to all
+                                # available logical cores. CLI --threads N overrides.
 ```
+
+The CLI also accepts `-t N` / `--threads N` to override `[run].threads`
+(useful for thread-scaling experiments without editing the config).
 
 ### Algorithm semantics
 
@@ -110,11 +125,11 @@ dropped (BOLT 7 supersession); strictly newer arrivals update the entry
 and re-broadcast.
 
 | Algorithm | What each node does |
-|---|---|
+| --- | --- |
 | **Flooding** | On a fresh `(scid, direction, timestamp)`, schedule a forward to all peers after `latency.ms`. Originated messages broadcast immediately. |
 | **Cln** (c-lightning-style) | Forwarded gossip waits in a `pending` queue and is sent in one big `Batch` per `stagger_ms` tick. **Originated messages bypass the queue and are broadcast immediately as `Single`** (matches CLN's "local updates aren't held by the broadcast window"). |
-| **Lnd** (LND-style) | Same per-tick batching as Cln, but pending is split into chunks of `min_batch_size`. First chunk goes immediately on tick; subsequent chunks at `+i·trickle_ms`. **Originated messages are inserted at the FRONT of `pending`**, so they ride out in the first chunk ahead of any forwarded traffic. |
-| **Mix** | Per-node assignment of Cln/Lnd from a fraction list; deterministic shuffle by `seed`. Connections between mixed nodes work because both `recv` methods take the same `WireMessage` type. |
+| **Lnd** (LND-style) | Same per-tick batching as Cln, but pending is split into chunks sized by `calculate_sub_batch_size(stagger_ms, trickle_ms, min_batch_size, pending_len)` so all chunks fit inside the stagger window. Concretely: `chunk = max(min_batch_size, ceil(pending_len * trickle_ms / stagger_ms))`. With stagger=90s, trickle=5s, pending=360, min=10 → chunk=20 (18 sub-batches), not 10 (36 sub-batches). First chunk goes immediately on tick; subsequent chunks at `+i·trickle_ms`. **Originated messages are inserted at the FRONT of `pending`**, so they ride out in the first chunk ahead of any forwarded traffic. |
+| **Mix** | Per-node assignment of Cln/Lnd from a fraction list; deterministic shuffle by `seed`. Connections between mixed nodes work because both `recv` methods take the same `WireMessage` type. The chosen kind for each node is stored as `NodeAlgo` on the `peers` graph vertex. |
 
 Each stagger node samples its first-tick offset uniformly in
 `(0, stagger_ms]` from the seeded RNG. This avoids same-instant tick
@@ -128,7 +143,7 @@ looks up which node owns that channel side. Streams never "pick a node
 at random"; they pick a channel.
 
 | Kind | Behavior |
-|---|---|
+| --- | --- |
 | `one_shot_single { node }` | One message at `t=0`, on the first `(scid, direction)` that `node` owns. Skipped (with a warning) if `node` owns no channels. |
 | `one_shot_all` | Every node that owns at least one channel originates one message at `t=0`, using its first owned `(scid, direction)`. |
 | `poisson_random { rate_per_sec, size_bytes }` | Exponential inter-arrival with mean `1/rate_per_sec`; each event picks a uniformly-random `(scid, direction)` and uses its owner as the originator. Runs until `duration_seconds`. |
@@ -143,7 +158,7 @@ topology stats, and (for mixed populations) the per-algorithm node count.
 While running, every `progress_interval_seconds` of simulated time it
 prints:
 
-```
+```sh
 [t=  120.0s | wall=  13.9s] first_seen= 154995811 (+ 52539784,  12321536/wall_s)
 ```
 
@@ -164,7 +179,7 @@ When the run finishes the binary prints, in order:
    25%, 50%, 75%, 100%, the distribution *across messages* of the time
    that message took to reach that coverage.
 
-```
+```sh
 msg     covg     covg%   p 5    p10    p25    p50    p75    p90    p99   p100
 0       1000   100.0%   ...
 
@@ -199,7 +214,7 @@ full network-convergence time for that message.** For a quick gut check:
 
 ### Two layers
 
-```
+```sh
 ┌────────────────────────────────────────────────────────┐
 │  lnconv-cli  — clap binary, loads TOML, prints output  │
 ├────────────────────────────────────────────────────────┤
@@ -208,9 +223,11 @@ full network-convergence time for that message.** For a quick gut check:
 │  ├─ node/         FloodingNode | ClnNode | LndNode     │
 │  ├─ message.rs    Gossip + WireMessage (Single|Batch)  │
 │  ├─ channels.rs   (scid, direction) -> owner registry  │
-│  ├─ topology/     random k-regular + BFS metrics       │
+│  ├─ topology/     petgraph: peers UnGraph + channels   │
+│  │                 DiGraph + dijkstra-derived metrics  │
 │  ├─ events/       OneShot* + PoissonRandom             │
 │  ├─ metrics.rs    BOLT-7-aware first-seen tracker      │
+│  │                 (scc-backed concurrent containers)  │
 │  └─ config.rs     TOML schema (serde)                  │
 ├────────────────────────────────────────────────────────┤
 │  NeXosim 1.0  — discrete-event executor + ports        │
@@ -220,6 +237,7 @@ full network-convergence time for that message.** For a quick gut check:
 ### NeXosim primer (for LN folks new to discrete-event sim)
 
 Each LN node is a NeXosim **`Model`**, an actor with:
+
 - private mutable state (`lngraph` for BOLT 7 dedup, pending queue),
 - typed input ports (methods marked by `#[Model]` like `recv` and `originate`),
 - typed output ports (`Output<WireMessage>`) that broadcast to many peers.
@@ -231,6 +249,7 @@ recipient's input handler, and any new events scheduled inside that
 handler land back in the heap.
 
 What this gives us:
+
 - **Deterministic ordering** for the same seed, regardless of how many
   cores the executor uses.
 - **Free parallelism** — independent models advance concurrently.
@@ -250,36 +269,132 @@ All node kinds expose `recv: fn(WireMessage, ...)`. That single shared
 type is what lets a CLN node forward a `Batch` to an LND peer and vice
 versa in a mixed population. Receivers iterate `.iter_gossips()`.
 
-### Topology
+### Loading a real LN snapshot
+
+[`init_data/`](init_data/) ships two CSVs from a January 2026 mainnet snapshot:
+
+- `node_list.csv` — one column `pubkey`, ~12 000 rows.
+- `channel_list.csv` — `scid, node_1, node_2`, ~42 000 rows.
+
+To run against this data instead of a synthetic k-regular graph:
+
+```toml
+[topology]
+kind = "from_csv"
+nodes_csv = "init_data/node_list.csv"
+channels_csv = "init_data/channel_list.csv"
+enforce_hub_cap = false   # default; see below
+
+[topology.k]
+flooding = 5    # peer-degree target for flooding nodes
+cln = 10        # CLN nodes target ~10 peers
+lnd = 3         # LND nodes target ~3 peers
+```
+
+`k` is per-impl-type — different gossip algorithms target different
+peer-degrees, and a Mix population uses each vertex's assigned algo to
+pick the right `k`. For homogeneous-flooding/cln/lnd configs, only the
+matching field is read; the other two are still required by the schema.
+
+`enforce_hub_cap` changes how peer-graph edges into a hub
+(`c > 100` channel counterparties) are handled:
+
+| value | behavior | snapshot peers max-degree |
+| --- | --- | --- |
+| `false` (default) | Hub picks 100 counterparties; leaves can still pick the hub back, so the hub may end up with all `c > 100` peers. Matches "real LN: a leaf wants to peer with its only channel partner". | ≈ 1700 |
+| `true` | Hub pre-commits to its 100 picks; any incoming peer-edge request from outside that set is dropped. Each leaf whose hub-edge got dropped gets one *replacement stranger* in a phase-3 top-up, so its peer-degree stays close to its phase-1 plan. | ≈ 100 (hub itself); other nodes preserved |
+
+Enabling the cap reshapes the peer-graph (hubs lose their fanout) but
+keeps the **total edge count and mean-degree the same** as the uncapped
+case, because every dropped edge is replaced with a stranger. The
+peer-graph diameter does grow (6 → 9 on the snapshot) since hubs no
+longer shortcut across the network.
+
+Pubkeys → `NodeId` and SCID strings → `Scid` are derived via xxhash64
+(seeded from `cfg.seed`). Both ID types are u64, so birthday-collision
+probability on this dataset is negligible (~5e-12 for nodes / ~2e-11
+for channels). On the unlikely event of a collision the loader returns
+an error naming both colliding inputs and the seed; bumping `cfg.seed`
+reshuffles all derived IDs.
+
+The channel graph is taken verbatim from the CSV (`node_1` is the
+direction-0 owner, `node_2` is direction-1). The peer graph is then
+built from it via the per-node rule:
+
+- `c > 100` channel counterparties: keep 100 random ones as peers.
+- `k <= c <= 100`: keep all + 1 random stranger.
+- `c < k`: keep all + `k` random strangers.
+
+Each node's pass only adds peer-edges incident to itself. A hub that
+picks 100 of its 200 counterparties may still end up with all 200 as
+peers because every leaf will still pick the hub back — this matches
+real LN, where a leaf wants to peer with its only channel partner.
+
+`OneShotSingle { node = N }` interprets `N` as the dense vertex
+*index* (0..n) — for a CSV-loaded run, `node = 0` is whichever pubkey
+is on the first row of `node_list.csv`. This makes the same config
+field work for both synthetic and CSV-loaded topologies.
+
+### Topology — two petgraph graphs sharing one vertex set
+
+[`topology/graph.rs`](crates/lnconv-core/src/topology/graph.rs) defines
+the `Topology` struct:
+
+```rust
+pub struct Topology {
+    pub peers:    UnGraph<NodeMeta, ()>,   // who exchanges gossip with whom
+    pub channels: DiGraph<(),       Scid>, // one directed edge per LN channel
+}
+
+pub struct NodeMeta {
+    pub id:   NodeId,
+    pub algo: NodeAlgo,                    // Flooding | Cln{...} | Lnd{...}
+}
+```
+
+Both graphs share one NodeIndex space (insertion order matches
+`NodeId 0..n`). The peer graph carries the per-vertex `(NodeId, NodeAlgo)`
+metadata so wiring loops can read a node's algorithm directly off the
+vertex weight instead of via a parallel `Vec<NodeAlgoKind>`.
+
+`channels` is a *directed* graph with one edge per channel. The
+direction encodes ownership structurally: an outgoing edge from `N`
+carrying `Scid s` means `N` owns `(scid=s, direction=0)`; the same edge
+seen from the destination is its `(scid=s, direction=1)` ownership. The
+"directions are opposite-endpoint" invariant becomes impossible to
+violate — there's only one edge to look at.
 
 [`topology/synthetic.rs`](crates/lnconv-core/src/topology/synthetic.rs)
 calls
 [`rustworkx_core::generators::random_regular_graph`](https://docs.rs/rustworkx-core/latest/rustworkx_core/generators/fn.random_regular_graph.html)
 to produce a true k-regular random graph (every node has exactly `k`
-neighbours, no parallel edges, no self-loops). The result is converted to
-a flat `Vec<Vec<u32>>` adjacency list because that's what the wiring loop
-in `sim.rs` iterates once at startup. After init the graph is never
-touched; runtime cost is dominated by message dispatch.
+neighbours, no parallel edges, no self-loops) and copies its edges into
+the `peers` graph. After init the graph is never mutated; runtime cost
+is dominated by message dispatch.
 
 [`topology/metrics.rs`](crates/lnconv-core/src/topology/metrics.rs)
-computes degree stats, BFS-derived diameter and mean path length, and
-connectedness. Exact for `n ≤ 2000`; sampled (1000 random sources) for
-larger graphs.
+computes degree stats and runs
+[`petgraph::algo::dijkstra`](https://docs.rs/petgraph/latest/petgraph/algo/dijkstra/fn.dijkstra.html)
+(unit edge weights → BFS distance) from each source to derive diameter,
+mean path length, and connectedness. Exact for `n ≤ 2000`; sampled
+(1000 random sources) for larger graphs.
 
 ### Channel registry
 
 [`channels.rs`](crates/lnconv-core/src/channels.rs) builds a
-`ChannelRegistry` once at sim init: for each of `[channels].count`
+`ChannelRegistry` once at sim init. For each of `[channels].count`
 SCIDs, two distinct random nodes are chosen and each takes one direction
-(`0` or `1`). The registry has `owner(scid, direction) -> NodeId` and
-`channels_for(node) -> &[(Scid, Direction)]`. Event-stream generators
-consult it so that any message with a given `(scid, direction)` always
-originates from the same node — mirroring how each side of a real LN
-channel emits its own `channel_update`s.
+(`0` or `1`); a single directed edge is added to `topology.channels`
+from the dir-0 owner to the dir-1 owner, carrying the SCID. The
+registry caches `owner(scid, direction) -> NodeId` and
+`channels_for(node) -> &[(Scid, Direction)]` for O(1) lookups from
+event-stream generators. Channels and the peer graph stay independent
+for now — a channel between u and v doesn't imply a peer edge.
 
 ### The chunked sim driver
 
 `sim.rs::drive_simulation` repeatedly:
+
 1. Computes the next "checkpoint": min of `deadline`, next scheduled
    gossip event, next progress-print time.
 2. Calls `Simulation::step_until(checkpoint)` to advance.
@@ -287,6 +402,7 @@ channel emits its own `channel_update`s.
 4. Prints a progress line if a progress-tick boundary was crossed.
 
 This shape is what lets us mix:
+
 - **Static one-shot events** (all events queued at `t=0`),
 - **Time-spread streams** (Poisson, a Vec sorted by time),
 - **Periodic progress output** without polluting NeXosim's event queue.
@@ -341,21 +457,28 @@ nodes can still parse what arrives.
   when added, it will compare sets directly rather than transporting real
   minisketch payloads (matches the Go behavior; can later swap in
   [`minisketch`](https://crates.io/crates/minisketch) bindings).
-- **Metrics are mutex-shared.** The `MetricsHandle` is an
-  `Arc<Mutex<...>>` written from every node. At ~12M events/wall-second
-  this hasn't been a bottleneck so far; if it becomes one, switch to
-  per-node buffers + post-run merge.
+- **Metrics are concurrent but per-MsgId-serialised.** The
+  `MetricsHandle` uses `scc::HashMap` for in-flight + per-channel state
+  and `AtomicUsize` counters, so different MsgIds proceed in parallel
+  with no global lock. But the n_nodes `record_first_seen` calls for a
+  single MsgId all serialise on its bucket, capping per-MsgId
+  parallelism. To unlock that we'd need atomic per-slot updates
+  (`Vec<AtomicU64>` instead of `Vec<u64>`) — left for a follow-up.
 - **Per-node `lngraph` is a `HashMap`.** At LN scale (~20k nodes,
   ~40k channels) the table fills as more channels see updates and the
   aggregate cost reaches several GB. A flat `Vec<u32>` indexed by
   `scid * 2 + direction` would cut per-entry overhead but pre-allocate
   the full table at startup — not yet wired up.
+- **Per-node degree is uniform `k`.** Sampling `k` per node from a
+  distribution (and per-impl-type) needs a degree-sequence-aware
+  topology generator (Havel-Hakimi or configuration model);
+  rustworkx-core 0.17 doesn't ship one, so it's a near-term TODO.
 
 ---
 
 ## Repository layout
 
-```
+```sh
 lnconv-sim/
 ├── Cargo.toml                     workspace
 ├── README.md

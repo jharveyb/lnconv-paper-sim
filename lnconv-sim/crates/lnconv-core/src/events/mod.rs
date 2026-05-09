@@ -27,10 +27,17 @@ use crate::message::{Gossip, NodeId};
 /// tuples to inject into the simulation. `max_duration` lets unbounded
 /// streams (e.g. rate-based) cap themselves to the run window. The
 /// `registry` is consulted for `(scid, direction) -> originator` lookups.
+///
+/// `nodes` is the topology's NodeIds in dense `NodeIdx` order. For
+/// synthetic configs these are sequential `0..n` cast to `u64`; for
+/// CSV-loaded configs they're sparse `xxhash64` values. Streams that
+/// want to address a node by *vertex position* (e.g. `OneShotSingle
+/// { node = 0 }`) index into this slice; streams that iterate "all
+/// nodes" (e.g. `OneShotAll`) do so by walking it.
 pub trait EventSchedule {
     fn build(
         &self,
-        num_nodes: usize,
+        nodes: &[NodeId],
         max_duration: Duration,
         registry: &ChannelRegistry,
     ) -> Vec<(Duration, NodeId, Gossip)>;

@@ -1,12 +1,16 @@
-seed = 2
+seed = 3
 
 [topology]
-kind = "k_regular"
-n = 16000
-k = 7
+kind = "from_csv"
+nodes_csv = "init_data/node_list.csv"
+channels_csv = "init_data/channel_list.csv"
+enforce_hub_cap = true
+# Per-node fallback can be 7 for now
 
-[channels]
-count = 41000
+[topology.k]
+flooding = 5
+cln = 10
+lnd = 3
 
 [latency]
 dist = "constant"
@@ -16,7 +20,7 @@ ms = 100
 [algo]
 kind = "mix"
 [[algo.population]]
-fraction = 0.7
+fraction = 0.85
 [algo.population.algo]
 kind = "lnd"
 stagger_ms = 90000
@@ -24,7 +28,7 @@ trickle_ms = 5000
 min_batch_size = 10
 
 [[algo.population]]
-fraction = 0.3
+fraction = 0.15
 [algo.population.algo]
 kind = "cln"
 stagger_ms = 60000
@@ -34,6 +38,6 @@ kind = "poisson_random"
 rate_per_sec = 10.0
 
 [run]
-duration_seconds = 3600
+duration_seconds = 7200
 mailbox_capacity = 1024
 progress_interval_seconds = 60
