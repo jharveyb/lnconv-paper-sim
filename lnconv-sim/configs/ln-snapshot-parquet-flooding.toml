@@ -28,8 +28,8 @@ kind = "flooding"
 
 [event]
 kind = "parquet_replay"
-# Glob ok; the bundled smoke fixture is the single 28 MB file.
-path = "init_data/compact_traffic_2026-03-08_2026-03-10.parquet"
+# Glob ok; matches whatever capture is currently bundled.
+path = "init_data/compact_traffic_*.parquet"
 
 [run]
 duration_seconds = 300

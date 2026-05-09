@@ -25,6 +25,7 @@
 //! `OneShotAll`, `PoissonRandom` at high rate).
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 
 use nexosim::model::{Context, Model, schedulable};
@@ -195,7 +196,14 @@ impl LndNode {
             self.min_batch_size,
             drained.len(),
         );
-        let chunks: Vec<Vec<Gossip>> = drained.chunks(sub).map(|c| c.to_vec()).collect();
+        // Each chunk is its own `Arc<Vec<Gossip>>` so per-recipient
+        // broadcast clones are refcount bumps. We still allocate one
+        // Vec per chunk because chunks are sent at different times,
+        // but we no longer pay an O(peers) Vec allocation per chunk.
+        let chunks: Vec<Arc<Vec<Gossip>>> = drained
+            .chunks(sub)
+            .map(|c| Arc::new(c.to_vec()))
+            .collect();
         let mut iter = chunks.into_iter();
         if let Some(first) = iter.next() {
             self.out.send(WireMessage::Batch(first)).await;
@@ -210,7 +218,7 @@ impl LndNode {
     /// Trickled-batch send target. Identical body to ClnNode's tick,
     /// just invoked from the scheduler at trickle offsets.
     #[nexosim(schedulable)]
-    async fn send_batch(&mut self, batch: Vec<Gossip>) {
+    async fn send_batch(&mut self, batch: Arc<Vec<Gossip>>) {
         self.out.send(WireMessage::Batch(batch)).await;
     }
 }

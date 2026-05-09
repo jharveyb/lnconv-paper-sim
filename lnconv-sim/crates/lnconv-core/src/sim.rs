@@ -356,24 +356,51 @@ fn log_mix_summary(assignments: &[NodeAlgoKind]) {
     );
 }
 
-/// Step the simulation in chunks, injecting scheduled events as their times
-/// arrive and printing a progress line every `progress_interval` of sim time.
+/// Pre-schedule every origination event into the simulator's priority
+/// queue before stepping starts. This replaces the previous per-event
+/// `process_event` injection that ran inside the driver loop and
+/// turned each event into an executor-wide synchronisation barrier.
+/// With pre-scheduling the executor processes the entire stream
+/// inline during `step_until`, with no driver round-trip per event.
 ///
-/// The loop's job each iteration is to figure out the *closest* future
-/// thing we care about — the deadline, the next scheduled origination, or
-/// the next progress checkpoint — step time to it, then handle whatever
-/// got triggered. Events are kept in a sorted iterator (peek-and-take
-/// pattern) so we never re-scan them.
+/// `Scheduler::schedule_event` requires deadlines strictly in the
+/// future of the current sim time. At pre-launch the current time
+/// is `EPOCH`, so `delay = 0` events get bumped by 1 ns — sub-ms
+/// latency model means observable timing is unchanged.
+fn prelaunch_events(
+    simu: &Simulation,
+    originate_sources: &HashMap<NodeId, EventId<Gossip>>,
+    events: Vec<(Duration, NodeId, Gossip)>,
+) -> Result<()> {
+    let scheduler = simu.scheduler();
+    let t0 = MonotonicTime::EPOCH;
+    for (delay, src, msg) in events {
+        let event_id = originate_sources
+            .get(&src)
+            .ok_or_else(|| anyhow::anyhow!("no originate source for node id {src}"))?;
+        let deadline = if delay.is_zero() {
+            t0 + Duration::from_nanos(1)
+        } else {
+            t0 + delay
+        };
+        scheduler
+            .schedule_event(deadline, event_id, msg)
+            .map_err(|e| anyhow::anyhow!("schedule_event failed: {e:?}"))?;
+    }
+    Ok(())
+}
+
+/// Step the simulation forward to `deadline`, emitting a progress line
+/// every `progress_interval` of simulated time. With pre-scheduled
+/// origination events (see [`prelaunch_events`]) the driver only has
+/// to advance time; the executor pops everything else from its
+/// priority queue inline.
 fn drive_simulation(
     simu: &mut Simulation,
-    originate_sources: HashMap<NodeId, EventId<Gossip>>,
-    events: Vec<(Duration, NodeId, Gossip)>,
     metrics: &MetricsHandle,
     deadline: MonotonicTime,
     progress_interval_secs: u64,
 ) -> Result<()> {
-    let mut events_iter = events.into_iter();
-    let mut next_event = events_iter.next();
     let wall_start = Instant::now();
     let progress_interval = if progress_interval_secs > 0 {
         Some(Duration::from_secs(progress_interval_secs))
@@ -389,61 +416,41 @@ fn drive_simulation(
             break;
         }
 
-        // Find next checkpoint: deadline, next event, or next progress tick.
-        let mut target = deadline;
-        if let Some((t, _, _)) = &next_event {
-            target = target.min(MonotonicTime::EPOCH + *t);
-        }
-        if let Some(np) = next_progress {
-            target = target.min(np);
-        }
+        let target = match next_progress {
+            Some(np) if np < deadline => np,
+            _ => deadline,
+        };
 
         if target > simu.time() {
             simu.step_until(target)
                 .map_err(|e| anyhow::anyhow!("step_until failed: {e:?}"))?;
         }
 
-        // Drain any events that are due now (after the step).
-        while let Some(peek) = next_event.as_ref() {
-            let event_time = MonotonicTime::EPOCH + peek.0;
-            if event_time <= simu.time() {
-                let (_t, src, msg) = next_event.take().unwrap();
-                let event_id = originate_sources
-                    .get(&src)
-                    .ok_or_else(|| anyhow::anyhow!("no originate source for node id {src}"))?;
-                simu.process_event(event_id, msg)
-                    .map_err(|e| anyhow::anyhow!("process_event failed: {e:?}"))?;
-                next_event = events_iter.next();
-            } else {
-                break;
-            }
-        }
-
-        // Maybe emit progress.
         if let Some(np) = next_progress
-            && simu.time() >= np {
-                let now_wall = Instant::now();
-                let total_events = metrics.total_first_seen();
-                let delta_events = total_events - last_progress_events;
-                let delta_wall = now_wall.duration_since(last_progress_wall).as_secs_f64();
-                let rate = if delta_wall > 0.0 {
-                    delta_events as f64 / delta_wall
-                } else {
-                    0.0
-                };
-                let sim_secs = simu
-                    .time()
-                    .duration_since(MonotonicTime::EPOCH)
-                    .as_secs_f64();
-                let wall_secs = now_wall.duration_since(wall_start).as_secs_f64();
-                println!(
-                    "[t={:>8.1}s | wall={:>6.1}s] first_seen={:>10} (+{:>9}, {:>9.0}/wall_s)",
-                    sim_secs, wall_secs, total_events, delta_events, rate
-                );
-                last_progress_events = total_events;
-                last_progress_wall = now_wall;
-                next_progress = progress_interval.map(|p| np + p);
-            }
+            && simu.time() >= np
+        {
+            let now_wall = Instant::now();
+            let total_events = metrics.total_first_seen();
+            let delta_events = total_events - last_progress_events;
+            let delta_wall = now_wall.duration_since(last_progress_wall).as_secs_f64();
+            let rate = if delta_wall > 0.0 {
+                delta_events as f64 / delta_wall
+            } else {
+                0.0
+            };
+            let sim_secs = simu
+                .time()
+                .duration_since(MonotonicTime::EPOCH)
+                .as_secs_f64();
+            let wall_secs = now_wall.duration_since(wall_start).as_secs_f64();
+            println!(
+                "[t={:>8.1}s | wall={:>6.1}s] first_seen={:>10} (+{:>9}, {:>9.0}/wall_s)",
+                sim_secs, wall_secs, total_events, delta_events, rate
+            );
+            last_progress_events = total_events;
+            last_progress_wall = now_wall;
+            next_progress = progress_interval.map(|p| np + p);
+        }
     }
 
     Ok(())
@@ -513,10 +520,9 @@ fn run_flooding(
         .init(MonotonicTime::EPOCH)
         .map_err(|e| anyhow::anyhow!("simulation init failed: {e:?}"))?;
 
+    prelaunch_events(&simu, &originate_sources, events)?;
     drive_simulation(
         &mut simu,
-        originate_sources,
-        events,
         &metrics,
         deadline,
         cfg.run.progress_interval_seconds,
@@ -660,10 +666,9 @@ fn run_stagger_population(
         .init(MonotonicTime::EPOCH)
         .map_err(|e| anyhow::anyhow!("simulation init failed: {e:?}"))?;
 
+    prelaunch_events(&simu, &originate_sources, events)?;
     drive_simulation(
         &mut simu,
-        originate_sources,
-        events,
         &metrics,
         deadline,
         cfg.run.progress_interval_seconds,
