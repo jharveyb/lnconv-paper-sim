@@ -18,3 +18,6 @@ scc.workspace = true
 csv.workspace = true
 twox-hash.workspace = true
 thiserror.workspace = true
+parquet.workspace = true
+arrow-array.workspace = true
+glob.workspace = true

@@ -1,0 +1,43 @@
+seed = 42
+
+[topology]
+kind = "from_csv"
+nodes_csv = "init_data/node_list.csv"
+channels_csv = "init_data/channel_list.csv"
+enforce_hub_cap = true
+
+[topology.k]
+flooding = 5
+cln = 10
+lnd = 3
+
+[latency]
+dist = "constant"
+ms = 100
+
+# Match the (old) estimates of implementation diversity on mainnet.
+[algo]
+kind = "mix"
+[[algo.population]]
+fraction = 0.85
+[algo.population.algo]
+kind = "lnd"
+stagger_ms = 90000
+trickle_ms = 5000
+min_batch_size = 10
+
+[[algo.population]]
+fraction = 0.15
+[algo.population.algo]
+kind = "cln"
+stagger_ms = 60000
+
+[event]
+kind = "parquet_replay"
+# Glob ok; the bundled smoke fixture is the single 28 MB file.
+path = "init_data/compact_traffic_2026-02-11_2026-02-13.parquet"
+
+[run]
+duration_seconds = 10800
+mailbox_capacity = 1024
+progress_interval_seconds = 60

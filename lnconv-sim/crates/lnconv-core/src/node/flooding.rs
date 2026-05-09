@@ -6,7 +6,7 @@
 //!
 //! Convergence time on a connected graph: `diameter × forward_delay`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use nexosim::model::{Context, Model, schedulable};
@@ -14,7 +14,7 @@ use nexosim::ports::Output;
 use nexosim::time::MonotonicTime;
 use serde::{Deserialize, Serialize};
 
-use crate::message::{Direction, Gossip, NodeId, NodeIdx, Scid, WireMessage};
+use crate::message::{Direction, Gossip, GossipKind, NodeId, NodeIdx, Scid, WireMessage};
 use crate::metrics::MetricsHandle;
 
 /// NeXosim requires `Serialize + Deserialize` on every `Model` (for
@@ -37,10 +37,17 @@ pub struct FloodingNode {
     forward_delay: Duration,
     #[serde(skip)]
     metrics: MetricsHandle,
-    /// BOLT 7 LN graph state: latest timestamp seen per `(scid,
-    /// direction)`. Lifetime, not per-tick: equal/older arrivals are
-    /// dropped, strictly-newer ones supersede and re-broadcast.
-    lngraph: HashMap<(Scid, Direction), u32>,
+    /// `channel_update` dedup: latest timestamp seen per
+    /// `(scid, direction)`. Equal/older arrivals are dropped,
+    /// strictly-newer ones supersede and re-broadcast.
+    chan_updates: HashMap<(Scid, Direction), u32>,
+    /// `node_announcement` dedup: latest timestamp seen per origin node.
+    /// Same monotonic rule as `chan_updates`.
+    node_anns: HashMap<NodeId, u32>,
+    /// `channel_announcement` dedup: SCIDs we've already seen. BOLT 7
+    /// channel announcements are not timestamped — first arrival wins
+    /// and any subsequent arrival is dropped silently.
+    chan_anns: HashSet<Scid>,
 }
 
 impl FloodingNode {
@@ -56,27 +63,58 @@ impl FloodingNode {
             out: Output::default(),
             forward_delay,
             metrics,
-            lngraph: HashMap::new(),
+            chan_updates: HashMap::new(),
+            node_anns: HashMap::new(),
+            chan_anns: HashSet::new(),
         }
     }
 }
 
 #[Model]
 impl FloodingNode {
-    /// Input port: a peer just delivered a `WireMessage`. For each inner
-    /// gossip whose timestamp is strictly newer than what we have stored
-    /// for `(scid, direction)`, update the lngraph, record the first-seen
-    /// time, and schedule a forward after `forward_delay`. Forwarding
-    /// goes through `do_send` (a schedulable helper) because `recv` is a
-    /// sync handler that can't `.await`.
+    /// Input port: a peer just delivered a `WireMessage`. For each
+    /// inner gossip, dispatch on `kind`:
+    ///
+    /// * `ChannelUpdate` — keep if `timestamp` strictly exceeds the
+    ///   stored `(scid, direction)` value.
+    /// * `NodeAnnouncement` — keep if `timestamp` strictly exceeds the
+    ///   stored value for `origin`.
+    /// * `ChannelAnnouncement` — keep if this is the first time we've
+    ///   seen this `scid`.
+    ///
+    /// Kept messages are recorded in metrics and scheduled for forward
+    /// after `forward_delay` via the schedulable helper.
     pub fn recv(&mut self, wire: WireMessage, cx: &Context<Self>) {
         for g in wire.iter_gossips() {
-            let key = (g.scid, g.direction);
-            if let Some(&stored) = self.lngraph.get(&key)
-                && g.timestamp <= stored {
-                    continue;
+            let fresh = match g.kind {
+                GossipKind::ChannelUpdate => {
+                    let key = (g.scid, g.direction);
+                    let supersedes = self
+                        .chan_updates
+                        .get(&key)
+                        .map(|&s| g.timestamp > s)
+                        .unwrap_or(true);
+                    if supersedes {
+                        self.chan_updates.insert(key, g.timestamp);
+                    }
+                    supersedes
                 }
-            self.lngraph.insert(key, g.timestamp);
+                GossipKind::NodeAnnouncement => {
+                    let supersedes = self
+                        .node_anns
+                        .get(&g.origin)
+                        .map(|&s| g.timestamp > s)
+                        .unwrap_or(true);
+                    if supersedes {
+                        self.node_anns.insert(g.origin, g.timestamp);
+                    }
+                    supersedes
+                }
+                GossipKind::ChannelAnnouncement => self.chan_anns.insert(g.scid),
+            };
+            if !fresh {
+                continue;
+            }
             self.metrics.record_first_seen(self.idx, g, cx.time());
             cx.schedule_event(
                 self.forward_delay,
@@ -88,23 +126,42 @@ impl FloodingNode {
     }
 
     /// Input port for the per-node `EventSource`. Originated messages
-    /// arrive without a meaningful `timestamp`; we stamp it here from the
-    /// current sim time, bumping past any existing stored timestamp for
-    /// this `(scid, direction)` so the value is strictly increasing
-    /// (BOLT 7 requires it). Then broadcast immediately — the originator
-    /// is the source so there's nothing to "forward from" with delay.
+    /// arrive without a meaningful `timestamp`; for `ChannelUpdate` and
+    /// `NodeAnnouncement` we stamp from current sim time, bumping past
+    /// any stored value so the per-key timestamp is strictly increasing
+    /// (BOLT 7 requires it). For `ChannelAnnouncement` we leave
+    /// `timestamp` alone but skip emission entirely if we've already
+    /// seen this SCID — this is what collapses the parquet replay's
+    /// "both endpoints emit" doubling into a single broadcast cascade.
     pub async fn originate(&mut self, mut msg: Gossip, cx: &Context<Self>) {
         let now_secs = cx
             .time()
             .duration_since(MonotonicTime::EPOCH)
             .as_secs() as u32;
-        let key = (msg.scid, msg.direction);
-        let next_ts = match self.lngraph.get(&key) {
-            Some(&stored) => stored.saturating_add(1).max(now_secs),
-            None => now_secs,
-        };
-        msg.timestamp = next_ts;
-        self.lngraph.insert(key, next_ts);
+        match msg.kind {
+            GossipKind::ChannelUpdate => {
+                let key = (msg.scid, msg.direction);
+                let next_ts = match self.chan_updates.get(&key) {
+                    Some(&stored) => stored.saturating_add(1).max(now_secs),
+                    None => now_secs,
+                };
+                msg.timestamp = next_ts;
+                self.chan_updates.insert(key, next_ts);
+            }
+            GossipKind::NodeAnnouncement => {
+                let next_ts = match self.node_anns.get(&msg.origin) {
+                    Some(&stored) => stored.saturating_add(1).max(now_secs),
+                    None => now_secs,
+                };
+                msg.timestamp = next_ts;
+                self.node_anns.insert(msg.origin, next_ts);
+            }
+            GossipKind::ChannelAnnouncement => {
+                if !self.chan_anns.insert(msg.scid) {
+                    return;
+                }
+            }
+        }
         self.metrics.record_first_seen(self.idx, &msg, cx.time());
         self.out.send(WireMessage::Single(msg)).await;
     }

@@ -14,7 +14,7 @@ use crate::message::{Gossip, GossipKind, NodeId};
 /// N gossips need to spread at once".
 pub struct OneShotAll {
     pub at: Duration,
-    pub size_bytes: u32,
+    pub size_bytes: u16,
 }
 
 impl EventSchedule for OneShotAll {
@@ -37,7 +37,7 @@ impl EventSchedule for OneShotAll {
             let msg = Gossip {
                 id: next_id,
                 origin: node,
-                kind: GossipKind::Full,
+                kind: GossipKind::ChannelUpdate,
                 size_bytes: self.size_bytes,
                 scid,
                 direction,
@@ -59,7 +59,7 @@ impl EventSchedule for OneShotAll {
 pub struct OneShotSingle {
     pub node: usize,
     pub at: Duration,
-    pub size_bytes: u32,
+    pub size_bytes: u16,
 }
 
 impl EventSchedule for OneShotSingle {
@@ -88,7 +88,7 @@ impl EventSchedule for OneShotSingle {
         let msg = Gossip {
             id: 0,
             origin: node_id,
-            kind: GossipKind::Full,
+            kind: GossipKind::ChannelUpdate,
             size_bytes: self.size_bytes,
             scid,
             direction,

@@ -99,6 +99,14 @@ impl ChannelRegistry {
             .expect("unknown (scid, direction)")
     }
 
+    /// Cheap "do we know this SCID at all" check. The parquet replay
+    /// loader uses this to skip events that reference channels not
+    /// present in the snapshot — calling `owner()` on an unknown SCID
+    /// would panic.
+    pub fn knows_scid(&self, scid: Scid) -> bool {
+        self.owners.contains_key(&(scid, 0))
+    }
+
     pub fn channels_for(&self, node: NodeId) -> &[(Scid, Direction)] {
         self.per_node
             .get(&node)

@@ -16,6 +16,7 @@
 //! 3. Add a match arm in `sim::build_events`.
 
 pub mod oneshot;
+pub mod parquet_replay;
 pub mod poisson;
 
 use std::time::Duration;

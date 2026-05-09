@@ -42,6 +42,7 @@ Available smoke configs in [`configs/`](configs):
 | `poisson-tiny-pool.toml` | Poisson with a tiny `[channels].count = 50` to force BOLT 7 supersession |
 | `mix-poisson-large.toml` / `mixed-poisson-large.toml` | n≈20k, mix population, hour-long Poisson — long-run / memory stress |
 | `ln-snapshot-flooding.toml` | Real LN snapshot from `init_data/` (~12k nodes, ~42k channels), flooding from one origin |
+| `ln-snapshot-parquet-flooding.toml` | Real LN snapshot + parquet replay of mainnet gossip traffic for the first 5 minutes of the trace |
 
 The example `cargo run --release --example diameter -p lnconv-core` prints
 BFS-derived diameters and mean path lengths for a sweep of `(n, k)` —
@@ -147,6 +148,7 @@ at random"; they pick a channel.
 | `one_shot_single { node }` | One message at `t=0`, on the first `(scid, direction)` that `node` owns. Skipped (with a warning) if `node` owns no channels. |
 | `one_shot_all` | Every node that owns at least one channel originates one message at `t=0`, using its first owned `(scid, direction)`. |
 | `poisson_random { rate_per_sec, size_bytes }` | Exponential inter-arrival with mean `1/rate_per_sec`; each event picks a uniformly-random `(scid, direction)` and uses its owner as the originator. Runs until `duration_seconds`. |
+| `parquet_replay { path }` | Replay events from a real-world ZSTD-compressed parquet capture. See **Replaying real-world traffic from parquet** below. |
 
 ---
 
@@ -334,6 +336,48 @@ real LN, where a leaf wants to peer with its only channel partner.
 *index* (0..n) — for a CSV-loaded run, `node = 0` is whichever pubkey
 is on the first row of `node_list.csv`. This makes the same config
 field work for both synthetic and CSV-loaded topologies.
+
+### Replaying real-world traffic from parquet
+
+[`init_data/`](init_data/) also ships a ZSTD-compressed parquet
+capture of mainnet LN gossip
+(`compact_traffic_2026-03-08_2026-03-10.parquet`, 28 MB, 1.53 M rows
+over ~3 days). The `parquet_replay` event source loads it and replays
+every row at its original `first_seen_timestamp` cadence relative to
+the first row.
+
+```toml
+[event]
+kind = "parquet_replay"
+path = "init_data/compact_traffic_*.parquet"  # glob ok
+```
+
+The first parquet row maps to sim t=0; rows past
+`[run] duration_seconds` are dropped at load time (the loader
+short-circuits the moment it crosses the window — no point reading the
+rest of a 3-day file for a 5-minute run).
+
+Three BOLT 7 message kinds are emitted (`Gossip.kind`):
+
+| Kind | Per-row emission | Per-node dedup |
+| --- | --- | --- |
+| `node_announcement` (type=2) | One tuple. Origin = `xxhash3_64(seed XOR NODE_SUBSEED, orig_node)`. | `node_anns: HashMap<NodeId, u32>` — highest timestamp per origin wins. |
+| `channel_announcement` (type=1) | TWO tuples at the same delay, one per `registry.owner(scid, 0)` and `(scid, 1)`. Mirrors BOLT 7 (both endpoints sign + gossip). | `chan_anns: HashSet<Scid>` — first arrival wins; receiver dedup collapses the second cascade after one hop. |
+| `channel_update` (type=3) | One tuple. Direction round-robins per SCID (alternates 0,1,0,1 within each SCID's stream). The parquet does not carry the real BOLT 7 channel_flags direction bit; per-direction asymmetry metrics on parquet replays are therefore NOT meaningful. | `chan_updates: HashMap<(Scid, Direction), u32>` — same as before, highest timestamp wins. |
+
+Pubkeys / SCIDs that aren't in the snapshot (~5 % drift between the
+January and March datasets) are silently skipped at load time; the
+loader prints a one-line summary like:
+
+```sh
+parquet replay: scanned 65536 rows, kept 1729 tuples (within 300s window),
+  skipped 469 unknown SCIDs / 35 unknown pubkeys
+```
+
+The originator-side dedup (`chan_anns.insert(scid)`) on each node
+prevents the "both endpoints emit" doubling from producing two
+broadcast cascades — only the first endpoint's `originate` actually
+broadcasts; the second's no-ops.
 
 ### Topology — two petgraph graphs sharing one vertex set
 

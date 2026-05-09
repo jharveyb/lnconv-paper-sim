@@ -12,7 +12,8 @@
 //! one time step, biasing convergence times much faster than the
 //! algorithm allows.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 
 use nexosim::model::{Context, Model, schedulable};
@@ -20,7 +21,7 @@ use nexosim::ports::Output;
 use nexosim::time::MonotonicTime;
 use serde::{Deserialize, Serialize};
 
-use crate::message::{Direction, Gossip, NodeId, NodeIdx, Scid, WireMessage};
+use crate::message::{Direction, Gossip, GossipKind, NodeId, NodeIdx, Scid, WireMessage};
 use crate::metrics::MetricsHandle;
 
 #[derive(Default, Serialize, Deserialize)]
@@ -35,9 +36,12 @@ pub struct ClnNode {
     first_tick: Duration,
     #[serde(skip)]
     metrics: MetricsHandle,
-    /// BOLT 7 LN graph state: latest timestamp seen per `(scid,
-    /// direction)`. Lifetime, not per-tick.
-    lngraph: HashMap<(Scid, Direction), u32>,
+    /// `channel_update` dedup, lifetime not per-tick.
+    chan_updates: HashMap<(Scid, Direction), u32>,
+    /// `node_announcement` dedup, lifetime not per-tick.
+    node_anns: HashMap<NodeId, u32>,
+    /// `channel_announcement` first-seen set.
+    chan_anns: HashSet<Scid>,
     /// Gossip awaiting the next stagger tick.
     pending: Vec<Gossip>,
 }
@@ -57,7 +61,9 @@ impl ClnNode {
             stagger,
             first_tick,
             metrics,
-            lngraph: HashMap::new(),
+            chan_updates: HashMap::new(),
+            node_anns: HashMap::new(),
+            chan_anns: HashSet::new(),
             pending: Vec::new(),
         }
     }
@@ -73,15 +79,38 @@ impl ClnNode {
             .expect("schedule cln tick");
     }
 
-    /// Input port. BOLT 7 dedup, then queue for next tick.
+    /// Input port. BOLT 7 per-kind dedup, then queue for next tick.
     pub async fn recv(&mut self, wire: WireMessage, cx: &Context<Self>) {
         for g in wire.iter_gossips() {
-            let key = (g.scid, g.direction);
-            if let Some(&stored) = self.lngraph.get(&key)
-                && g.timestamp <= stored {
-                    continue;
+            let fresh = match g.kind {
+                GossipKind::ChannelUpdate => {
+                    let key = (g.scid, g.direction);
+                    let supersedes = self
+                        .chan_updates
+                        .get(&key)
+                        .map(|&s| g.timestamp > s)
+                        .unwrap_or(true);
+                    if supersedes {
+                        self.chan_updates.insert(key, g.timestamp);
+                    }
+                    supersedes
                 }
-            self.lngraph.insert(key, g.timestamp);
+                GossipKind::NodeAnnouncement => {
+                    let supersedes = self
+                        .node_anns
+                        .get(&g.origin)
+                        .map(|&s| g.timestamp > s)
+                        .unwrap_or(true);
+                    if supersedes {
+                        self.node_anns.insert(g.origin, g.timestamp);
+                    }
+                    supersedes
+                }
+                GossipKind::ChannelAnnouncement => self.chan_anns.insert(g.scid),
+            };
+            if !fresh {
+                continue;
+            }
             self.metrics.record_first_seen(self.idx, g, cx.time());
             self.pending.push(*g);
         }
@@ -91,23 +120,43 @@ impl ClnNode {
     /// gossip (which waits for the next stagger tick), an originated
     /// message broadcasts to all connected peers *immediately* as a
     /// `WireMessage::Single` — matches CLN's behavior where local
-    /// `channel_update`s aren't held back by the stagger window. Async
-    /// because we `.await` the broadcast directly here.
+    /// `channel_update`s aren't held back by the stagger window.
     ///
-    /// Timestamp stamped from current sim time, bumped past any existing
-    /// entry to guarantee strict monotonicity (BOLT 7 requirement).
+    /// `ChannelUpdate` and `NodeAnnouncement` are timestamped from
+    /// current sim time, bumped past any stored value (BOLT 7
+    /// monotonicity). `ChannelAnnouncement` keeps its incoming
+    /// timestamp and is suppressed if we've already broadcast this
+    /// SCID — prevents the parquet replay's two-endpoint duplicate
+    /// origination from producing two cascades.
     pub async fn originate(&mut self, mut msg: Gossip, cx: &Context<Self>) {
         let now_secs = cx
             .time()
             .duration_since(MonotonicTime::EPOCH)
             .as_secs() as u32;
-        let key = (msg.scid, msg.direction);
-        let next_ts = match self.lngraph.get(&key) {
-            Some(&stored) => stored.saturating_add(1).max(now_secs),
-            None => now_secs,
-        };
-        msg.timestamp = next_ts;
-        self.lngraph.insert(key, next_ts);
+        match msg.kind {
+            GossipKind::ChannelUpdate => {
+                let key = (msg.scid, msg.direction);
+                let next_ts = match self.chan_updates.get(&key) {
+                    Some(&stored) => stored.saturating_add(1).max(now_secs),
+                    None => now_secs,
+                };
+                msg.timestamp = next_ts;
+                self.chan_updates.insert(key, next_ts);
+            }
+            GossipKind::NodeAnnouncement => {
+                let next_ts = match self.node_anns.get(&msg.origin) {
+                    Some(&stored) => stored.saturating_add(1).max(now_secs),
+                    None => now_secs,
+                };
+                msg.timestamp = next_ts;
+                self.node_anns.insert(msg.origin, next_ts);
+            }
+            GossipKind::ChannelAnnouncement => {
+                if !self.chan_anns.insert(msg.scid) {
+                    return;
+                }
+            }
+        }
         self.metrics.record_first_seen(self.idx, &msg, cx.time());
         self.out.send(WireMessage::Single(msg)).await;
     }
@@ -120,6 +169,6 @@ impl ClnNode {
             return;
         }
         let batch = std::mem::take(&mut self.pending);
-        self.out.send(WireMessage::Batch(batch)).await;
+        self.out.send(WireMessage::Batch(Arc::new(batch))).await;
     }
 }

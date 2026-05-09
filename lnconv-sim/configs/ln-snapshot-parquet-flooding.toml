@@ -1,0 +1,37 @@
+# Real LN snapshot topology (CSV) replayed against a parquet gossip
+# trace captured 2026-03-08..03-10. The first parquet row maps to sim
+# t=0; rows past `[run] duration_seconds` are dropped at load time.
+#
+# Kind mapping in the parquet:
+#   type=1 channel_announcement → both endpoints emit (BOLT 7 mirror)
+#   type=2 node_announcement    → origin = hash_pubkey(orig_node)
+#   type=3 channel_update       → direction round-robins per SCID
+#                                 (parquet doesn't carry the real bit)
+seed = 1
+
+[topology]
+kind = "from_csv"
+nodes_csv = "init_data/node_list.csv"
+channels_csv = "init_data/channel_list.csv"
+
+[topology.k]
+flooding = 5
+cln = 10
+lnd = 3
+
+[latency]
+dist = "constant"
+ms = 100
+
+[algo]
+kind = "flooding"
+
+[event]
+kind = "parquet_replay"
+# Glob ok; the bundled smoke fixture is the single 28 MB file.
+path = "init_data/compact_traffic_2026-03-08_2026-03-10.parquet"
+
+[run]
+duration_seconds = 300
+mailbox_capacity = 4096
+progress_interval_seconds = 30

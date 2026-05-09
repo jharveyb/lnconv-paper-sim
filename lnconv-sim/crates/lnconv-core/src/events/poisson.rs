@@ -28,7 +28,7 @@ use crate::message::{Gossip, GossipKind, NodeId};
 pub struct PoissonRandom {
     pub rate_per_sec: f64,
     pub seed: u64,
-    pub size_bytes: u32,
+    pub size_bytes: u16,
 }
 
 impl EventSchedule for PoissonRandom {
@@ -62,7 +62,7 @@ impl EventSchedule for PoissonRandom {
                 Gossip {
                     id: next_id,
                     origin,
-                    kind: GossipKind::Full,
+                    kind: GossipKind::ChannelUpdate,
                     size_bytes: self.size_bytes,
                     scid,
                     direction,

@@ -135,11 +135,20 @@ pub enum EventCfg {
     PoissonRandom {
         rate_per_sec: f64,
         #[serde(default = "default_msg_size")]
-        size_bytes: u32,
+        size_bytes: u16,
+    },
+    /// Replay events from a real-world ZSTD-compressed parquet capture.
+    /// `path` accepts either a single file or a glob pattern (e.g.
+    /// `"init_data/compact_traffic_*.parquet"`); paths resolve relative
+    /// to the process CWD. The first row's `first_seen_timestamp` maps
+    /// to sim t=0, subsequent rows fire at their original cadence;
+    /// rows past `[run] duration_seconds` are dropped at load time.
+    ParquetReplay {
+        path: String,
     },
 }
 
-fn default_msg_size() -> u32 {
+fn default_msg_size() -> u16 {
     1024
 }
 

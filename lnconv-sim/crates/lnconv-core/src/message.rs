@@ -16,6 +16,8 @@
 //! types) is what lets a CLN node forward a `Batch` to an LND peer in a
 //! mixed population — both nodes' `recv` ports take `WireMessage`.
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
 /// Stable node identifier. For synthetic configs, this is the dense
@@ -45,31 +47,51 @@ pub struct Gossip {
     pub id: MsgId,
     pub origin: NodeId,
     pub kind: GossipKind,
-    /// On-the-wire size, used for bandwidth metrics (not yet wired up).
-    pub size_bytes: u32,
-    /// Short channel ID this update is for.
+    /// On-the-wire size, used for bandwidth metrics. Real BOLT 7
+    /// gossip messages cap around 1364 bytes (`node_announcement` with
+    /// max addresses); `u16` gives 64 KiB of headroom and shrinks the
+    /// `Gossip` struct slightly.
+    pub size_bytes: u16,
+    /// Short channel ID. Meaningful for `ChannelAnnouncement` and
+    /// `ChannelUpdate`; ignored for `NodeAnnouncement` (set to 0).
     pub scid: Scid,
     /// Which side of the channel this update represents (0 or 1).
+    /// Meaningful for `ChannelUpdate`; ignored for the other kinds
+    /// (set to 0).
     pub direction: Direction,
     /// Seconds since `MonotonicTime::EPOCH`. Set to 0 by event-stream
     /// generators; populated by the originating node's `originate`
-    /// handler at the moment of broadcast (matches BOLT 7's "node sets
-    /// timestamp on send"). 32 bits = ~136 years of seconds — far longer
-    /// than any sim run.
+    /// handler at the moment of broadcast for `ChannelUpdate` and
+    /// `NodeAnnouncement` (matches BOLT 7's "node sets timestamp on
+    /// send"). For `ChannelAnnouncement` the timestamp field is
+    /// unused — channel announcements are not timestamped in BOLT 7.
+    /// 32 bits = ~136 years of seconds — far longer than any sim run.
     pub timestamp: u32,
 }
 
-/// Future-extension point for inventory entries / reconciliation
-/// payloads. Currently every gossip is a `Full` message.
-#[derive(Copy, Clone, Debug, Serialize, Deserialize)]
+/// The three BOLT 7 gossip message kinds the simulator distinguishes.
+/// Dedup semantics differ per kind:
+///
+/// * `NodeAnnouncement`: keyed on `(origin, timestamp)`; highest
+///   timestamp seen per origin wins.
+/// * `ChannelAnnouncement`: keyed on `scid` alone; first seen wins
+///   (no timestamp in real BOLT 7).
+/// * `ChannelUpdate`: keyed on `(scid, direction, timestamp)`; highest
+///   timestamp per `(scid, direction)` wins.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GossipKind {
-    Full,
+    NodeAnnouncement,
+    ChannelAnnouncement,
+    ChannelUpdate,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum WireMessage {
     Single(Gossip),
-    Batch(Vec<Gossip>),
+    /// Stagger-tick payload, immutable after construction. `Arc` so
+    /// NeXosim's per-recipient broadcast clone is a refcount bump
+    /// instead of an O(batch_len) `Vec` copy.
+    Batch(Arc<Vec<Gossip>>),
 }
 
 impl WireMessage {

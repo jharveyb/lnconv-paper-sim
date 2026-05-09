@@ -39,6 +39,7 @@ use crate::channels::ChannelRegistry;
 use crate::config::{AlgoCfg, EventCfg, LatencyCfg, NodeAlgoKind, SimConfig, TopologyCfg};
 use crate::events::EventSchedule;
 use crate::events::oneshot::{OneShotAll, OneShotSingle};
+use crate::events::parquet_replay::ParquetReplay;
 use crate::events::poisson::PoissonRandom;
 use crate::message::{Gossip, NodeId};
 use crate::metrics::MetricsHandle;
@@ -167,7 +168,7 @@ pub fn run(cfg: &SimConfig, percentiles: Vec<f64>) -> Result<RunResult> {
     // streams can address nodes by vertex index (OneShotSingle) or
     // iterate them all (OneShotAll, PoissonRandom).
     let nodes_in_order: Vec<NodeId> = topology.node_ids().collect();
-    let event_tuples = build_events(cfg, &nodes_in_order, run_duration, &registry);
+    let event_tuples = build_events(cfg, &nodes_in_order, run_duration, &registry)?;
     println!(
         "events: scheduled {} message(s) over the run window",
         event_tuples.len()
@@ -241,7 +242,7 @@ fn build_events(
     nodes: &[NodeId],
     max: Duration,
     registry: &ChannelRegistry,
-) -> Vec<(Duration, NodeId, Gossip)> {
+) -> Result<Vec<(Duration, NodeId, Gossip)>> {
     let mut tuples = match &cfg.event {
         EventCfg::OneShotSingle { node } => OneShotSingle {
             node: *node,
@@ -263,9 +264,33 @@ fn build_events(
             size_bytes: *size_bytes,
         }
         .build(nodes, max, registry),
+        EventCfg::ParquetReplay { path } => {
+            let paths = expand_glob(path)?;
+            ParquetReplay {
+                paths,
+                seed: cfg.seed,
+                snapshot_nodes: nodes.iter().copied().collect(),
+            }
+            .build(nodes, max, registry)
+        }
     };
     tuples.sort_by_key(|(t, _, _)| *t);
-    tuples
+    Ok(tuples)
+}
+
+/// Expand a glob pattern (or a literal path) to a sorted list of files.
+/// Errors if zero matches — silently running with no events is rarely
+/// the user's intent. Returned paths are in lexicographic order.
+fn expand_glob(pat: &str) -> Result<Vec<std::path::PathBuf>> {
+    let mut out: Vec<_> = glob::glob(pat)
+        .map_err(|e| anyhow::anyhow!("bad glob pattern {pat:?}: {e}"))?
+        .filter_map(std::result::Result::ok)
+        .collect();
+    if out.is_empty() {
+        anyhow::bail!("no files matched pattern {pat:?}");
+    }
+    out.sort();
+    Ok(out)
 }
 
 /// Deterministically partition `n` global node IDs across the entries of

@@ -40,6 +40,23 @@ use crate::message::{NodeId, Scid};
 const NODE_SUBSEED: u64 = 0x4E4F44455F535542; // "NODE_SUB"
 const SCID_SUBSEED: u64 = 0x534349445F535542; // "SCID_SUB"
 
+/// Hash a 66-hex pubkey string into a stable `NodeId`. Single source
+/// of truth used by both the CSV loader and the parquet replay
+/// loader; same `seed` ⇒ same `NodeId` for the same pubkey.
+pub fn hash_pubkey(seed: u64, pubkey: &str) -> NodeId {
+    XX3Hasher::oneshot_with_seed(seed ^ NODE_SUBSEED, pubkey.as_bytes())
+}
+
+/// Hash an SCID *string* (decimal form) into a stable `Scid`. The CSV
+/// snapshot ships SCIDs as decimal strings (e.g. `"1012232394786537478"`)
+/// and the parquet trace ships them as `u64` — the parquet loader must
+/// `to_string()` its `u64` before calling this so the resulting
+/// `Scid` matches the CSV-derived one. Hashing raw `u64::to_le_bytes`
+/// produces a different value and silently breaks registry lookups.
+pub fn hash_scid_string(seed: u64, scid_str: &str) -> Scid {
+    XX3Hasher::oneshot_with_seed(seed ^ SCID_SUBSEED, scid_str.as_bytes())
+}
+
 #[derive(Debug)]
 pub struct LnSnapshot {
     /// Hash-derived NodeId for each pubkey, in CSV row order. Index
@@ -103,9 +120,6 @@ pub fn load(
     channels_csv: &Path,
     seed: u64,
 ) -> Result<LnSnapshot, LoadError> {
-    let node_seed = seed ^ NODE_SUBSEED;
-    let scid_seed = seed ^ SCID_SUBSEED;
-
     // 1. Parse pubkeys, hash, detect collisions.
     let mut nodes: Vec<NodeId> = Vec::new();
     let mut pubkey_of: HashMap<NodeId, String> = HashMap::new();
@@ -116,7 +130,7 @@ pub fn load(
             path: nodes_csv.display().to_string(),
             source: e,
         })?;
-        let id = XX3Hasher::oneshot_with_seed(node_seed, row.pubkey.as_bytes());
+        let id = hash_pubkey(seed, &row.pubkey);
         if let Some(existing) = pubkey_of.get(&id)
             && *existing != row.pubkey
         {
@@ -143,7 +157,7 @@ pub fn load(
             path: channels_csv.display().to_string(),
             source: e,
         })?;
-        let scid = XX3Hasher::oneshot_with_seed(scid_seed, row.scid.as_bytes());
+        let scid = hash_scid_string(seed, &row.scid);
         if let Some(existing) = scid_seen.get(&scid)
             && *existing != row.scid
         {
