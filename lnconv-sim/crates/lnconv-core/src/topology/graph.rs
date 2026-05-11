@@ -48,9 +48,9 @@ pub struct NodeMeta {
 }
 
 /// All possible per-node algorithms. Superset of the config-side
-/// `NodeAlgoKind`, which only covers stagger algos (Cln/Lnd) — this enum
-/// also includes Flooding so a homogeneous flooding population can use
-/// the same `Topology` shape as a Cln/Lnd/Mix run.
+/// `NodeAlgoKind`, which only covers stagger algos (Cln/Lnd/Sketch) —
+/// this enum also includes Flooding so a homogeneous flooding
+/// population can use the same `Topology` shape as a Cln/Lnd/Mix run.
 #[derive(Clone, Debug)]
 pub enum NodeAlgo {
     Flooding,
@@ -61,6 +61,16 @@ pub enum NodeAlgo {
         stagger_ms: u64,
         trickle_ms: u64,
         min_batch_size: usize,
+    },
+    /// Set-reconciliation node. Doesn't fan-out gossip on recv —
+    /// state propagates only via per-peer sketch exchanges over
+    /// **all three kinds**, each with its own capacity.
+    Sketch {
+        stagger_ms: u64,
+        capacity_chan_updates: u32,
+        capacity_node_anns: u32,
+        capacity_chan_anns: u32,
+        peer_offset_max_ms: Option<u64>,
     },
 }
 
@@ -78,6 +88,19 @@ impl From<&NodeAlgoKind> for NodeAlgo {
                 stagger_ms: *stagger_ms,
                 trickle_ms: *trickle_ms,
                 min_batch_size: *min_batch_size,
+            },
+            NodeAlgoKind::Sketch {
+                stagger_ms,
+                capacity_chan_updates,
+                capacity_node_anns,
+                capacity_chan_anns,
+                peer_offset_max_ms,
+            } => NodeAlgo::Sketch {
+                stagger_ms: *stagger_ms,
+                capacity_chan_updates: *capacity_chan_updates,
+                capacity_node_anns: *capacity_node_anns,
+                capacity_chan_anns: *capacity_chan_anns,
+                peer_offset_max_ms: *peer_offset_max_ms,
             },
         }
     }

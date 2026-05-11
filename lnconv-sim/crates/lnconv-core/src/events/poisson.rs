@@ -46,7 +46,6 @@ impl EventSchedule for PoissonRandom {
         let max_secs = max.as_secs_f64();
         let mut t_secs = 0.0_f64;
         let mut events = Vec::new();
-        let mut next_id: u32 = 0;
         loop {
             // Strict (0, 1) so inverse_cdf never sees the boundary value.
             let u = rng.random::<f64>().clamp(f64::EPSILON, 1.0 - f64::EPSILON);
@@ -60,16 +59,15 @@ impl EventSchedule for PoissonRandom {
                 Duration::from_secs_f64(t_secs),
                 origin,
                 Gossip {
-                    id: next_id,
-                    origin,
+                    id: 0, // originate's stamp re-derives this
+                    origin: None, // ChannelUpdate has no wire origin
                     kind: GossipKind::ChannelUpdate,
                     size_bytes: self.size_bytes,
-                    scid,
+                    scid: Some(scid),
                     direction,
                     timestamp: 0,
                 },
             ));
-            next_id += 1;
         }
         events
     }

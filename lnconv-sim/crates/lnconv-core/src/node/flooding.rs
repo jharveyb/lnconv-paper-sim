@@ -2,25 +2,41 @@
 //!
 //! On a fresh `(scid, direction, timestamp)` tuple (per BOLT 7 dedup),
 //! schedule a forward to all peers after `forward_delay` (a stand-in for
-//! one-way wire latency). Old or equal timestamps are dropped silently.
+//! one-way wire latency). Old or equal timestamps are dropped silently
+//! and counted as per-node duplicates.
 //!
 //! Convergence time on a connected graph: `diameter × forward_delay`.
+//!
+//! ## Per-peer outputs
+//!
+//! `outputs` is a `Vec<Output<WireMessage>>` with one Output per peer
+//! (each Output has exactly one connected mailbox). Broadcast is
+//! "iterate and send"; `peer_id_to_local` maps a peer's `NodeId` to
+//! its position in the Vec. The arrangement is driven from sim init
+//! by walking `topology.peers.neighbors(nx)` deterministically — see
+//! sim.rs.
+//!
+//! ## Shared dedup state
+//!
+//! `state: SharedNodeState` lives behind `Arc<NodeState>`. Sketch
+//! protocol nodes elsewhere can read this node's state via the same
+//! Arc to compute set-recon diffs. The dedup writes themselves take
+//! brief per-kind RwLock writes; the rest of the recv loop is
+//! lock-free. `peer_states` is unused by Flooding (it doesn't run
+//! reconciliation) but the field is present so sim.rs can wire all
+//! node kinds through one helper.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::Duration;
 
 use nexosim::model::{Context, Model, schedulable};
 use nexosim::ports::Output;
-use nexosim::time::MonotonicTime;
 use serde::{Deserialize, Serialize};
 
-use crate::message::{Direction, Gossip, GossipKind, NodeId, NodeIdx, Scid, WireMessage};
+use crate::message::{Gossip, GossipKind, NodeId, NodeIdx, WireMessage};
 use crate::metrics::MetricsHandle;
+use crate::state::{SharedNodeState, originate_stamp};
 
-/// NeXosim requires `Serialize + Deserialize` on every `Model` (for
-/// optional save/restore); fields that aren't naturally serde-able
-/// (`MetricsHandle`, which holds an `Arc<Mutex<...>>`) are marked
-/// `#[serde(skip)]` and rely on `Default` for deserialization.
 #[derive(Default, Serialize, Deserialize)]
 pub struct FloodingNode {
     /// Stable identifier (sparse u64 hash for CSV; dense 0..n for
@@ -28,26 +44,30 @@ pub struct FloodingNode {
     pub id: NodeId,
     /// Dense index `0..n_nodes` used by metrics for `Vec` storage.
     pub idx: NodeIdx,
-    /// Broadcast port. Wired up at sim init: `out.connect(peer_recv,
-    /// &peer_mailbox)` once per peer, then a single `out.send(...)` fans
-    /// out to all of them.
-    pub out: Output<WireMessage>,
+    /// One Output per peer. Each Output has exactly one connected
+    /// mailbox; "broadcast" is the explicit `for out in &mut outputs`
+    /// loop in `do_send` / `originate`.
+    pub outputs: Vec<Output<WireMessage>>,
+    /// `peer_ids[i]` is the `NodeId` of `outputs[i]`'s recipient.
+    pub peer_ids: Vec<NodeId>,
+    /// Reverse map: `NodeId -> local index into outputs/peer_ids`.
+    /// Lets reply paths (sketch) find the right per-peer Output.
+    pub peer_id_to_local: HashMap<NodeId, usize>,
     /// How long to wait between receiving a new message and forwarding
     /// it. Stands in for one-way network latency.
     forward_delay: Duration,
+    /// Per-node dedup state owned by the registry (see [`crate::state`]).
+    /// Mutated under per-kind RwLocks; readable concurrently by other
+    /// nodes' sketch handlers.
+    #[serde(skip)]
+    state: SharedNodeState,
+    /// Peers' shared states. Unused by flooding; kept for uniformity
+    /// with other node kinds so sim.rs can use one wiring helper.
+    #[serde(skip)]
+    #[allow(dead_code)]
+    peer_states: Vec<SharedNodeState>,
     #[serde(skip)]
     metrics: MetricsHandle,
-    /// `channel_update` dedup: latest timestamp seen per
-    /// `(scid, direction)`. Equal/older arrivals are dropped,
-    /// strictly-newer ones supersede and re-broadcast.
-    chan_updates: HashMap<(Scid, Direction), u32>,
-    /// `node_announcement` dedup: latest timestamp seen per origin node.
-    /// Same monotonic rule as `chan_updates`.
-    node_anns: HashMap<NodeId, u32>,
-    /// `channel_announcement` dedup: SCIDs we've already seen. BOLT 7
-    /// channel announcements are not timestamped — first arrival wins
-    /// and any subsequent arrival is dropped silently.
-    chan_anns: HashSet<Scid>,
 }
 
 impl FloodingNode {
@@ -55,18 +75,30 @@ impl FloodingNode {
         id: NodeId,
         idx: NodeIdx,
         forward_delay: Duration,
+        state: SharedNodeState,
+        peer_states: Vec<SharedNodeState>,
         metrics: MetricsHandle,
     ) -> Self {
         Self {
             id,
             idx,
-            out: Output::default(),
+            outputs: Vec::new(),
+            peer_ids: Vec::new(),
+            peer_id_to_local: HashMap::new(),
             forward_delay,
+            state,
+            peer_states,
             metrics,
-            chan_updates: HashMap::new(),
-            node_anns: HashMap::new(),
-            chan_anns: HashSet::new(),
         }
+    }
+
+    /// Push a new per-peer Output into this node. Called by sim.rs
+    /// once per directed edge in the topology peer graph.
+    pub fn add_peer(&mut self, peer_id: NodeId, out: Output<WireMessage>) {
+        let local = self.outputs.len();
+        self.outputs.push(out);
+        self.peer_ids.push(peer_id);
+        self.peer_id_to_local.insert(peer_id, local);
     }
 }
 
@@ -82,46 +114,81 @@ impl FloodingNode {
     /// * `ChannelAnnouncement` — keep if this is the first time we've
     ///   seen this `scid`.
     ///
-    /// Kept messages are recorded in metrics and scheduled for forward
-    /// after `forward_delay` via the schedulable helper.
+    /// Duplicates bump the per-node duplicate counter and are
+    /// dropped. Kept messages are recorded in metrics and scheduled
+    /// for forward after `forward_delay`.
     pub fn recv(&mut self, wire: WireMessage, cx: &Context<Self>) {
-        for g in wire.iter_gossips() {
-            let fresh = match g.kind {
-                GossipKind::ChannelUpdate => {
-                    let key = (g.scid, g.direction);
-                    let supersedes = self
-                        .chan_updates
-                        .get(&key)
-                        .map(|&s| g.timestamp > s)
-                        .unwrap_or(true);
-                    if supersedes {
-                        self.chan_updates.insert(key, g.timestamp);
-                    }
-                    supersedes
-                }
-                GossipKind::NodeAnnouncement => {
-                    let supersedes = self
-                        .node_anns
-                        .get(&g.origin)
-                        .map(|&s| g.timestamp > s)
-                        .unwrap_or(true);
-                    if supersedes {
-                        self.node_anns.insert(g.origin, g.timestamp);
-                    }
-                    supersedes
-                }
-                GossipKind::ChannelAnnouncement => self.chan_anns.insert(g.scid),
-            };
-            if !fresh {
-                continue;
+        self.metrics.record_bytes_in(self.idx, wire.wire_size());
+        match &wire {
+            WireMessage::Single(g) => {
+                let g_copy = *g;
+                self.absorb_one(g_copy, cx);
             }
-            self.metrics.record_first_seen(self.idx, g, cx.time());
-            cx.schedule_event(
-                self.forward_delay,
-                schedulable!(Self::do_send),
-                *g,
-            )
-            .expect("schedule do_send");
+            WireMessage::Batch(batch) => {
+                self.absorb_chan_updates(&batch.chan_updates, cx);
+                self.absorb_node_anns(&batch.node_anns, cx);
+                self.absorb_chan_anns(&batch.chan_anns, cx);
+            }
+            WireMessage::Sketch(_) => {
+                // Flooding doesn't speak sketch protocol — silently ignore.
+            }
+        }
+    }
+
+    fn absorb_one(&mut self, g: Gossip, cx: &Context<Self>) {
+        match g.kind {
+            GossipKind::ChannelUpdate => self.absorb_chan_updates(std::slice::from_ref(&g), cx),
+            GossipKind::NodeAnnouncement => self.absorb_node_anns(std::slice::from_ref(&g), cx),
+            GossipKind::ChannelAnnouncement => self.absorb_chan_anns(std::slice::from_ref(&g), cx),
+        }
+    }
+
+    fn absorb_chan_updates(&mut self, gs: &[Gossip], cx: &Context<Self>) {
+        if gs.is_empty() {
+            return;
+        }
+        let mut m = self.state.chan_updates.write().expect("chan_updates poisoned");
+        for g in gs {
+            let scid = g.scid.expect("ChannelUpdate must carry scid");
+            let key = (scid, g.direction);
+            let supersedes = m
+                .get(&key)
+                .map(|(stored, _)| g.timestamp > *stored)
+                .unwrap_or(true);
+            if supersedes {
+                m.insert(key, (g.timestamp, g.size_bytes));
+            }
+            drop_or_forward(self.idx, &self.metrics, g, supersedes, cx, self.forward_delay);
+        }
+    }
+
+    fn absorb_node_anns(&mut self, gs: &[Gossip], cx: &Context<Self>) {
+        if gs.is_empty() {
+            return;
+        }
+        let mut m = self.state.node_anns.write().expect("node_anns poisoned");
+        for g in gs {
+            let origin = g.origin.expect("NodeAnnouncement must carry origin");
+            let supersedes = m
+                .get(&origin)
+                .map(|(stored, _)| g.timestamp > *stored)
+                .unwrap_or(true);
+            if supersedes {
+                m.insert(origin, (g.timestamp, g.size_bytes));
+            }
+            drop_or_forward(self.idx, &self.metrics, g, supersedes, cx, self.forward_delay);
+        }
+    }
+
+    fn absorb_chan_anns(&mut self, gs: &[Gossip], cx: &Context<Self>) {
+        if gs.is_empty() {
+            return;
+        }
+        let mut m = self.state.chan_anns.write().expect("chan_anns poisoned");
+        for g in gs {
+            let scid = g.scid.expect("ChannelAnnouncement must carry scid");
+            let fresh = m.insert(scid, g.size_bytes).is_none();
+            drop_or_forward(self.idx, &self.metrics, g, fresh, cx, self.forward_delay);
         }
     }
 
@@ -131,39 +198,13 @@ impl FloodingNode {
     /// any stored value so the per-key timestamp is strictly increasing
     /// (BOLT 7 requires it). For `ChannelAnnouncement` we leave
     /// `timestamp` alone but skip emission entirely if we've already
-    /// seen this SCID — this is what collapses the parquet replay's
-    /// "both endpoints emit" doubling into a single broadcast cascade.
+    /// seen this SCID.
     pub async fn originate(&mut self, mut msg: Gossip, cx: &Context<Self>) {
-        let now_secs = cx
-            .time()
-            .duration_since(MonotonicTime::EPOCH)
-            .as_secs() as u32;
-        match msg.kind {
-            GossipKind::ChannelUpdate => {
-                let key = (msg.scid, msg.direction);
-                let next_ts = match self.chan_updates.get(&key) {
-                    Some(&stored) => stored.saturating_add(1).max(now_secs),
-                    None => now_secs,
-                };
-                msg.timestamp = next_ts;
-                self.chan_updates.insert(key, next_ts);
-            }
-            GossipKind::NodeAnnouncement => {
-                let next_ts = match self.node_anns.get(&msg.origin) {
-                    Some(&stored) => stored.saturating_add(1).max(now_secs),
-                    None => now_secs,
-                };
-                msg.timestamp = next_ts;
-                self.node_anns.insert(msg.origin, next_ts);
-            }
-            GossipKind::ChannelAnnouncement => {
-                if !self.chan_anns.insert(msg.scid) {
-                    return;
-                }
-            }
+        if !originate_stamp(&self.state, self.id, &mut msg, cx.time()) {
+            return;
         }
         self.metrics.record_first_seen(self.idx, &msg, cx.time());
-        self.out.send(WireMessage::Single(msg)).await;
+        broadcast_single(&mut self.outputs, &self.metrics, self.idx, msg).await;
     }
 
     /// Helper invoked by `recv` after `forward_delay`. Marked
@@ -171,6 +212,43 @@ impl FloodingNode {
     /// `schedulable!(Self::do_send)` from the scheduler.
     #[nexosim(schedulable)]
     pub async fn do_send(&mut self, msg: Gossip) {
-        self.out.send(WireMessage::Single(msg)).await;
+        broadcast_single(&mut self.outputs, &self.metrics, self.idx, msg).await;
     }
+}
+
+/// Send `msg` as `WireMessage::Single` to every per-peer Output. Each
+/// Output has exactly one connected mailbox, so this is N independent
+/// sends rather than one broadcast iteration. Bandwidth metric is
+/// recorded once with the per-recipient multiplier baked in.
+async fn broadcast_single(
+    outputs: &mut [Output<WireMessage>],
+    metrics: &MetricsHandle,
+    idx: NodeIdx,
+    msg: Gossip,
+) {
+    let n_peers = outputs.len() as u64;
+    metrics.record_bytes_out(idx, msg.size_bytes as u64 * n_peers);
+    for out in outputs {
+        out.send(WireMessage::Single(msg)).await;
+    }
+}
+
+/// Per-gossip post-dedup action for flooding: on `fresh`, record
+/// metrics + schedule a forward; on stale, just bump the duplicate
+/// counter. Called from each per-kind absorber.
+fn drop_or_forward(
+    idx: NodeIdx,
+    metrics: &MetricsHandle,
+    g: &Gossip,
+    fresh: bool,
+    cx: &Context<FloodingNode>,
+    forward_delay: Duration,
+) {
+    if !fresh {
+        metrics.record_duplicate(idx);
+        return;
+    }
+    metrics.record_first_seen(idx, g, cx.time());
+    cx.schedule_event(forward_delay, schedulable!(FloodingNode::do_send), *g)
+        .expect("schedule do_send");
 }

@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use nexosim::ports::EventSource;
+use nexosim::ports::{EventSource, Output};
 use nexosim::simulation::{EventId, Mailbox, SimInit, Simulation};
 use nexosim::time::MonotonicTime;
 use rand::seq::SliceRandom;
@@ -46,6 +46,8 @@ use crate::metrics::MetricsHandle;
 use crate::node::cln::ClnNode;
 use crate::node::flooding::FloodingNode;
 use crate::node::lnd::LndNode;
+use crate::node::sketch::SketchNode;
+use crate::state::{self, SharedNodeState};
 use crate::topology::{NodeAlgo, Topology, metrics as topology_metrics, synthetic};
 
 pub struct RunResult {
@@ -137,10 +139,12 @@ pub fn run(cfg: &SimConfig, percentiles: Vec<f64>) -> Result<RunResult> {
             let k_cln = k.cln;
             let k_lnd = k.lnd;
             let k_flooding = k.flooding;
+            let k_sketch = k.sketch.unwrap_or(k.cln);
             let k_for = move |a: &NodeAlgo| match a {
                 NodeAlgo::Flooding => k_flooding,
                 NodeAlgo::Cln { .. } => k_cln,
                 NodeAlgo::Lnd { .. } => k_lnd,
+                NodeAlgo::Sketch { .. } => k_sketch,
             };
             crate::topology::synthetic::build_peer_graph(
                 &mut topology,
@@ -184,7 +188,10 @@ pub fn run(cfg: &SimConfig, percentiles: Vec<f64>) -> Result<RunResult> {
             event_tuples,
             deadline,
         )?,
-        AlgoCfg::Cln { .. } | AlgoCfg::Lnd { .. } | AlgoCfg::Mix { .. } => {
+        AlgoCfg::Cln { .. }
+        | AlgoCfg::Lnd { .. }
+        | AlgoCfg::Mix { .. }
+        | AlgoCfg::Sketch { .. } => {
             run_stagger_population(cfg, &topology, metrics.clone(), event_tuples, deadline)?;
         }
     }
@@ -215,6 +222,19 @@ fn default_algo_from(cfg: &AlgoCfg) -> NodeAlgo {
             min_batch_size: *min_batch_size,
         },
         AlgoCfg::Mix { .. } => NodeAlgo::Cln { stagger_ms: 0 },
+        AlgoCfg::Sketch {
+            stagger_ms,
+            capacity_chan_updates,
+            capacity_node_anns,
+            capacity_chan_anns,
+            peer_offset_max_ms,
+        } => NodeAlgo::Sketch {
+            stagger_ms: *stagger_ms,
+            capacity_chan_updates: *capacity_chan_updates,
+            capacity_node_anns: *capacity_node_anns,
+            capacity_chan_anns: *capacity_chan_anns,
+            peer_offset_max_ms: *peer_offset_max_ms,
+        },
     }
 }
 
@@ -478,6 +498,11 @@ fn run_flooding(
     deadline: MonotonicTime,
 ) -> Result<()> {
     let n = topology.len();
+    // One Arc<NodeState> per node, shared with the model that owns
+    // it AND with each of that node's peers (for sketch-style diffs).
+    // The local `registry` is dropped at the end of this function;
+    // the per-node Arcs survive via the model + its peers' clones.
+    let registry = state::build_registry(n);
     // Drive construction by NodeIndex so `idx` is dense 0..n while
     // `id` is whatever NodeMeta carries (dense for synthetic, sparse
     // u64 hash for CSV-loaded).
@@ -486,18 +511,35 @@ fn run_flooding(
         .node_indices()
         .map(|nx| {
             let meta = &topology.peers[nx];
-            FloodingNode::new(meta.id, meta.idx, forward_delay, metrics.clone())
+            let state = registry[meta.idx as usize].clone();
+            let peer_states: Vec<SharedNodeState> = topology
+                .peers
+                .neighbors(nx)
+                .map(|ny| registry[topology.peers[ny].idx as usize].clone())
+                .collect();
+            FloodingNode::new(
+                meta.id,
+                meta.idx,
+                forward_delay,
+                state,
+                peer_states,
+                metrics.clone(),
+            )
         })
         .collect();
     let mboxes: Vec<Mailbox<FloodingNode>> = (0..n)
         .map(|_| Mailbox::with_capacity(cfg.run.mailbox_capacity))
         .collect();
 
+    // Per-peer outputs: one Output per directed edge. The neighbour
+    // iteration order matches the `peer_states` order above so
+    // `outputs[i]` <-> `peer_states[i]` line up.
     for nx in topology.peers.node_indices() {
         for ny in topology.peers.neighbors(nx) {
-            nodes[nx.index()]
-                .out
-                .connect(FloodingNode::recv, &mboxes[ny.index()]);
+            let mut out = Output::default();
+            out.connect(FloodingNode::recv, &mboxes[ny.index()]);
+            let peer_id = topology.peers[ny].id;
+            nodes[nx.index()].add_peer(peer_id, out);
         }
     }
 
@@ -553,16 +595,20 @@ fn run_stagger_population(
 ) -> Result<()> {
     let n = topology.len();
 
-    // cln_local[i] / lnd_local[i] map a vertex's NodeIndex (dense
-    // 0..n) to its position in the per-type Vec<ClnNode> /
-    // Vec<LndNode>. We can't unify those two vectors because the model
-    // types differ.
+    let registry = state::build_registry(n);
+
+    // {cln,lnd,sketch}_local[i] maps a vertex's NodeIndex (dense
+    // 0..n) to its position in the per-type Vec<...>. Per-kind
+    // vectors are separate because the model types differ.
     let mut cln_local: Vec<Option<usize>> = vec![None; n];
     let mut lnd_local: Vec<Option<usize>> = vec![None; n];
+    let mut sketch_local: Vec<Option<usize>> = vec![None; n];
     let mut cln_nodes: Vec<ClnNode> = Vec::new();
     let mut lnd_nodes: Vec<LndNode> = Vec::new();
+    let mut sketch_nodes: Vec<SketchNode> = Vec::new();
     let mut cln_mboxes: Vec<Mailbox<ClnNode>> = Vec::new();
     let mut lnd_mboxes: Vec<Mailbox<LndNode>> = Vec::new();
+    let mut sketch_mboxes: Vec<Mailbox<SketchNode>> = Vec::new();
 
     let mut rng = ChaCha8Rng::seed_from_u64(cfg.seed ^ 0xC1A);
 
@@ -572,6 +618,12 @@ fn run_stagger_population(
         let idx = meta.idx;
         let algo = &meta.algo;
         let phase = sample_phase(&mut rng, stagger_of(algo));
+        let state = registry[idx as usize].clone();
+        let peer_states: Vec<SharedNodeState> = topology
+            .peers
+            .neighbors(nx)
+            .map(|ny| registry[topology.peers[ny].idx as usize].clone())
+            .collect();
         match algo {
             NodeAlgo::Cln { stagger_ms } => {
                 cln_local[nx.index()] = Some(cln_nodes.len());
@@ -580,6 +632,8 @@ fn run_stagger_population(
                     idx,
                     Duration::from_millis(*stagger_ms),
                     phase,
+                    state,
+                    peer_states,
                     metrics.clone(),
                 ));
                 cln_mboxes.push(Mailbox::with_capacity(cfg.run.mailbox_capacity));
@@ -597,9 +651,32 @@ fn run_stagger_population(
                     phase,
                     Duration::from_millis(*trickle_ms),
                     *min_batch_size,
+                    state,
+                    peer_states,
                     metrics.clone(),
                 ));
                 lnd_mboxes.push(Mailbox::with_capacity(cfg.run.mailbox_capacity));
+            }
+            NodeAlgo::Sketch {
+                stagger_ms,
+                capacity_chan_updates,
+                capacity_node_anns,
+                capacity_chan_anns,
+                peer_offset_max_ms: _,
+            } => {
+                sketch_local[nx.index()] = Some(sketch_nodes.len());
+                sketch_nodes.push(SketchNode::new(
+                    id,
+                    idx,
+                    Duration::from_millis(*stagger_ms),
+                    *capacity_chan_updates,
+                    *capacity_node_anns,
+                    *capacity_chan_anns,
+                    state,
+                    peer_states,
+                    metrics.clone(),
+                ));
+                sketch_mboxes.push(Mailbox::with_capacity(cfg.run.mailbox_capacity));
             }
             NodeAlgo::Flooding => {
                 panic!(
@@ -612,6 +689,8 @@ fn run_stagger_population(
     }
 
     // Wire connections by (src_kind, dst_kind) over the peer graph.
+    // Each (src, dst) edge gets a fresh per-peer Output on the source
+    // node, connected to the destination's mailbox.
     for nx in topology.peers.node_indices() {
         for ny in topology.peers.neighbors(nx) {
             wire_connection(
@@ -620,12 +699,29 @@ fn run_stagger_population(
                 topology,
                 &mut cln_nodes,
                 &mut lnd_nodes,
+                &mut sketch_nodes,
                 &cln_mboxes,
                 &lnd_mboxes,
+                &sketch_mboxes,
                 &cln_local,
                 &lnd_local,
+                &sketch_local,
             );
         }
+    }
+
+    // Sample per-peer sketch offsets — one per (sketch_node, peer) pair.
+    // Deterministic from cfg.seed XOR the node's id so reruns with the
+    // same config produce identical schedules.
+    for sn in sketch_nodes.iter_mut() {
+        let stagger = sn.stagger_for_offset_sample();
+        let mut sn_rng = ChaCha8Rng::seed_from_u64(cfg.seed ^ 0x5C7E ^ sn.id);
+        let n_peers = sn.outputs.len();
+        let mut offsets = Vec::with_capacity(n_peers);
+        for _ in 0..n_peers {
+            offsets.push(sample_phase(&mut sn_rng, stagger));
+        }
+        sn.set_per_peer_offsets(offsets);
     }
 
     let mut bench = new_sim_init(cfg);
@@ -649,6 +745,12 @@ fn run_stagger_population(
                     &lnd_mboxes[lnd_local[nx.index()].unwrap()],
                 )
                 .register(&mut bench),
+            NodeAlgo::Sketch { .. } => EventSource::<Gossip>::new()
+                .connect(
+                    SketchNode::originate,
+                    &sketch_mboxes[sketch_local[nx.index()].unwrap()],
+                )
+                .register(&mut bench),
             NodeAlgo::Flooding => unreachable!("guarded above"),
         };
         originate_sources.insert(meta.id, event_id);
@@ -660,6 +762,9 @@ fn run_stagger_population(
     }
     for (local_idx, (node, mbox)) in lnd_nodes.into_iter().zip(lnd_mboxes).enumerate() {
         bench = bench.add_model(node, mbox, &format!("lnd{local_idx}"));
+    }
+    for (local_idx, (node, mbox)) in sketch_nodes.into_iter().zip(sketch_mboxes).enumerate() {
+        bench = bench.add_model(node, mbox, &format!("sketch{local_idx}"));
     }
 
     let mut simu = bench
@@ -679,6 +784,7 @@ fn stagger_of(algo: &NodeAlgo) -> Duration {
     match algo {
         NodeAlgo::Cln { stagger_ms } => Duration::from_millis(*stagger_ms),
         NodeAlgo::Lnd { stagger_ms, .. } => Duration::from_millis(*stagger_ms),
+        NodeAlgo::Sketch { stagger_ms, .. } => Duration::from_millis(*stagger_ms),
         NodeAlgo::Flooding => Duration::ZERO,
     }
 }
@@ -690,33 +796,83 @@ fn wire_connection(
     topology: &Topology,
     cln_nodes: &mut [ClnNode],
     lnd_nodes: &mut [LndNode],
+    sketch_nodes: &mut [SketchNode],
     cln_mboxes: &[Mailbox<ClnNode>],
     lnd_mboxes: &[Mailbox<LndNode>],
+    sketch_mboxes: &[Mailbox<SketchNode>],
     cln_local: &[Option<usize>],
     lnd_local: &[Option<usize>],
+    sketch_local: &[Option<usize>],
 ) {
-    let src_algo = &topology.peers[petgraph::graph::NodeIndex::new(src)].algo;
-    let dst_algo = &topology.peers[petgraph::graph::NodeIndex::new(dst)].algo;
-    match (src_algo, dst_algo) {
+    let src_meta = &topology.peers[petgraph::graph::NodeIndex::new(src)];
+    let dst_meta = &topology.peers[petgraph::graph::NodeIndex::new(dst)];
+    let dst_id = dst_meta.id;
+    match (&src_meta.algo, &dst_meta.algo) {
+        // Cln source
         (NodeAlgo::Cln { .. }, NodeAlgo::Cln { .. }) => {
             let s = cln_local[src].unwrap();
             let d = cln_local[dst].unwrap();
-            cln_nodes[s].out.connect(ClnNode::recv, &cln_mboxes[d]);
+            let mut out = Output::default();
+            out.connect(ClnNode::recv, &cln_mboxes[d]);
+            cln_nodes[s].add_peer(dst_id, out);
         }
         (NodeAlgo::Cln { .. }, NodeAlgo::Lnd { .. }) => {
             let s = cln_local[src].unwrap();
             let d = lnd_local[dst].unwrap();
-            cln_nodes[s].out.connect(LndNode::recv, &lnd_mboxes[d]);
+            let mut out = Output::default();
+            out.connect(LndNode::recv, &lnd_mboxes[d]);
+            cln_nodes[s].add_peer(dst_id, out);
         }
+        (NodeAlgo::Cln { .. }, NodeAlgo::Sketch { .. }) => {
+            let s = cln_local[src].unwrap();
+            let d = sketch_local[dst].unwrap();
+            let mut out = Output::default();
+            out.connect(SketchNode::recv, &sketch_mboxes[d]);
+            cln_nodes[s].add_peer(dst_id, out);
+        }
+        // Lnd source
         (NodeAlgo::Lnd { .. }, NodeAlgo::Cln { .. }) => {
             let s = lnd_local[src].unwrap();
             let d = cln_local[dst].unwrap();
-            lnd_nodes[s].out.connect(ClnNode::recv, &cln_mboxes[d]);
+            let mut out = Output::default();
+            out.connect(ClnNode::recv, &cln_mboxes[d]);
+            lnd_nodes[s].add_peer(dst_id, out);
         }
         (NodeAlgo::Lnd { .. }, NodeAlgo::Lnd { .. }) => {
             let s = lnd_local[src].unwrap();
             let d = lnd_local[dst].unwrap();
-            lnd_nodes[s].out.connect(LndNode::recv, &lnd_mboxes[d]);
+            let mut out = Output::default();
+            out.connect(LndNode::recv, &lnd_mboxes[d]);
+            lnd_nodes[s].add_peer(dst_id, out);
+        }
+        (NodeAlgo::Lnd { .. }, NodeAlgo::Sketch { .. }) => {
+            let s = lnd_local[src].unwrap();
+            let d = sketch_local[dst].unwrap();
+            let mut out = Output::default();
+            out.connect(SketchNode::recv, &sketch_mboxes[d]);
+            lnd_nodes[s].add_peer(dst_id, out);
+        }
+        // Sketch source
+        (NodeAlgo::Sketch { .. }, NodeAlgo::Cln { .. }) => {
+            let s = sketch_local[src].unwrap();
+            let d = cln_local[dst].unwrap();
+            let mut out = Output::default();
+            out.connect(ClnNode::recv, &cln_mboxes[d]);
+            sketch_nodes[s].add_peer(dst_id, out);
+        }
+        (NodeAlgo::Sketch { .. }, NodeAlgo::Lnd { .. }) => {
+            let s = sketch_local[src].unwrap();
+            let d = lnd_local[dst].unwrap();
+            let mut out = Output::default();
+            out.connect(LndNode::recv, &lnd_mboxes[d]);
+            sketch_nodes[s].add_peer(dst_id, out);
+        }
+        (NodeAlgo::Sketch { .. }, NodeAlgo::Sketch { .. }) => {
+            let s = sketch_local[src].unwrap();
+            let d = sketch_local[dst].unwrap();
+            let mut out = Output::default();
+            out.connect(SketchNode::recv, &sketch_mboxes[d]);
+            sketch_nodes[s].add_peer(dst_id, out);
         }
         _ => unreachable!("Flooding nodes are routed via run_flooding"),
     }

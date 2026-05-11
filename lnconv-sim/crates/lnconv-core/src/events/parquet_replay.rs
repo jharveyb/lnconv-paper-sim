@@ -93,7 +93,8 @@ impl EventSchedule for ParquetReplay {
     ) -> Vec<(Duration, NodeId, Gossip)> {
         let mut out: Vec<(Duration, NodeId, Gossip)> = Vec::new();
         let mut rotor = DirectionRotor::default();
-        let mut next_id: u32 = 0;
+        // MsgId is now content-derived (Gossip::derive_id) — no
+        // sequential counter needed.
         let mut total_rows: usize = 0;
         let mut bad_scid: usize = 0;
         let mut bad_pk: usize = 0;
@@ -185,21 +186,23 @@ impl EventSchedule for ParquetReplay {
                                 continue;
                             }
                             let direction = rotor.next(scid);
-                            let origin = registry.owner(scid, direction);
+                            let origin_route = registry.owner(scid, direction);
+                            // ChannelUpdate: origin = None on the wire
+                            // (BOLT 7); originator's `originate` will
+                            // re-derive `id` after stamping `timestamp`.
                             out.push((
                                 delay,
-                                origin,
+                                origin_route,
                                 Gossip {
-                                    id: next_id,
-                                    origin,
+                                    id: 0,
+                                    origin: None,
                                     kind: GossipKind::ChannelUpdate,
                                     size_bytes,
-                                    scid,
+                                    scid: Some(scid),
                                     direction,
                                     timestamp: 0,
                                 },
                             ));
-                            next_id += 1;
                         }
                         TYPE_NODE_ANN => {
                             if orig_nodes.is_null(i) {
@@ -207,25 +210,26 @@ impl EventSchedule for ParquetReplay {
                                 continue;
                             }
                             let pk = orig_nodes.value(i);
-                            let origin = hash_pubkey(self.seed, pk);
-                            if !self.snapshot_nodes.contains(&origin) {
+                            let origin_id = hash_pubkey(self.seed, pk);
+                            if !self.snapshot_nodes.contains(&origin_id) {
                                 bad_pk += 1;
                                 continue;
                             }
+                            // NodeAnnouncement: origin IS the identity
+                            // (always Some(announcing_node)).
                             out.push((
                                 delay,
-                                origin,
+                                origin_id,
                                 Gossip {
-                                    id: next_id,
-                                    origin,
+                                    id: 0,
+                                    origin: Some(origin_id),
                                     kind: GossipKind::NodeAnnouncement,
                                     size_bytes,
-                                    scid: 0,
+                                    scid: None,
                                     direction: 0,
                                     timestamp: 0,
                                 },
                             ));
-                            next_id += 1;
                         }
                         TYPE_CHANNEL_ANN => {
                             if scids.is_null(i) {
@@ -237,22 +241,26 @@ impl EventSchedule for ParquetReplay {
                                 bad_scid += 1;
                                 continue;
                             }
+                            // ChannelAnnouncement: origin = None
+                            // (both endpoints sign in BOLT 7). Both
+                            // emissions hash to the same MsgId
+                            // (stable derive on identity tuple), so
+                            // dedup collapses them at the receiver.
                             for direction in [0u8, 1u8] {
-                                let origin = registry.owner(scid, direction);
+                                let origin_route = registry.owner(scid, direction);
                                 out.push((
                                     delay,
-                                    origin,
+                                    origin_route,
                                     Gossip {
-                                        id: next_id,
-                                        origin,
+                                        id: 0,
+                                        origin: None,
                                         kind: GossipKind::ChannelAnnouncement,
                                         size_bytes,
-                                        scid,
+                                        scid: Some(scid),
                                         direction: 0,
                                         timestamp: 0,
                                     },
                                 ));
-                                next_id += 1;
                             }
                         }
                         _ => {

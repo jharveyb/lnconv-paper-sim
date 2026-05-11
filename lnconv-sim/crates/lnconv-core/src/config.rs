@@ -73,6 +73,10 @@ pub struct KByAlgo {
     pub flooding: usize,
     pub cln: usize,
     pub lnd: usize,
+    /// Default `cln`'s value if omitted — sketch nodes broadly behave
+    /// like CLN at the topology level (similar peer-degree targets).
+    #[serde(default)]
+    pub sketch: Option<usize>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -99,7 +103,30 @@ pub enum AlgoCfg {
     Mix {
         population: Vec<MixEntry>,
     },
+    /// Set-reconciliation protocol. Each node maintains the same
+    /// per-kind dedup state as flooding/cln/lnd but never
+    /// broadcasts gossip directly — every `(node, peer)` pair has a
+    /// per-peer ticker that fires three `Sketch`es per stagger
+    /// (one per `SketchKind`), each at its own configurable
+    /// capacity.
+    Sketch {
+        stagger_ms: u64,
+        #[serde(default = "default_cu_capacity")]
+        capacity_chan_updates: u32,
+        #[serde(default = "default_na_capacity")]
+        capacity_node_anns: u32,
+        #[serde(default = "default_ca_capacity")]
+        capacity_chan_anns: u32,
+        /// Cap per-peer offset within each stagger window. None ⇒
+        /// uniform in (0, stagger_ms].
+        #[serde(default)]
+        peer_offset_max_ms: Option<u64>,
+    },
 }
+
+fn default_cu_capacity() -> u32 { 512 }
+fn default_na_capacity() -> u32 { 64 }
+fn default_ca_capacity() -> u32 { 64 }
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct MixEntry {
@@ -117,6 +144,19 @@ pub enum NodeAlgoKind {
         stagger_ms: u64,
         trickle_ms: u64,
         min_batch_size: usize,
+    },
+    Sketch {
+        stagger_ms: u64,
+        #[serde(default = "default_cu_capacity")]
+        capacity_chan_updates: u32,
+        #[serde(default = "default_na_capacity")]
+        capacity_node_anns: u32,
+        #[serde(default = "default_ca_capacity")]
+        capacity_chan_anns: u32,
+        /// Cap per-peer offset within each stagger window. None ⇒
+        /// uniform in (0, stagger_ms].
+        #[serde(default)]
+        peer_offset_max_ms: Option<u64>,
     },
 }
 

@@ -84,6 +84,44 @@ pub struct Metrics {
     completed: Mutex<Vec<MsgStats>>,
     superseded_count: AtomicUsize,
     total_first_seen: AtomicUsize,
+    /// Per-node bandwidth + duplicate + sketch counters indexed by
+    /// `NodeIdx`. Length is `n_nodes`; only zero-cost atomics so
+    /// nodes that don't use a particular counter just leave it at 0.
+    per_node: Vec<PerNodeMetrics>,
+}
+
+/// Per-node accounting recorded by every protocol. Bandwidth is
+/// counted in bytes (sum of `Gossip.size_bytes` for received /
+/// per-recipient sent messages, plus sketch wire-sizes). Duplicates
+/// are arrivals dropped by per-kind dedup. Sketch counters stay at
+/// zero on non-sketch nodes.
+#[derive(Default)]
+pub struct PerNodeMetrics {
+    pub bytes_in: AtomicU64,
+    pub bytes_out: AtomicU64,
+    pub duplicates: AtomicU64,
+    pub sketches_sent: AtomicU64,
+    pub sketches_received: AtomicU64,
+    pub sketches_overflowed: AtomicU64,
+    pub intersection_total: AtomicU64,
+    pub a_only_total: AtomicU64,
+    pub b_only_total: AtomicU64,
+}
+
+/// Snapshot of a single node's counters, returned by
+/// [`MetricsHandle::per_node_summary`] for CLI reporting.
+#[derive(Clone, Debug, Default)]
+pub struct NodeSummary {
+    pub idx: NodeIdx,
+    pub bytes_in: u64,
+    pub bytes_out: u64,
+    pub duplicates: u64,
+    pub sketches_sent: u64,
+    pub sketches_received: u64,
+    pub sketches_overflowed: u64,
+    pub intersection_total: u64,
+    pub a_only_total: u64,
+    pub b_only_total: u64,
 }
 
 #[derive(Default)]
@@ -124,6 +162,10 @@ impl Default for MetricsHandle {
 
 impl MetricsHandle {
     pub fn new(n_nodes: usize, percentiles: Vec<f64>) -> Self {
+        let mut per_node = Vec::with_capacity(n_nodes);
+        for _ in 0..n_nodes {
+            per_node.push(PerNodeMetrics::default());
+        }
         Self(Arc::new(Metrics {
             n_nodes,
             percentiles,
@@ -134,6 +176,7 @@ impl MetricsHandle {
             completed: Mutex::new(Vec::new()),
             superseded_count: AtomicUsize::new(0),
             total_first_seen: AtomicUsize::new(0),
+            per_node,
         }))
     }
 
@@ -145,17 +188,17 @@ impl MetricsHandle {
     pub fn record_first_seen(&self, node: NodeIdx, gossip: &Gossip, t: MonotonicTime) {
         let m = &*self.0;
         let ns = ns_since_epoch(t);
-        let key = (gossip.scid, gossip.direction);
+        let chan_key: Option<(Scid, Direction)> = gossip
+            .scid
+            .filter(|_| gossip.kind == crate::message::GossipKind::ChannelUpdate)
+            .map(|s| (s, gossip.direction));
 
-        // Early-out for already-finalized messages. Cheap concurrent
-        // read on the finalized set.
         if m.finalized.contains_sync(&gossip.id) {
             return;
         }
 
-        // Step 1: Supersession — atomically advance the channel's
-        // latest_version. The thread that wins the advance owns the
-        // drain of older MsgIds.
+        // Step 1: Supersession (ChannelUpdate only).
+        if let Some(key) = chan_key {
         let do_supersede = match m.latest_version.entry_sync(key) {
             scc::hash_map::Entry::Occupied(mut occ) => {
                 let v = occ.get_mut();
@@ -181,28 +224,24 @@ impl MetricsHandle {
                 .unwrap_or_default();
             for old_id in drained {
                 if old_id == gossip.id {
-                    continue; // we'll re-insert this one below
+                    continue;
                 }
                 if let Some((_, m_owned_arc)) = m.in_flight.remove_sync(&old_id) {
                     let inflight_owned = unwrap_or_snapshot(m_owned_arc);
-                    let stats =
-                        finalize_msg(old_id, inflight_owned, &m.percentiles, m.n_nodes);
+                    let stats = finalize_msg(old_id, inflight_owned, &m.percentiles, m.n_nodes);
                     m.completed.lock().unwrap().push(stats);
                     let _ = m.finalized.insert_sync(old_id);
                     m.superseded_count.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
+        }
 
-        // Step 2: get-or-create the per-MsgId Arc<MsgInflight>. The
-        // bucket lock from entry_sync is held only for the duration
-        // of the get-or-insert; we clone the Arc out and the guard
-        // is dropped at the end of the scope.
+        let inflight_key = chan_key.unwrap_or((0, 0));
         let inflight: Arc<MsgInflight> = {
             let entry = m.in_flight.entry_sync(gossip.id);
-            let occ = entry.or_insert_with(|| {
-                Arc::new(MsgInflight::new(m.n_nodes, ns, key))
-            });
+            let occ = entry
+                .or_insert_with(|| Arc::new(MsgInflight::new(m.n_nodes, ns, inflight_key)));
             occ.get().clone()
         };
 
@@ -243,11 +282,13 @@ impl MetricsHandle {
                 m.completed.lock().unwrap().push(stats);
                 let _ = m.finalized.insert_sync(gossip.id);
             }
-            // Maintain the per-channel index.
-            let _ = m.inflight_by_channel.update_sync(&key, |_, set| {
-                set.remove(&gossip.id);
-            });
-        } else {
+            // Maintain the per-channel index (ChannelUpdate only).
+            if let Some(key) = chan_key {
+                let _ = m.inflight_by_channel.update_sync(&key, |_, set| {
+                    set.remove(&gossip.id);
+                });
+            }
+        } else if let Some(key) = chan_key {
             // First-seen on this slot but message hasn't completed
             // yet — make sure the per-channel index has us listed.
             let entry = m.inflight_by_channel.entry_sync(key);
@@ -258,6 +299,89 @@ impl MetricsHandle {
 
     pub fn total_first_seen(&self) -> usize {
         self.0.total_first_seen.load(Ordering::Relaxed)
+    }
+
+    /// Record `n` bytes received by `idx`. Called once per inbound
+    /// `WireMessage` (Single, Batch, or Sketch) using
+    /// [`crate::message::WireMessage::wire_size`].
+    #[inline]
+    pub fn record_bytes_in(&self, idx: NodeIdx, n: u64) {
+        if let Some(p) = self.0.per_node.get(idx as usize) {
+            p.bytes_in.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    /// Record `n` bytes sent by `idx`. For broadcasts the caller
+    /// multiplies by the recipient count before calling this so the
+    /// per-recipient cost is captured in one atomic op.
+    #[inline]
+    pub fn record_bytes_out(&self, idx: NodeIdx, n: u64) {
+        if let Some(p) = self.0.per_node.get(idx as usize) {
+            p.bytes_out.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    /// Bump the duplicate-arrival counter for `idx` by 1. Called by
+    /// `recv` when a per-kind dedup check rejects an inbound gossip.
+    #[inline]
+    pub fn record_duplicate(&self, idx: NodeIdx) {
+        if let Some(p) = self.0.per_node.get(idx as usize) {
+            p.duplicates.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Bump the sketch-sent counter for `idx`.
+    #[inline]
+    pub fn record_sketch_sent(&self, idx: NodeIdx) {
+        if let Some(p) = self.0.per_node.get(idx as usize) {
+            p.sketches_sent.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Record a sketch the receiver `idx` just processed. `overflowed`
+    /// = true means the diff exceeded the sketch capacity (no reply
+    /// will be sent). The intersection / a_only / b_only counts are
+    /// added to running totals so the CLI can report means at end.
+    #[inline]
+    pub fn record_sketch_recv(
+        &self,
+        idx: NodeIdx,
+        intersection: u64,
+        a_only: u64,
+        b_only: u64,
+        overflowed: bool,
+    ) {
+        if let Some(p) = self.0.per_node.get(idx as usize) {
+            p.sketches_received.fetch_add(1, Ordering::Relaxed);
+            if overflowed {
+                p.sketches_overflowed.fetch_add(1, Ordering::Relaxed);
+            }
+            p.intersection_total.fetch_add(intersection, Ordering::Relaxed);
+            p.a_only_total.fetch_add(a_only, Ordering::Relaxed);
+            p.b_only_total.fetch_add(b_only, Ordering::Relaxed);
+        }
+    }
+
+    /// Snapshot per-node counters in `NodeIdx` order. Returns one
+    /// `NodeSummary` per node.
+    pub fn per_node_summary(&self) -> Vec<NodeSummary> {
+        self.0
+            .per_node
+            .iter()
+            .enumerate()
+            .map(|(i, p)| NodeSummary {
+                idx: i as NodeIdx,
+                bytes_in: p.bytes_in.load(Ordering::Relaxed),
+                bytes_out: p.bytes_out.load(Ordering::Relaxed),
+                duplicates: p.duplicates.load(Ordering::Relaxed),
+                sketches_sent: p.sketches_sent.load(Ordering::Relaxed),
+                sketches_received: p.sketches_received.load(Ordering::Relaxed),
+                sketches_overflowed: p.sketches_overflowed.load(Ordering::Relaxed),
+                intersection_total: p.intersection_total.load(Ordering::Relaxed),
+                a_only_total: p.a_only_total.load(Ordering::Relaxed),
+                b_only_total: p.b_only_total.load(Ordering::Relaxed),
+            })
+            .collect()
     }
 
     /// Number of messages that finalized via supersession (an older
@@ -433,10 +557,10 @@ mod tests {
     fn dummy_gossip(id: MsgId, ts: u32) -> Gossip {
         Gossip {
             id,
-            origin: 0,
+            origin: None,
             kind: crate::message::GossipKind::ChannelUpdate,
             size_bytes: 0,
-            scid: 1,
+            scid: Some(1),
             direction: 0,
             timestamp: ts,
         }
@@ -464,6 +588,49 @@ mod tests {
         }
         // n_nodes=4: only node 0 was recorded. coverage should be 1.
         assert_eq!(metrics.total_first_seen(), 1);
+    }
+
+    #[test]
+    fn bytes_in_out_counted() {
+        let m = MetricsHandle::new(4, vec![1.0]);
+        m.record_bytes_in(0, 100);
+        m.record_bytes_in(0, 50);
+        m.record_bytes_out(0, 200);
+        m.record_bytes_in(2, 7);
+        let s = m.per_node_summary();
+        assert_eq!(s.len(), 4);
+        assert_eq!(s[0].bytes_in, 150);
+        assert_eq!(s[0].bytes_out, 200);
+        assert_eq!(s[1].bytes_in, 0);
+        assert_eq!(s[2].bytes_in, 7);
+        assert_eq!(s[3].bytes_in, 0);
+    }
+
+    #[test]
+    fn duplicate_count_counted() {
+        let m = MetricsHandle::new(2, vec![1.0]);
+        for _ in 0..5 {
+            m.record_duplicate(1);
+        }
+        let s = m.per_node_summary();
+        assert_eq!(s[0].duplicates, 0);
+        assert_eq!(s[1].duplicates, 5);
+    }
+
+    #[test]
+    fn sketch_counters_tally() {
+        let m = MetricsHandle::new(2, vec![1.0]);
+        m.record_sketch_sent(0);
+        m.record_sketch_sent(0);
+        m.record_sketch_recv(1, 10, 2, 3, false);
+        m.record_sketch_recv(1, 20, 0, 0, true);
+        let s = m.per_node_summary();
+        assert_eq!(s[0].sketches_sent, 2);
+        assert_eq!(s[1].sketches_received, 2);
+        assert_eq!(s[1].sketches_overflowed, 1);
+        assert_eq!(s[1].intersection_total, 30);
+        assert_eq!(s[1].a_only_total, 2);
+        assert_eq!(s[1].b_only_total, 3);
     }
 
     /// N threads recording N distinct nodes for the same message ⇒

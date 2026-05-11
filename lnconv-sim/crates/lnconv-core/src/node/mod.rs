@@ -18,3 +18,4 @@
 pub mod cln;
 pub mod flooding;
 pub mod lnd;
+pub mod sketch;

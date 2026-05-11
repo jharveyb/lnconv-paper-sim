@@ -21,6 +21,10 @@ pub mod message;
 pub mod metrics;
 pub mod node;
 pub mod sim;
+pub mod state;
 pub mod topology;
 
-pub use message::{Direction, Gossip, GossipKind, MsgId, NodeId, NodeIdx, Scid, WireMessage};
+pub use message::{
+    Direction, Gossip, GossipKind, MsgId, NodeId, NodeIdx, Scid, Sketch, SketchKind, WireMessage,
+};
+pub use state::{NodeState, SharedNodeState};

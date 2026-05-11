@@ -11,37 +11,41 @@
 //! up. Without this the simulator would let messages cascade many hops in
 //! one time step, biasing convergence times much faster than the
 //! algorithm allows.
+//!
+//! See [`super::flooding`] for notes on per-peer outputs and shared
+//! `NodeState` — same shape here.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use nexosim::model::{Context, Model, schedulable};
 use nexosim::ports::Output;
-use nexosim::time::MonotonicTime;
 use serde::{Deserialize, Serialize};
 
-use crate::message::{Direction, Gossip, GossipKind, NodeId, NodeIdx, Scid, WireMessage};
+use crate::message::{Gossip, GossipBatch, GossipKind, NodeId, NodeIdx, WireMessage};
 use crate::metrics::MetricsHandle;
+use crate::state::{SharedNodeState, originate_stamp};
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct ClnNode {
     pub id: NodeId,
     pub idx: NodeIdx,
-    pub out: Output<WireMessage>,
+    pub outputs: Vec<Output<WireMessage>>,
+    pub peer_ids: Vec<NodeId>,
+    pub peer_id_to_local: HashMap<NodeId, usize>,
     /// Period between drain ticks.
     stagger: Duration,
     /// Absolute time of this node's *first* tick. Sampled uniformly in
     /// (0, stagger] by the runner — see `sim::sample_phase`.
     first_tick: Duration,
     #[serde(skip)]
+    state: SharedNodeState,
+    #[serde(skip)]
+    #[allow(dead_code)]
+    peer_states: Vec<SharedNodeState>,
+    #[serde(skip)]
     metrics: MetricsHandle,
-    /// `channel_update` dedup, lifetime not per-tick.
-    chan_updates: HashMap<(Scid, Direction), u32>,
-    /// `node_announcement` dedup, lifetime not per-tick.
-    node_anns: HashMap<NodeId, u32>,
-    /// `channel_announcement` first-seen set.
-    chan_anns: HashSet<Scid>,
     /// Gossip awaiting the next stagger tick.
     pending: Vec<Gossip>,
 }
@@ -52,20 +56,30 @@ impl ClnNode {
         idx: NodeIdx,
         stagger: Duration,
         first_tick: Duration,
+        state: SharedNodeState,
+        peer_states: Vec<SharedNodeState>,
         metrics: MetricsHandle,
     ) -> Self {
         Self {
             id,
             idx,
-            out: Output::default(),
+            outputs: Vec::new(),
+            peer_ids: Vec::new(),
+            peer_id_to_local: HashMap::new(),
             stagger,
             first_tick,
+            state,
+            peer_states,
             metrics,
-            chan_updates: HashMap::new(),
-            node_anns: HashMap::new(),
-            chan_anns: HashSet::new(),
             pending: Vec::new(),
         }
+    }
+
+    pub fn add_peer(&mut self, peer_id: NodeId, out: Output<WireMessage>) {
+        let local = self.outputs.len();
+        self.outputs.push(out);
+        self.peer_ids.push(peer_id);
+        self.peer_id_to_local.insert(peer_id, local);
     }
 }
 
@@ -81,94 +95,121 @@ impl ClnNode {
 
     /// Input port. BOLT 7 per-kind dedup, then queue for next tick.
     pub async fn recv(&mut self, wire: WireMessage, cx: &Context<Self>) {
-        for g in wire.iter_gossips() {
-            let fresh = match g.kind {
-                GossipKind::ChannelUpdate => {
-                    let key = (g.scid, g.direction);
-                    let supersedes = self
-                        .chan_updates
-                        .get(&key)
-                        .map(|&s| g.timestamp > s)
-                        .unwrap_or(true);
-                    if supersedes {
-                        self.chan_updates.insert(key, g.timestamp);
-                    }
-                    supersedes
-                }
-                GossipKind::NodeAnnouncement => {
-                    let supersedes = self
-                        .node_anns
-                        .get(&g.origin)
-                        .map(|&s| g.timestamp > s)
-                        .unwrap_or(true);
-                    if supersedes {
-                        self.node_anns.insert(g.origin, g.timestamp);
-                    }
-                    supersedes
-                }
-                GossipKind::ChannelAnnouncement => self.chan_anns.insert(g.scid),
-            };
-            if !fresh {
-                continue;
+        self.metrics.record_bytes_in(self.idx, wire.wire_size());
+        match &wire {
+            WireMessage::Single(g) => {
+                let g_copy = *g;
+                self.absorb_one(g_copy, cx);
             }
-            self.metrics.record_first_seen(self.idx, g, cx.time());
-            self.pending.push(*g);
+            WireMessage::Batch(batch) => {
+                self.absorb_chan_updates(&batch.chan_updates, cx);
+                self.absorb_node_anns(&batch.node_anns, cx);
+                self.absorb_chan_anns(&batch.chan_anns, cx);
+            }
+            WireMessage::Sketch(_) => {}
         }
     }
 
-    /// Input port for `EventSource`-driven originations. Unlike forwarded
-    /// gossip (which waits for the next stagger tick), an originated
-    /// message broadcasts to all connected peers *immediately* as a
-    /// `WireMessage::Single` — matches CLN's behavior where local
-    /// `channel_update`s aren't held back by the stagger window.
-    ///
-    /// `ChannelUpdate` and `NodeAnnouncement` are timestamped from
-    /// current sim time, bumped past any stored value (BOLT 7
-    /// monotonicity). `ChannelAnnouncement` keeps its incoming
-    /// timestamp and is suppressed if we've already broadcast this
-    /// SCID — prevents the parquet replay's two-endpoint duplicate
-    /// origination from producing two cascades.
+    /// Originated messages broadcast immediately (CLN behaviour:
+    /// local updates aren't held by the stagger window).
     pub async fn originate(&mut self, mut msg: Gossip, cx: &Context<Self>) {
-        let now_secs = cx
-            .time()
-            .duration_since(MonotonicTime::EPOCH)
-            .as_secs() as u32;
-        match msg.kind {
-            GossipKind::ChannelUpdate => {
-                let key = (msg.scid, msg.direction);
-                let next_ts = match self.chan_updates.get(&key) {
-                    Some(&stored) => stored.saturating_add(1).max(now_secs),
-                    None => now_secs,
-                };
-                msg.timestamp = next_ts;
-                self.chan_updates.insert(key, next_ts);
-            }
-            GossipKind::NodeAnnouncement => {
-                let next_ts = match self.node_anns.get(&msg.origin) {
-                    Some(&stored) => stored.saturating_add(1).max(now_secs),
-                    None => now_secs,
-                };
-                msg.timestamp = next_ts;
-                self.node_anns.insert(msg.origin, next_ts);
-            }
-            GossipKind::ChannelAnnouncement => {
-                if !self.chan_anns.insert(msg.scid) {
-                    return;
-                }
-            }
+        if !originate_stamp(&self.state, self.id, &mut msg, cx.time()) {
+            return;
         }
         self.metrics.record_first_seen(self.idx, &msg, cx.time());
-        self.out.send(WireMessage::Single(msg)).await;
+        let n_peers = self.outputs.len() as u64;
+        self.metrics
+            .record_bytes_out(self.idx, msg.size_bytes as u64 * n_peers);
+        for out in &mut self.outputs {
+            out.send(WireMessage::Single(msg)).await;
+        }
     }
 
-    /// Periodic broadcast. If anything's pending, take it all and send
-    /// as one batch. Most ticks for most nodes have empty pending.
+    /// Periodic broadcast. If anything's pending, partition by kind
+    /// into a `GossipBatch` (so receivers can take each per-kind
+    /// `RwLock` exactly once) and send to each peer.
     #[nexosim(schedulable)]
     async fn tick(&mut self, _: ()) {
         if self.pending.is_empty() {
             return;
         }
-        let batch = std::mem::take(&mut self.pending);
-        self.out.send(WireMessage::Batch(Arc::new(batch))).await;
+        let drained = std::mem::take(&mut self.pending);
+        let bytes_per_peer: u64 = drained.iter().map(|g| g.size_bytes as u64).sum();
+        let n_peers = self.outputs.len() as u64;
+        self.metrics.record_bytes_out(self.idx, bytes_per_peer * n_peers);
+        let arc_batch = Arc::new(GossipBatch::from_mixed(drained));
+        for out in &mut self.outputs {
+            out.send(WireMessage::Batch(arc_batch.clone())).await;
+        }
+    }
+}
+
+impl ClnNode {
+    fn absorb_one(&mut self, g: Gossip, cx: &Context<Self>) {
+        match g.kind {
+            GossipKind::ChannelUpdate => self.absorb_chan_updates(std::slice::from_ref(&g), cx),
+            GossipKind::NodeAnnouncement => self.absorb_node_anns(std::slice::from_ref(&g), cx),
+            GossipKind::ChannelAnnouncement => self.absorb_chan_anns(std::slice::from_ref(&g), cx),
+        }
+    }
+
+    fn absorb_chan_updates(&mut self, gs: &[Gossip], cx: &Context<Self>) {
+        if gs.is_empty() {
+            return;
+        }
+        let mut m = self.state.chan_updates.write().expect("chan_updates poisoned");
+        for g in gs {
+            let scid = g.scid.expect("ChannelUpdate must carry scid");
+            let key = (scid, g.direction);
+            let supersedes = m
+                .get(&key)
+                .map(|(stored, _)| g.timestamp > *stored)
+                .unwrap_or(true);
+            if supersedes {
+                m.insert(key, (g.timestamp, g.size_bytes));
+                self.metrics.record_first_seen(self.idx, g, cx.time());
+                self.pending.push(*g);
+            } else {
+                self.metrics.record_duplicate(self.idx);
+            }
+        }
+    }
+
+    fn absorb_node_anns(&mut self, gs: &[Gossip], cx: &Context<Self>) {
+        if gs.is_empty() {
+            return;
+        }
+        let mut m = self.state.node_anns.write().expect("node_anns poisoned");
+        for g in gs {
+            let origin = g.origin.expect("NodeAnnouncement must carry origin");
+            let supersedes = m
+                .get(&origin)
+                .map(|(stored, _)| g.timestamp > *stored)
+                .unwrap_or(true);
+            if supersedes {
+                m.insert(origin, (g.timestamp, g.size_bytes));
+                self.metrics.record_first_seen(self.idx, g, cx.time());
+                self.pending.push(*g);
+            } else {
+                self.metrics.record_duplicate(self.idx);
+            }
+        }
+    }
+
+    fn absorb_chan_anns(&mut self, gs: &[Gossip], cx: &Context<Self>) {
+        if gs.is_empty() {
+            return;
+        }
+        let mut m = self.state.chan_anns.write().expect("chan_anns poisoned");
+        for g in gs {
+            let scid = g.scid.expect("ChannelAnnouncement must carry scid");
+            let fresh = m.insert(scid, g.size_bytes).is_none();
+            if fresh {
+                self.metrics.record_first_seen(self.idx, g, cx.time());
+                self.pending.push(*g);
+            } else {
+                self.metrics.record_duplicate(self.idx);
+            }
+        }
     }
 }

@@ -25,7 +25,6 @@ impl EventSchedule for OneShotAll {
         registry: &ChannelRegistry,
     ) -> Vec<(Duration, NodeId, Gossip)> {
         let mut out = Vec::new();
-        let mut next_id: u32 = 0;
         for &node in nodes {
             let owned = registry.channels_for(node);
             let Some(&(scid, direction)) = owned.first() else {
@@ -34,17 +33,19 @@ impl EventSchedule for OneShotAll {
                 );
                 continue;
             };
+            // ChannelUpdate convention: origin = None on the wire.
+            // The originating node's `originate` will stamp `timestamp`
+            // and re-derive `id`, so we leave id at 0 here.
             let msg = Gossip {
-                id: next_id,
-                origin: node,
+                id: 0,
+                origin: None,
                 kind: GossipKind::ChannelUpdate,
                 size_bytes: self.size_bytes,
-                scid,
+                scid: Some(scid),
                 direction,
                 timestamp: 0,
             };
             out.push((self.at, node, msg));
-            next_id += 1;
         }
         out
     }
@@ -87,10 +88,10 @@ impl EventSchedule for OneShotSingle {
         };
         let msg = Gossip {
             id: 0,
-            origin: node_id,
+            origin: None,
             kind: GossipKind::ChannelUpdate,
             size_bytes: self.size_bytes,
-            scid,
+            scid: Some(scid),
             direction,
             timestamp: 0,
         };

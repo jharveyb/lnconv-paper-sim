@@ -1,0 +1,34 @@
+seed = 42
+
+[topology]
+kind = "from_csv"
+nodes_csv = "init_data/node_list.csv"
+channels_csv = "init_data/channel_list.csv"
+enforce_hub_cap = true
+
+[topology.k]
+flooding = 5
+cln = 10
+lnd = 3
+sketch = 4
+
+[latency]
+dist = "constant"
+ms = 100
+
+[algo]
+kind = "sketch"
+stagger_ms = 30000
+capacity_chan_updates = 512
+capacity_node_anns = 128
+capacity_chan_anns = 128
+
+[event]
+kind = "parquet_replay"
+# Glob ok; the bundled smoke fixture is the single 28 MB file.
+path = "init_data/compact_traffic_2026-02-11_2026-02-13.parquet"
+
+[run]
+duration_seconds = 600
+mailbox_capacity = 1024
+progress_interval_seconds = 60

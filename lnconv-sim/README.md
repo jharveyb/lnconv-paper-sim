@@ -43,6 +43,7 @@ Available smoke configs in [`configs/`](configs):
 | `mix-poisson-large.toml` / `mixed-poisson-large.toml` | n≈20k, mix population, hour-long Poisson — long-run / memory stress |
 | `ln-snapshot-flooding.toml` | Real LN snapshot from `init_data/` (~12k nodes, ~42k channels), flooding from one origin |
 | `ln-snapshot-parquet-flooding.toml` | Real LN snapshot + parquet replay of mainnet gossip traffic for the first 5 minutes of the trace |
+| `sketch-smoke.toml` | Set-reconciliation smoke (n=200, capacity-64 sketch over chan_updates, Poisson load) |
 
 The example `cargo run --release --example diameter -p lnconv-core` prints
 BFS-derived diameters and mean path lengths for a sweep of `(n, k)` —
@@ -130,7 +131,8 @@ and re-broadcast.
 | **Flooding** | On a fresh `(scid, direction, timestamp)`, schedule a forward to all peers after `latency.ms`. Originated messages broadcast immediately. |
 | **Cln** (c-lightning-style) | Forwarded gossip waits in a `pending` queue and is sent in one big `Batch` per `stagger_ms` tick. **Originated messages bypass the queue and are broadcast immediately as `Single`** (matches CLN's "local updates aren't held by the broadcast window"). |
 | **Lnd** (LND-style) | Same per-tick batching as Cln, but pending is split into chunks sized by `calculate_sub_batch_size(stagger_ms, trickle_ms, min_batch_size, pending_len)` so all chunks fit inside the stagger window. Concretely: `chunk = max(min_batch_size, ceil(pending_len * trickle_ms / stagger_ms))`. With stagger=90s, trickle=5s, pending=360, min=10 → chunk=20 (18 sub-batches), not 10 (36 sub-batches). First chunk goes immediately on tick; subsequent chunks at `+i·trickle_ms`. **Originated messages are inserted at the FRONT of `pending`**, so they ride out in the first chunk ahead of any forwarded traffic. |
-| **Mix** | Per-node assignment of Cln/Lnd from a fraction list; deterministic shuffle by `seed`. Connections between mixed nodes work because both `recv` methods take the same `WireMessage` type. The chosen kind for each node is stored as `NodeAlgo` on the `peers` graph vertex. |
+| **Mix** | Per-node assignment of Cln/Lnd/Sketch from a fraction list; deterministic shuffle by `seed`. Connections between mixed nodes work because both `recv` methods take the same `WireMessage` type. The chosen kind for each node is stored as `NodeAlgo` on the `peers` graph vertex. |
+| **Sketch** | Set-reconciliation. Each `(node, peer)` pair has a per-peer ticker firing every `stagger_ms` at a deterministic per-peer offset within `(0, stagger_ms]`. The tick sends a fixed-`capacity` `Sketch` to that one peer. The receiver computes the symmetric diff over the configured `SketchKind` (`chan_updates`, `node_anns`, or `chan_anns`) by reading both nodes' `Arc<NodeState>`; if the diff fits in `capacity` it replies with a `Batch` of the messages the sender is missing, else records `sketches_overflowed` and sends nothing. Sketch nodes do NOT fan-out gossip on `recv` — propagation is exclusively via reconciliation. |
 
 Each stagger node samples its first-tick offset uniformly in
 `(0, stagger_ms]` from the seeded RNG. This avoids same-instant tick
@@ -149,6 +151,45 @@ at random"; they pick a channel.
 | `one_shot_all` | Every node that owns at least one channel originates one message at `t=0`, using its first owned `(scid, direction)`. |
 | `poisson_random { rate_per_sec, size_bytes }` | Exponential inter-arrival with mean `1/rate_per_sec`; each event picks a uniformly-random `(scid, direction)` and uses its owner as the originator. Runs until `duration_seconds`. |
 | `parquet_replay { path }` | Replay events from a real-world ZSTD-compressed parquet capture. See **Replaying real-world traffic from parquet** below. |
+
+### Set reconciliation (sketch protocol)
+
+```toml
+[algo]
+kind = "sketch"
+stagger_ms = 5000              # how often each (node, peer) pair reconciles
+capacity_chan_updates = 128    # per-kind sketch capacity
+capacity_node_anns = 64
+capacity_chan_anns = 64
+# peer_offset_max_ms = 60000   # optional cap; default is stagger_ms
+```
+
+Each tick fires **three** sketches per peer — one per `SketchKind`
+(chan_updates, node_anns, chan_anns) — so all three BOLT 7 message
+kinds reconcile independently. Per-kind capacities let you give
+chan_updates (the largest traffic kind) more bandwidth than
+node_anns / chan_anns.
+
+Each node assigns a deterministic per-peer offset within
+`(0, peer_offset_max_ms]` from `cfg.seed XOR node_id` so reruns
+schedule sketches identically. The receiver of a sketch reads the
+sender's `Arc<NodeState>` (it has direct access only to its peers'
+states, not the global registry — contention scales with peer-degree
+not network size), computes the per-kind symmetric diff, and
+replies with a `WireMessage::Batch` containing the gossips the
+sender is **strictly missing** — items where the receiver has a
+strictly newer version (or the sender is missing the entry
+entirely). Stale entries are never sent.
+
+Capacity overflow uses the **strict** symmetric-diff count (each
+same-key-different-timestamp pair counts as 2 elements, matching
+how a real minisketch decode would fail). Overflow ⇒
+`sketches_overflowed` metric bumped, no reply sent.
+
+Sketch nodes never fan-out gossip on `recv` — their state propagates
+only via reconciliation. They can mix freely with Cln/Lnd (and other
+sketch nodes) in a `Mix` population; cross-kind connections work
+because every `recv` accepts the same `WireMessage` type.
 
 ---
 
@@ -174,10 +215,17 @@ When the run finishes the binary prints, in order:
 1. `simulation finished: N distinct messages` and `total first-seen events: …`.
 2. `superseded: K of N …` if any messages were killed mid-spread by a
    newer `(scid, direction)` version (BOLT 7 supersession).
-3. A per-message table (first 5 messages) showing each percentile column;
+3. **per-node bandwidth + duplicates**: min/p50/p95/max/total of
+   `bytes_in`, `bytes_out`, and `duplicates` (per-kind dedup
+   rejections). Bandwidth counts `Gossip.size_bytes` for each
+   delivered message plus `Sketch.size_bytes` for sketch traffic.
+4. **sketch protocol** (only printed when sketch traffic is nonzero):
+   sent / received counts, overflow rate, mean intersection / a_only
+   / b_only diff sizes per sketch.
+5. A per-message table (first 5 messages) showing each percentile column;
    `--` means the message never reached that absolute coverage.
-4. A **coverage distribution**: how many messages reached each tier.
-5. A **time-to-reach-coverage distribution per tier**: for each of
+6. A **coverage distribution**: how many messages reached each tier.
+7. A **time-to-reach-coverage distribution per tier**: for each of
    25%, 50%, 75%, 100%, the distribution *across messages* of the time
    that message took to reach that coverage.
 
@@ -497,10 +545,15 @@ nodes can still parse what arrives.
   `do_send` (already done for flooding).
 - **One topology generator (random k-regular).** Erdős–Rényi and
   Barabási–Albert are on the roadmap (rustworkx-core has both).
-- **Mocked set reconciliation.** Not yet ported from the Go simulator —
-  when added, it will compare sets directly rather than transporting real
-  minisketch payloads (matches the Go behavior; can later swap in
-  [`minisketch`](https://crates.io/crates/minisketch) bindings).
+- **Mocked set reconciliation.** Sketches don't run real
+  minisketch coding — the simulator computes the symmetric diff
+  directly from each side's `Arc<NodeState>` and reports failure
+  when the diff exceeds `capacity`. Bandwidth costs use a synthetic
+  `capacity * 8` bytes per sketch; reply Batches use real
+  `Gossip.size_bytes`. Can later swap in
+  [`minisketch`](https://crates.io/crates/minisketch) bindings if
+  we want to verify the encoding overhead matches what the diff
+  semantics already capture.
 - **Metrics are concurrent but per-MsgId-serialised.** The
   `MetricsHandle` uses `scc::HashMap` for in-flight + per-channel state
   and `AtomicUsize` counters, so different MsgIds proceed in parallel
