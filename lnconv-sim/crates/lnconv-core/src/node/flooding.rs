@@ -34,7 +34,7 @@ use nexosim::ports::Output;
 use serde::{Deserialize, Serialize};
 
 use crate::message::{Gossip, GossipKind, NodeId, NodeIdx, WireMessage};
-use crate::metrics::MetricsHandle;
+use crate::metrics::{MetricsHandle, PerNodeMetrics};
 use crate::state::{SharedNodeState, originate_stamp};
 
 #[derive(Default, Serialize, Deserialize)]
@@ -56,6 +56,8 @@ pub struct FloodingNode {
     /// How long to wait between receiving a new message and forwarding
     /// it. Stands in for one-way network latency.
     forward_delay: Duration,
+    /// How long until end of run; used to schedule `flush_summary`.
+    run_duration: Duration,
     /// Per-node dedup state owned by the registry (see [`crate::state`]).
     /// Mutated under per-kind RwLocks; readable concurrently by other
     /// nodes' sketch handlers.
@@ -66,15 +68,20 @@ pub struct FloodingNode {
     #[serde(skip)]
     #[allow(dead_code)]
     peer_states: Vec<SharedNodeState>,
+    /// Plain-u64 per-node counters; flushed at end-of-run.
+    #[serde(skip)]
+    metrics_local: PerNodeMetrics,
     #[serde(skip)]
     metrics: MetricsHandle,
 }
 
 impl FloodingNode {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: NodeId,
         idx: NodeIdx,
         forward_delay: Duration,
+        run_duration: Duration,
         state: SharedNodeState,
         peer_states: Vec<SharedNodeState>,
         metrics: MetricsHandle,
@@ -86,24 +93,44 @@ impl FloodingNode {
             peer_ids: Vec::new(),
             peer_id_to_local: HashMap::new(),
             forward_delay,
+            run_duration,
             state,
             peer_states,
+            metrics_local: PerNodeMetrics::default(),
             metrics,
         }
     }
 
-    /// Push a new per-peer Output into this node. Called by sim.rs
-    /// once per directed edge in the topology peer graph.
     pub fn add_peer(&mut self, peer_id: NodeId, out: Output<WireMessage>) {
-        let local = self.outputs.len();
-        self.outputs.push(out);
-        self.peer_ids.push(peer_id);
-        self.peer_id_to_local.insert(peer_id, local);
+        super::push_peer(
+            &mut self.outputs,
+            &mut self.peer_ids,
+            &mut self.peer_id_to_local,
+            peer_id,
+            out,
+        );
     }
 }
 
 #[Model]
 impl FloodingNode {
+    /// One-shot setup at sim start: schedule the end-of-run
+    /// `flush_summary` so per-node counters get pushed to the
+    /// aggregator. Flooding has no periodic ticker (unlike cln/lnd/
+    /// sketch), so this init only handles flush.
+    #[nexosim(init)]
+    async fn arm_flush(&mut self, cx: &Context<Self>) {
+        cx.schedule_event(self.run_duration, schedulable!(Self::flush_summary), ())
+            .expect("schedule flooding flush_summary");
+    }
+
+    /// One-shot end-of-run handler: send the accumulated per-node
+    /// counters to the aggregator.
+    #[nexosim(schedulable)]
+    async fn flush_summary(&mut self, _: ()) {
+        self.metrics.send_node_summary(self.idx, &self.metrics_local);
+    }
+
     /// Input port: a peer just delivered a `WireMessage`. For each
     /// inner gossip, dispatch on `kind`:
     ///
@@ -118,7 +145,7 @@ impl FloodingNode {
     /// dropped. Kept messages are recorded in metrics and scheduled
     /// for forward after `forward_delay`.
     pub fn recv(&mut self, wire: WireMessage, cx: &Context<Self>) {
-        self.metrics.record_bytes_in(self.idx, wire.wire_size());
+        self.metrics_local.bytes_in += wire.wire_size();
         match &wire {
             WireMessage::Single(g) => {
                 let g_copy = *g;
@@ -147,18 +174,29 @@ impl FloodingNode {
         if gs.is_empty() {
             return;
         }
-        let mut m = self.state.chan_updates.write().expect("chan_updates poisoned");
-        for g in gs {
-            let scid = g.scid.expect("ChannelUpdate must carry scid");
-            let key = (scid, g.direction);
-            let supersedes = m
-                .get(&key)
-                .map(|(stored, _)| g.timestamp > *stored)
-                .unwrap_or(true);
-            if supersedes {
-                m.insert(key, (g.timestamp, g.size_bytes));
+        let mut fresh: Vec<usize> = Vec::with_capacity(gs.len());
+        {
+            let mut m = self.state.chan_updates.write();
+            for (i, g) in gs.iter().enumerate() {
+                let scid = g.scid.expect("ChannelUpdate must carry scid");
+                let key = crate::state::pack_cu_key(scid, g.direction);
+                let supersedes = m
+                    .get(&key)
+                    .map(|(stored, _)| g.timestamp > *stored)
+                    .unwrap_or(true);
+                if supersedes {
+                    m.insert(key, (g.timestamp, g.size_bytes));
+                    fresh.push(i);
+                } else {
+                    self.metrics_local.duplicates += 1;
+                }
             }
-            drop_or_forward(self.idx, &self.metrics, g, supersedes, cx, self.forward_delay);
+        }
+        let now = cx.time();
+        for &i in &fresh {
+            self.metrics.record_first_seen(self.idx, &gs[i], now);
+            cx.schedule_event(self.forward_delay, schedulable!(FloodingNode::do_send), gs[i])
+                .expect("schedule do_send");
         }
     }
 
@@ -166,17 +204,28 @@ impl FloodingNode {
         if gs.is_empty() {
             return;
         }
-        let mut m = self.state.node_anns.write().expect("node_anns poisoned");
-        for g in gs {
-            let origin = g.origin.expect("NodeAnnouncement must carry origin");
-            let supersedes = m
-                .get(&origin)
-                .map(|(stored, _)| g.timestamp > *stored)
-                .unwrap_or(true);
-            if supersedes {
-                m.insert(origin, (g.timestamp, g.size_bytes));
+        let mut fresh: Vec<usize> = Vec::with_capacity(gs.len());
+        {
+            let mut m = self.state.node_anns.write();
+            for (i, g) in gs.iter().enumerate() {
+                let origin = g.origin.expect("NodeAnnouncement must carry origin");
+                let supersedes = m
+                    .get(&origin)
+                    .map(|(stored, _)| g.timestamp > *stored)
+                    .unwrap_or(true);
+                if supersedes {
+                    m.insert(origin, (g.timestamp, g.size_bytes));
+                    fresh.push(i);
+                } else {
+                    self.metrics_local.duplicates += 1;
+                }
             }
-            drop_or_forward(self.idx, &self.metrics, g, supersedes, cx, self.forward_delay);
+        }
+        let now = cx.time();
+        for &i in &fresh {
+            self.metrics.record_first_seen(self.idx, &gs[i], now);
+            cx.schedule_event(self.forward_delay, schedulable!(FloodingNode::do_send), gs[i])
+                .expect("schedule do_send");
         }
     }
 
@@ -184,11 +233,23 @@ impl FloodingNode {
         if gs.is_empty() {
             return;
         }
-        let mut m = self.state.chan_anns.write().expect("chan_anns poisoned");
-        for g in gs {
-            let scid = g.scid.expect("ChannelAnnouncement must carry scid");
-            let fresh = m.insert(scid, g.size_bytes).is_none();
-            drop_or_forward(self.idx, &self.metrics, g, fresh, cx, self.forward_delay);
+        let mut fresh: Vec<usize> = Vec::with_capacity(gs.len());
+        {
+            let mut m = self.state.chan_anns.write();
+            for (i, g) in gs.iter().enumerate() {
+                let scid = g.scid.expect("ChannelAnnouncement must carry scid");
+                if m.insert(scid, g.size_bytes).is_none() {
+                    fresh.push(i);
+                } else {
+                    self.metrics_local.duplicates += 1;
+                }
+            }
+        }
+        let now = cx.time();
+        for &i in &fresh {
+            self.metrics.record_first_seen(self.idx, &gs[i], now);
+            cx.schedule_event(self.forward_delay, schedulable!(FloodingNode::do_send), gs[i])
+                .expect("schedule do_send");
         }
     }
 
@@ -204,7 +265,7 @@ impl FloodingNode {
             return;
         }
         self.metrics.record_first_seen(self.idx, &msg, cx.time());
-        broadcast_single(&mut self.outputs, &self.metrics, self.idx, msg).await;
+        self.broadcast_single(msg).await;
     }
 
     /// Helper invoked by `recv` after `forward_delay`. Marked
@@ -212,43 +273,23 @@ impl FloodingNode {
     /// `schedulable!(Self::do_send)` from the scheduler.
     #[nexosim(schedulable)]
     pub async fn do_send(&mut self, msg: Gossip) {
-        broadcast_single(&mut self.outputs, &self.metrics, self.idx, msg).await;
+        self.broadcast_single(msg).await;
     }
 }
 
-/// Send `msg` as `WireMessage::Single` to every per-peer Output. Each
-/// Output has exactly one connected mailbox, so this is N independent
-/// sends rather than one broadcast iteration. Bandwidth metric is
-/// recorded once with the per-recipient multiplier baked in.
-async fn broadcast_single(
-    outputs: &mut [Output<WireMessage>],
-    metrics: &MetricsHandle,
-    idx: NodeIdx,
-    msg: Gossip,
-) {
-    let n_peers = outputs.len() as u64;
-    metrics.record_bytes_out(idx, msg.size_bytes as u64 * n_peers);
-    for out in outputs {
-        out.send(WireMessage::Single(msg)).await;
+impl FloodingNode {
+    /// Send `msg` as `WireMessage::Single` to every per-peer Output.
+    /// Each Output has exactly one connected mailbox, so this is N
+    /// independent sends rather than one broadcast iteration. Bandwidth
+    /// metric is recorded once with the per-recipient multiplier baked
+    /// in, on the local plain-u64 counter.
+    async fn broadcast_single(&mut self, msg: Gossip) {
+        let n_peers = self.outputs.len() as u64;
+        self.metrics_local.bytes_out += msg.size_bytes as u64 * n_peers;
+        for out in &mut self.outputs {
+            out.send(WireMessage::Single(msg)).await;
+        }
     }
 }
 
-/// Per-gossip post-dedup action for flooding: on `fresh`, record
-/// metrics + schedule a forward; on stale, just bump the duplicate
-/// counter. Called from each per-kind absorber.
-fn drop_or_forward(
-    idx: NodeIdx,
-    metrics: &MetricsHandle,
-    g: &Gossip,
-    fresh: bool,
-    cx: &Context<FloodingNode>,
-    forward_delay: Duration,
-) {
-    if !fresh {
-        metrics.record_duplicate(idx);
-        return;
-    }
-    metrics.record_first_seen(idx, g, cx.time());
-    cx.schedule_event(forward_delay, schedulable!(FloodingNode::do_send), *g)
-        .expect("schedule do_send");
-}
+

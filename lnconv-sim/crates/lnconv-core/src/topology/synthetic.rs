@@ -36,9 +36,6 @@ use super::{NodeAlgo, Topology};
 use crate::message::NodeId;
 
 const PEER_BUILD_SUBSEED: u64 = 0x504545525F535542; // "PEER_SUB"
-/// Maximum channel-counterparty count to retain as peers per node when
-/// the node is highly-connected. Matches the user's "100" threshold.
-const MAX_PEER_COUNTERPARTIES: usize = 100;
 
 /// True k-regular random graph: every node has exactly `k` neighbours,
 /// chosen uniformly at random subject to no self-loops or parallel edges.
@@ -94,14 +91,16 @@ pub struct PeerBuildStats {
     pub replacements_added: usize,
 }
 
-pub fn build_peer_graph<F>(
+pub fn build_peer_graph<F, G>(
     topology: &mut Topology,
     k_for: F,
+    max_peer_for: G,
     seed: u64,
     enforce_hub_cap: bool,
 ) -> PeerBuildStats
 where
     F: Fn(&NodeAlgo) -> usize,
+    G: Fn(&NodeAlgo) -> usize,
 {
     let mut stats = PeerBuildStats::default();
     let mut rng = ChaCha8Rng::seed_from_u64(seed ^ PEER_BUILD_SUBSEED);
@@ -114,11 +113,12 @@ where
     // Phase 1: per-node, decide which counterparties to keep + which
     // strangers to pick. Done in NodeIndex order so RNG draws are
     // deterministic. Hubs' kept set is locked in here so phase 2 can
-    // filter incoming-to-hub edges against the *same* 100 picks.
+    // filter incoming-to-hub edges against the *same* picks.
     //
     // Each node's `k` is resolved from its `NodeAlgo` via `k_for`, so
-    // CLN/LND/Flooding can target different peer-degrees within the
-    // same Mix run.
+    // CLN/LND/Flooding/Sketch can target different peer-degrees within the
+    // same Mix run. Per-node hub cap comes from `max_peer_for` for the
+    // same reason — sketch wants a low cap to bound per-peer tickers.
     struct NodePicks {
         kept_counterparties: Vec<NodeIndex>,
         strangers: Vec<NodeIndex>,
@@ -126,7 +126,9 @@ where
     }
     let mut picks: Vec<NodePicks> = Vec::with_capacity(n);
     for nx in topology.peers.node_indices() {
-        let k = k_for(&topology.peers[nx].algo);
+        let algo = &topology.peers[nx].algo;
+        let k = k_for(algo);
+        let max_peer = max_peer_for(algo);
         let counterparties: HashSet<NodeIndex> = topology
             .channels
             .neighbors_undirected(nx)
@@ -134,11 +136,10 @@ where
             .collect();
         let counterparties_vec: Vec<NodeIndex> = counterparties.iter().copied().collect();
         let c = counterparties_vec.len();
-        let is_hub = c > MAX_PEER_COUNTERPARTIES;
-
+        let is_hub = c > max_peer;
         let kept_counterparties: Vec<NodeIndex> = if is_hub {
             counterparties_vec
-                .choose_multiple(&mut rng, MAX_PEER_COUNTERPARTIES)
+                .choose_multiple(&mut rng, max_peer)
                 .copied()
                 .collect()
         } else {
@@ -298,6 +299,13 @@ mod tests {
         move |_| k
     }
 
+    /// Test helper: closure that returns the same hub-cap for any
+    /// algo. Default test cap is 100, matching the production stagger
+    /// default.
+    fn const_max_peer(c: usize) -> impl Fn(&NodeAlgo) -> usize {
+        move |_| c
+    }
+
     /// With `enforce_hub_cap = false` (default OR semantics), a hub's
     /// own pass only ever picks 100 counterparties — but leaf nodes
     /// will still pick the hub back, so the hub's *final* peer count
@@ -306,7 +314,7 @@ mod tests {
     fn hub_peer_count_or_semantics() {
         let chans: Vec<(NodeId, NodeId)> = (1..=200u64).map(|i| (0u64, i)).collect();
         let mut t = topo_with_channels(220, &chans);
-        build_peer_graph(&mut t, const_k(5), 42, false);
+        build_peer_graph(&mut t, const_k(5), const_max_peer(100), 42, false);
         let nx0 = t.nidx(0);
         let peer_count = t.peers.neighbors(nx0).count();
         // At least 100 (its own pick); at most 200 + strangers other nodes
@@ -323,7 +331,7 @@ mod tests {
     fn hub_peer_count_capped_at_100() {
         let chans: Vec<(NodeId, NodeId)> = (1..=200u64).map(|i| (0u64, i)).collect();
         let mut t = topo_with_channels(220, &chans);
-        build_peer_graph(&mut t, const_k(5), 42, true);
+        build_peer_graph(&mut t, const_k(5), const_max_peer(100), 42, true);
         let nx0 = t.nidx(0);
         let peer_count = t.peers.neighbors(nx0).count();
         assert_eq!(
@@ -351,7 +359,7 @@ mod tests {
         // gets rejected, and should get a replacement stranger.
         let chans: Vec<(NodeId, NodeId)> = (1..=200u64).map(|i| (0u64, i)).collect();
         let mut t = topo_with_channels(2000, &chans);
-        let stats = build_peer_graph(&mut t, const_k(4), 7, true);
+        let stats = build_peer_graph(&mut t, const_k(4), const_max_peer(100), 7, true);
         // At least 100 rejections — that's the leaf counterparty side.
         // Strangers from sparse nodes may also occasionally pick the
         // hub and get rejected, so the total can be slightly higher.
@@ -382,7 +390,7 @@ mod tests {
     fn no_rejections_or_replacements_when_cap_off() {
         let chans: Vec<(NodeId, NodeId)> = (1..=200u64).map(|i| (0u64, i)).collect();
         let mut t = topo_with_channels(2000, &chans);
-        let stats = build_peer_graph(&mut t, const_k(4), 7, false);
+        let stats = build_peer_graph(&mut t, const_k(4), const_max_peer(100), 7, false);
         assert_eq!(stats.hub_rejected_edges, 0);
         assert_eq!(stats.replacements_added, 0);
     }
@@ -394,7 +402,7 @@ mod tests {
     fn hub_cap_drops_unselected_counterparties_peer_edges() {
         let chans: Vec<(NodeId, NodeId)> = (1..=200u64).map(|i| (0u64, i)).collect();
         let mut t = topo_with_channels(220, &chans);
-        build_peer_graph(&mut t, const_k(5), 42, true);
+        build_peer_graph(&mut t, const_k(5), const_max_peer(100), 42, true);
         let nx0 = t.nidx(0);
         let kept_set: HashSet<NodeIndex> = t.peers.neighbors(nx0).collect();
         let mut dropped = 0usize;
@@ -437,7 +445,7 @@ mod tests {
         let chans = vec![(0u64, 1u64)];
         let mut t = topo_with_channels(20, &chans);
         let k = 4;
-        build_peer_graph(&mut t, const_k(k), 1, false);
+        build_peer_graph(&mut t, const_k(k), const_max_peer(100), 1, false);
         let nx0 = t.nidx(0);
         let peers: HashSet<NodeIndex> = t.peers.neighbors(nx0).collect();
         assert!(peers.contains(&t.nidx(1)), "must keep its only counterparty");
@@ -459,8 +467,8 @@ mod tests {
         let chans: Vec<(NodeId, NodeId)> = (1..=10u64).map(|i| (0u64, i)).collect();
         let mut t1 = topo_with_channels(50, &chans);
         let mut t2 = topo_with_channels(50, &chans);
-        build_peer_graph(&mut t1, const_k(4), 99, false);
-        build_peer_graph(&mut t2, const_k(4), 99, false);
+        build_peer_graph(&mut t1, const_k(4), const_max_peer(100), 99, false);
+        build_peer_graph(&mut t2, const_k(4), const_max_peer(100), 99, false);
         let p1: HashSet<(usize, usize)> = t1
             .peers
             .edge_indices()

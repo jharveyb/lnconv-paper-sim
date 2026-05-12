@@ -30,5 +30,5 @@ path = "init_data/compact_traffic_2026-02-11_2026-02-13.parquet"
 
 [run]
 duration_seconds = 600
-mailbox_capacity = 1024
+mailbox_capacity = 64
 progress_interval_seconds = 60

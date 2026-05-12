@@ -47,14 +47,14 @@ pub fn hash_pubkey(seed: u64, pubkey: &str) -> NodeId {
     XX3Hasher::oneshot_with_seed(seed ^ NODE_SUBSEED, pubkey.as_bytes())
 }
 
-/// Hash an SCID *string* (decimal form) into a stable `Scid`. The CSV
-/// snapshot ships SCIDs as decimal strings (e.g. `"1012232394786537478"`)
-/// and the parquet trace ships them as `u64` — the parquet loader must
-/// `to_string()` its `u64` before calling this so the resulting
-/// `Scid` matches the CSV-derived one. Hashing raw `u64::to_le_bytes`
-/// produces a different value and silently breaks registry lookups.
 pub fn hash_scid_string(seed: u64, scid_str: &str) -> Scid {
-    XX3Hasher::oneshot_with_seed(seed ^ SCID_SUBSEED, scid_str.as_bytes())
+    // Mask the top bit so the resulting `Scid` always fits in 63 bits.
+    // `state::pack_cu_key` uses `(scid << 1) | direction` to fold the
+    // `(Scid, Direction)` tuple into a `u64` for nohash-hasher; that
+    // shift would otherwise drop the top bit of full-u64 hashes from
+    // CSV-loaded snapshots. With ~42k SCIDs uniformly distributed in
+    // 2^63, birthday-collision probability is ~10^-10 — safe.
+    XX3Hasher::oneshot_with_seed(seed ^ SCID_SUBSEED, scid_str.as_bytes()) & 0x7FFF_FFFF_FFFF_FFFF
 }
 
 #[derive(Debug)]

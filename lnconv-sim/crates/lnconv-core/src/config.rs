@@ -61,13 +61,16 @@ pub enum TopologyCfg {
         nodes_csv: PathBuf,
         channels_csv: PathBuf,
         k: KByAlgo,
+        /// Per-impl-type hub-cap on retained channel counterparties.
+        /// Defaults to 100 for flooding/cln/lnd and 8 for sketch when
+        /// the table is absent — see [`MaxPeerByAlgo`].
+        #[serde(default)]
+        max_peer: MaxPeerByAlgo,
         #[serde(default)]
         enforce_hub_cap: bool,
     },
 }
 
-/// Per-impl-type peer-build threshold `k`. Used by `FromCsv` topology
-/// to give different gossip algorithms different target peer-degrees.
 #[derive(Deserialize, Debug, Clone)]
 pub struct KByAlgo {
     pub flooding: usize,
@@ -77,6 +80,47 @@ pub struct KByAlgo {
     /// like CLN at the topology level (similar peer-degree targets).
     #[serde(default)]
     pub sketch: Option<usize>,
+}
+
+/// Per-impl-type hub-cap (`MAX_PEER_COUNTERPARTIES`): for nodes whose
+/// channel-counterparty count exceeds this value, only that many random
+/// counterparties are kept as peers in `build_peer_graph`. Set high
+/// (~100) for staggered protocols where extra peers cost little; set
+/// low (~8) for sketch where each extra peer costs an extra
+/// reconciliation ticker per stagger window.
+#[derive(Deserialize, Debug, Clone)]
+pub struct MaxPeerByAlgo {
+    #[serde(default = "default_max_peer_stagger")]
+    pub flooding: usize,
+    #[serde(default = "default_max_peer_stagger")]
+    pub cln: usize,
+    #[serde(default = "default_max_peer_stagger")]
+    pub lnd: usize,
+    /// Defaults to a small value because sketch nodes pay per-peer
+    /// ticker cost. `None` falls back to `cln`'s value if not set.
+    #[serde(default)]
+    pub sketch: Option<usize>,
+}
+
+impl Default for MaxPeerByAlgo {
+    fn default() -> Self {
+        Self {
+            flooding: default_max_peer_stagger(),
+            cln: default_max_peer_stagger(),
+            lnd: default_max_peer_stagger(),
+            sketch: None,
+        }
+    }
+}
+
+fn default_max_peer_stagger() -> usize {
+    100
+}
+
+/// Default hub-cap for sketch when `MaxPeerByAlgo::sketch` is `None`.
+/// Kept small because sketch fires one ticker per peer per stagger.
+pub fn default_max_peer_sketch() -> usize {
+    4
 }
 
 #[derive(Deserialize, Debug)]

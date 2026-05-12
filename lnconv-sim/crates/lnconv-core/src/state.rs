@@ -9,14 +9,20 @@
 //! state, so the storage moves out into [`NodeState`] — one per node,
 //! shared via `Arc`.
 //!
-//! ## Per-kind sharded locking
+//! ## Storage choices
 //!
-//! `NodeState` shards its three maps under three independent
-//! `RwLock`s. A `chan_updates` write never blocks a `node_anns`
-//! reader; a `chan_updates` sketch only takes the `chan_updates`
-//! locks on each side. This matches the per-`SketchKind` exchange
-//! semantics — there's no reason a sketch over one kind should
-//! contend with traffic on another.
+//! Each kind lives behind a [`parking_lot::RwLock`] (faster + smaller
+//! than `std::sync::RwLock`; no syscall on uncontended paths). The
+//! contained map is a [`nohash_hasher::IntMap`] (i.e. `HashMap` with a
+//! `NoHashHasher<u64>` build hasher) — every key is already a
+//! `xxhash3_64` output (NodeId, Scid) or a derived packed `u64`
+//! ([`pack_cu_key`]), so re-hashing it would just add work.
+//!
+//! `chan_updates` keys pack `(scid << 1) | direction` into a `u64`.
+//! SCIDs from the CSV loader are masked to 63 bits at load time
+//! ([`crate::topology::ln_data::hash_scid_string`]) so the shift is
+//! lossless; synthetic SCIDs come from a small sequential counter and
+//! are already < 2^63. The unpack is `(packed >> 1, packed & 1)`.
 //!
 //! ## Distribution at sim-init
 //!
@@ -26,13 +32,11 @@
 //! and (b) a `Vec<Arc<NodeState>>` of *only its direct peers'*
 //! states (aligned with the model's per-peer Output Vec). The local
 //! registry vector is dropped after wiring; the per-node Arcs
-//! survive via the model + its peers' references. Nodes never get a
-//! handle to the global registry — contention scales with peer
-//! degree, not network size.
+//! survive via the model + its peers' references.
 //!
 //! ## Diff semantics
 //!
-//! [`compute_diff`] returns BOTH:
+//! [`compute_diff`] returns both:
 //!
 //! * **Strict-difference counts** (`a_only_count` / `b_only_count` /
 //!   `intersection`) — same-key-different-ts pairs count as one
@@ -40,27 +44,50 @@
 //!   and per-direction metrics; matches how a real minisketch
 //!   would decode the symmetric difference.
 //! * **Newer-only Gossips** (`a_newer` / `b_newer`) — items where
-//!   THIS side has the strictly-newer version. Used to build the
-//!   wire reply Batch; stale-side entries are never sent (they're
-//!   superseded by definition).
+//!   the named side has the strictly-newer version, eligible to be
+//!   sent back. The caller passes [`WhichSide`] to choose which
+//!   Vec(s) to materialise; the unselected side comes back empty.
 //!
 //! Lock acquisition is in `NodeIdx`-min-first order to avoid
 //! deadlock between two reconciliations on the same kind in
-//! opposite directions.
+//! opposite directions when a third party is waiting on a write
+//! lock.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use nexosim::time::MonotonicTime;
+use nohash_hasher::IntMap;
+use parking_lot::RwLock;
 
-use crate::message::{
-    Direction, Gossip, GossipKind, NodeId, NodeIdx, Scid, SketchKind,
-};
+use crate::message::{Direction, Gossip, GossipKind, NodeId, NodeIdx, Scid, SketchKind};
 
-/// Per-node dedup state. The three kinds each live behind their own
-/// `RwLock` so a `chan_updates` write doesn't block a `node_anns`
-/// reader. Each map's value embeds `size_bytes` so set-recon
-/// replies can carry realistic on-the-wire byte counts.
+/// Pack a `(Scid, Direction)` tuple into a single `u64` suitable for
+/// `nohash_hasher::IntMap`. Direction is stored in bit 0; SCID
+/// occupies bits 1..64. SCIDs are guaranteed `< 2^63` (CSV loader
+/// masks the top bit; synthetic SCIDs are sequential), so the shift
+/// is lossless.
+#[inline]
+pub fn pack_cu_key(scid: Scid, direction: Direction) -> u64 {
+    (scid << 1) | (direction as u64 & 1)
+}
+
+/// Inverse of [`pack_cu_key`].
+#[inline]
+pub fn unpack_cu_key(packed: u64) -> (Scid, Direction) {
+    (packed >> 1, (packed & 1) as Direction)
+}
+
+/// Type aliases for the three per-node dedup maps. All use
+/// `NoHashHasher<u64>` because the keys are already well-distributed
+/// hash outputs.
+pub type ChanUpdatesMap = IntMap<u64, (u32, u16)>;
+pub type NodeAnnsMap = IntMap<NodeId, (u32, u16)>;
+pub type ChanAnnsMap = IntMap<Scid, u16>;
+
+/// Per-node dedup state. Each kind lives behind its own
+/// `parking_lot::RwLock` so a `chan_updates` write doesn't block a
+/// `node_anns` reader. Each map's value embeds `size_bytes` so
+/// set-recon replies can carry realistic on-the-wire byte counts.
 ///
 /// `Default` exists only to satisfy the `#[derive(Default)]` on the
 /// node `Model` structs (each holds a `SharedNodeState`); a default
@@ -69,10 +96,10 @@ use crate::message::{
 /// the registry before any model spins up.
 #[derive(Default)]
 pub struct NodeState {
-    pub idx: NodeIdx, // for lock-order tie-breaking
-    pub chan_updates: RwLock<HashMap<(Scid, Direction), (u32, u16)>>,
-    pub node_anns: RwLock<HashMap<NodeId, (u32, u16)>>,
-    pub chan_anns: RwLock<HashMap<Scid, u16>>,
+    pub idx: NodeIdx, // for lock-order tie-breaking in `compute_diff`
+    pub chan_updates: RwLock<ChanUpdatesMap>,
+    pub node_anns: RwLock<NodeAnnsMap>,
+    pub chan_anns: RwLock<ChanAnnsMap>,
 }
 
 pub type SharedNodeState = Arc<NodeState>;
@@ -81,9 +108,9 @@ impl NodeState {
     pub fn new(idx: NodeIdx) -> Arc<Self> {
         Arc::new(Self {
             idx,
-            chan_updates: RwLock::new(HashMap::new()),
-            node_anns: RwLock::new(HashMap::new()),
-            chan_anns: RwLock::new(HashMap::new()),
+            chan_updates: RwLock::new(IntMap::default()),
+            node_anns: RwLock::new(IntMap::default()),
+            chan_anns: RwLock::new(IntMap::default()),
         })
     }
 }
@@ -96,9 +123,31 @@ pub fn build_registry(n: usize) -> Vec<SharedNodeState> {
     (0..n).map(|i| NodeState::new(i as NodeIdx)).collect()
 }
 
-/// Result of a symmetric-diff computation. See module docstring for
-/// the two-quantity model: counts for the capacity/metrics check,
-/// newer-only Gossips for the wire reply.
+/// Which side of a `compute_diff` should materialise its newer-only
+/// Gossip Vec. Production (sketch reply) only consumes `b_newer`, so
+/// it passes `WhichSide::B`; tests pass `WhichSide::Both` to assert
+/// symmetry. The unselected side comes back as an empty Vec.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum WhichSide {
+    A,
+    B,
+    Both,
+}
+
+impl WhichSide {
+    #[inline]
+    fn want_a(self) -> bool {
+        matches!(self, WhichSide::A | WhichSide::Both)
+    }
+    #[inline]
+    fn want_b(self) -> bool {
+        matches!(self, WhichSide::B | WhichSide::Both)
+    }
+}
+
+/// Result of a symmetric-diff computation. The `_count` fields are
+/// always populated; `a_newer` and `b_newer` are only populated for
+/// the side(s) requested via [`WhichSide`].
 pub struct DiffResult {
     /// Number of items present in `a` but absent (or under a
     /// different ts) in `b`. Includes `a`'s stale entries against
@@ -111,12 +160,11 @@ pub struct DiffResult {
     /// Items where both sides have the same key with the same `ts`
     /// (or, for `chan_anns`, same key — no `ts`).
     pub intersection: usize,
-    /// Subset of the diff that is **strictly newer on `a`'s side**
-    /// (i.e. `a` has a more recent `ts` than `b`, or `b` is
-    /// missing it). Eligible to send to `b` in a reply Batch.
+    /// Subset of the diff that is **strictly newer on `a`'s side**.
+    /// Empty when caller passed `WhichSide::B`.
     pub a_newer: Vec<Gossip>,
     /// Subset of the diff that is **strictly newer on `b`'s side**.
-    /// What `b` would send back to `a` in response to `a`'s sketch.
+    /// Empty when caller passed `WhichSide::A`.
     pub b_newer: Vec<Gossip>,
 }
 
@@ -129,96 +177,99 @@ pub fn compute_diff(
     a: &SharedNodeState,
     b: &SharedNodeState,
     kind: SketchKind,
+    which: WhichSide,
 ) -> DiffResult {
     let (first, second, swapped) = if a.idx <= b.idx {
         (a, b, false)
     } else {
         (b, a, true)
     };
+    // After swap, `which` may need to be inverted so the diff helpers
+    // still see (la, lb) in the original (a, b) orientation.
+    let inner_which = if swapped {
+        match which {
+            WhichSide::A => WhichSide::B,
+            WhichSide::B => WhichSide::A,
+            WhichSide::Both => WhichSide::Both,
+        }
+    } else {
+        which
+    };
 
-    match kind {
+    let res = match kind {
         SketchKind::ChanUpdates => {
-            let g_first = first.chan_updates.read().expect("chan_updates poisoned");
-            let g_second = second.chan_updates.read().expect("chan_updates poisoned");
-            let (la, lb) = if swapped {
-                (&*g_second, &*g_first)
-            } else {
-                (&*g_first, &*g_second)
-            };
-            diff_chan_updates(la, lb)
+            let g_first = first.chan_updates.read();
+            let g_second = second.chan_updates.read();
+            diff_chan_updates(&g_first, &g_second, inner_which)
         }
         SketchKind::NodeAnns => {
-            let g_first = first.node_anns.read().expect("node_anns poisoned");
-            let g_second = second.node_anns.read().expect("node_anns poisoned");
-            let (la, lb) = if swapped {
-                (&*g_second, &*g_first)
-            } else {
-                (&*g_first, &*g_second)
-            };
-            diff_node_anns(la, lb)
+            let g_first = first.node_anns.read();
+            let g_second = second.node_anns.read();
+            diff_node_anns(&g_first, &g_second, inner_which)
         }
         SketchKind::ChanAnns => {
-            let g_first = first.chan_anns.read().expect("chan_anns poisoned");
-            let g_second = second.chan_anns.read().expect("chan_anns poisoned");
-            let (la, lb) = if swapped {
-                (&*g_second, &*g_first)
-            } else {
-                (&*g_first, &*g_second)
-            };
-            diff_chan_anns(la, lb)
+            let g_first = first.chan_anns.read();
+            let g_second = second.chan_anns.read();
+            diff_chan_anns(&g_first, &g_second, inner_which)
         }
+    };
+
+    // Re-orient the result back to the caller's (a, b) view.
+    if swapped {
+        DiffResult {
+            a_only_count: res.b_only_count,
+            b_only_count: res.a_only_count,
+            intersection: res.intersection,
+            a_newer: res.b_newer,
+            b_newer: res.a_newer,
+        }
+    } else {
+        res
     }
 }
 
-fn diff_chan_updates(
-    la: &HashMap<(Scid, Direction), (u32, u16)>,
-    lb: &HashMap<(Scid, Direction), (u32, u16)>,
-) -> DiffResult {
+fn diff_chan_updates(la: &ChanUpdatesMap, lb: &ChanUpdatesMap, which: WhichSide) -> DiffResult {
+    let want_a = which.want_a();
+    let want_b = which.want_b();
     let mut a_only_count = 0usize;
     let mut b_only_count = 0usize;
     let mut intersection = 0usize;
-    let mut a_newer = Vec::new();
-    let mut b_newer = Vec::new();
-    for ((scid, dir), (ts_a, size_a)) in la {
-        match lb.get(&(*scid, *dir)) {
-            Some((ts_b, _)) if ts_b == ts_a => {
-                intersection += 1;
-            }
-            Some((ts_b, _)) => {
-                // Both sides have the key under different ts —
-                // counts on both sides; the newer one is eligible
-                // for its owner's reply.
+    let difference_count_estimate = 512;
+    let mut a_newer = if want_a { Vec::with_capacity(difference_count_estimate) } else { Vec::new() };
+    let mut b_newer = if want_b { Vec::with_capacity(difference_count_estimate) } else { Vec::new() };
+    for (packed, (ts_a, size_a)) in la {
+        match lb.get(packed) {
+            Some((ts_b, _)) if ts_b == ts_a => intersection += 1,
+            Some((ts_b, size_b)) => {
                 a_only_count += 1;
                 b_only_count += 1;
                 if ts_a > ts_b {
-                    a_newer.push(synth_chan_update(*scid, *dir, *ts_a, *size_a));
+                    if want_a {
+                        let (scid, dir) = unpack_cu_key(*packed);
+                        a_newer.push(synth_chan_update(scid, dir, *ts_a, *size_a));
+                    }
+                } else if want_b {
+                    let (scid, dir) = unpack_cu_key(*packed);
+                    b_newer.push(synth_chan_update(scid, dir, *ts_b, *size_b));
                 }
             }
             None => {
-                // Only a has it ⇒ strictly newer than b's "nothing".
                 a_only_count += 1;
-                a_newer.push(synth_chan_update(*scid, *dir, *ts_a, *size_a));
+                if want_a {
+                    let (scid, dir) = unpack_cu_key(*packed);
+                    a_newer.push(synth_chan_update(scid, dir, *ts_a, *size_a));
+                }
             }
         }
     }
-    for ((scid, dir), (ts_b, size_b)) in lb {
-        match la.get(&(*scid, *dir)) {
-            Some((ts_a, _)) if ts_a == ts_b => {
-                // Intersection already counted.
-            }
-            Some((ts_a, _)) => {
-                // Same key, different ts — a_only/b_only counts
-                // and the b-newer push have already been handled
-                // by the first loop's matching branch. Re-check
-                // only b_newer here.
-                if ts_b > ts_a {
-                    b_newer.push(synth_chan_update(*scid, *dir, *ts_b, *size_b));
-                }
-            }
-            None => {
-                b_only_count += 1;
-                b_newer.push(synth_chan_update(*scid, *dir, *ts_b, *size_b));
-            }
+    for (packed, (ts_b, size_b)) in lb {
+        if la.contains_key(packed) {
+            continue;
+        }
+        b_only_count += 1;
+        if want_b {
+            let (scid, dir) = unpack_cu_key(*packed);
+            b_newer.push(synth_chan_update(scid, dir, *ts_b, *size_b));
         }
     }
     DiffResult {
@@ -230,43 +281,44 @@ fn diff_chan_updates(
     }
 }
 
-fn diff_node_anns(
-    la: &HashMap<NodeId, (u32, u16)>,
-    lb: &HashMap<NodeId, (u32, u16)>,
-) -> DiffResult {
+fn diff_node_anns(la: &NodeAnnsMap, lb: &NodeAnnsMap, which: WhichSide) -> DiffResult {
+    let want_a = which.want_a();
+    let want_b = which.want_b();
     let mut a_only_count = 0usize;
     let mut b_only_count = 0usize;
     let mut intersection = 0usize;
-    let mut a_newer = Vec::new();
-    let mut b_newer = Vec::new();
+    let difference_count_estimate = 128;
+    let mut a_newer = if want_a { Vec::with_capacity(difference_count_estimate) } else { Vec::new() };
+    let mut b_newer = if want_b { Vec::with_capacity(difference_count_estimate) } else { Vec::new() };
     for (origin, (ts_a, size_a)) in la {
         match lb.get(origin) {
             Some((ts_b, _)) if ts_b == ts_a => intersection += 1,
-            Some((ts_b, _)) => {
+            Some((ts_b, size_b)) => {
                 a_only_count += 1;
                 b_only_count += 1;
                 if ts_a > ts_b {
-                    a_newer.push(synth_node_ann(*origin, *ts_a, *size_a));
-                }
-            }
-            None => {
-                a_only_count += 1;
-                a_newer.push(synth_node_ann(*origin, *ts_a, *size_a));
-            }
-        }
-    }
-    for (origin, (ts_b, size_b)) in lb {
-        match la.get(origin) {
-            Some((ts_a, _)) if ts_a == ts_b => {}
-            Some((ts_a, _)) => {
-                if ts_b > ts_a {
+                    if want_a {
+                        a_newer.push(synth_node_ann(*origin, *ts_a, *size_a));
+                    }
+                } else if want_b {
                     b_newer.push(synth_node_ann(*origin, *ts_b, *size_b));
                 }
             }
             None => {
-                b_only_count += 1;
-                b_newer.push(synth_node_ann(*origin, *ts_b, *size_b));
+                a_only_count += 1;
+                if want_a {
+                    a_newer.push(synth_node_ann(*origin, *ts_a, *size_a));
+                }
             }
+        }
+    }
+    for (origin, (ts_b, size_b)) in lb {
+        if la.contains_key(origin) {
+            continue;
+        }
+        b_only_count += 1;
+        if want_b {
+            b_newer.push(synth_node_ann(*origin, *ts_b, *size_b));
         }
     }
     DiffResult {
@@ -278,22 +330,34 @@ fn diff_node_anns(
     }
 }
 
-fn diff_chan_anns(la: &HashMap<Scid, u16>, lb: &HashMap<Scid, u16>) -> DiffResult {
-    let ka: HashSet<&Scid> = la.keys().collect();
-    let kb: HashSet<&Scid> = lb.keys().collect();
-    let intersection = ka.intersection(&kb).count();
-    // No timestamp ⇒ strict counts and newer-only Vecs are
-    // identical for chan_anns.
-    let a_newer: Vec<Gossip> = ka
-        .difference(&kb)
-        .map(|&scid| synth_chan_ann(*scid, *la.get(scid).unwrap()))
-        .collect();
-    let b_newer: Vec<Gossip> = kb
-        .difference(&ka)
-        .map(|&scid| synth_chan_ann(*scid, *lb.get(scid).unwrap()))
-        .collect();
-    let a_only_count = a_newer.len();
-    let b_only_count = b_newer.len();
+fn diff_chan_anns(la: &ChanAnnsMap, lb: &ChanAnnsMap, which: WhichSide) -> DiffResult {
+    let want_a = which.want_a();
+    let want_b = which.want_b();
+    let mut a_only_count = 0usize;
+    let mut intersection = 0usize;
+    let difference_count_estimate = 128;
+    let mut a_newer = if want_a { Vec::with_capacity(difference_count_estimate) } else { Vec::new() };
+    let mut b_newer = if want_b { Vec::with_capacity(difference_count_estimate) } else { Vec::new() };
+    for (scid, size_a) in la {
+        if lb.contains_key(scid) {
+            intersection += 1;
+        } else {
+            a_only_count += 1;
+            if want_a {
+                a_newer.push(synth_chan_ann(*scid, *size_a));
+            }
+        }
+    }
+    let mut b_only_count = 0usize;
+    for (scid, size_b) in lb {
+        if la.contains_key(scid) {
+            continue;
+        }
+        b_only_count += 1;
+        if want_b {
+            b_newer.push(synth_chan_ann(*scid, *size_b));
+        }
+    }
     DiffResult {
         a_only_count,
         b_only_count,
@@ -309,44 +373,35 @@ fn diff_chan_anns(la: &HashMap<Scid, u16>, lb: &HashMap<Scid, u16>) -> DiffResul
 /// channel_announcement). Shared across every node kind so the
 /// origin/timestamp/MsgId conventions stay aligned.
 ///
-/// `self_id` is the originating node's `NodeId`. Used only to set
-/// `msg.origin = Some(self_id)` for `NodeAnnouncement`. For
-/// `ChannelUpdate` / `ChannelAnnouncement` the wire `origin` is
-/// always `None` (BOLT 7 doesn't carry an origin on those kinds).
+/// Sim time is monotonic per-node (recv is serialised via the
+/// Mailbox), so the prior stored ts is not consulted — `now_secs`
+/// is always strictly greater (or equal, which collapses to one
+/// MsgId; downstream dedup drops duplicates).
 pub fn originate_stamp(
     state: &SharedNodeState,
     self_id: NodeId,
     msg: &mut Gossip,
     cx_time: MonotonicTime,
 ) -> bool {
-    let now_secs = cx_time.duration_since(MonotonicTime::EPOCH).as_secs() as u32;
+    let now_secs = cx_time.as_secs() as u32;
     match msg.kind {
         GossipKind::ChannelUpdate => {
             let scid = msg.scid.expect("ChannelUpdate must carry scid");
             msg.origin = None;
-            let mut m = state.chan_updates.write().expect("chan_updates poisoned");
-            let key = (scid, msg.direction);
-            let next_ts = match m.get(&key) {
-                Some((stored, _)) => stored.saturating_add(1).max(now_secs),
-                None => now_secs,
-            };
-            msg.timestamp = next_ts;
-            m.insert(key, (next_ts, msg.size_bytes));
+            msg.timestamp = now_secs;
+            let mut m = state.chan_updates.write();
+            m.insert(pack_cu_key(scid, msg.direction), (now_secs, msg.size_bytes));
         }
         GossipKind::NodeAnnouncement => {
             msg.origin = Some(self_id);
-            let mut m = state.node_anns.write().expect("node_anns poisoned");
-            let next_ts = match m.get(&self_id) {
-                Some((stored, _)) => stored.saturating_add(1).max(now_secs),
-                None => now_secs,
-            };
-            msg.timestamp = next_ts;
-            m.insert(self_id, (next_ts, msg.size_bytes));
+            msg.timestamp = now_secs;
+            let mut m = state.node_anns.write();
+            m.insert(self_id, (now_secs, msg.size_bytes));
         }
         GossipKind::ChannelAnnouncement => {
             let scid = msg.scid.expect("ChannelAnnouncement must carry scid");
             msg.origin = None;
-            let mut m = state.chan_anns.write().expect("chan_anns poisoned");
+            let mut m = state.chan_anns.write();
             if m.insert(scid, msg.size_bytes).is_some() {
                 // Already broadcast this scid — drop.
                 return false;
@@ -413,16 +468,33 @@ mod tests {
     fn write_cu(s: &SharedNodeState, scid: Scid, dir: Direction, ts: u32, size: u16) {
         s.chan_updates
             .write()
-            .unwrap()
-            .insert((scid, dir), (ts, size));
+            .insert(pack_cu_key(scid, dir), (ts, size));
     }
 
     fn write_na(s: &SharedNodeState, origin: NodeId, ts: u32, size: u16) {
-        s.node_anns.write().unwrap().insert(origin, (ts, size));
+        s.node_anns.write().insert(origin, (ts, size));
     }
 
     fn write_ca(s: &SharedNodeState, scid: Scid, size: u16) {
-        s.chan_anns.write().unwrap().insert(scid, size);
+        s.chan_anns.write().insert(scid, size);
+    }
+
+    #[test]
+    fn pack_unpack_roundtrip() {
+        let cases = [
+            (0u64, 0u8),
+            (0u64, 1),
+            (1, 0),
+            (1, 1),
+            (0x7FFF_FFFF_FFFF_FFFF, 0),
+            (0x7FFF_FFFF_FFFF_FFFF, 1),
+            (12345, 0),
+            (12345, 1),
+        ];
+        for (scid, dir) in cases {
+            let p = pack_cu_key(scid, dir);
+            assert_eq!(unpack_cu_key(p), (scid, dir));
+        }
     }
 
     #[test]
@@ -433,8 +505,7 @@ mod tests {
         write_cu(&a, 100, 1, 20, 64);
         write_cu(&b, 100, 0, 10, 64);
         write_cu(&b, 200, 0, 30, 64);
-        let d = compute_diff(&a, &b, SketchKind::ChanUpdates);
-        // (100,0,10) shared; (100,1,20) only in a; (200,0,30) only in b.
+        let d = compute_diff(&a, &b, SketchKind::ChanUpdates, WhichSide::Both);
         assert_eq!(d.intersection, 1);
         assert_eq!(d.a_only_count, 1);
         assert_eq!(d.b_only_count, 1);
@@ -445,35 +516,31 @@ mod tests {
         assert_eq!(d.b_newer[0].scid, Some(200));
     }
 
-    /// Same-key-different-ts pair: counts go up on both sides, but
-    /// only the newer-ts side appears in *_newer.
     #[test]
     fn diff_chan_updates_handles_timestamp_diff() {
         let a = st(0);
         let b = st(1);
         write_cu(&a, 100, 0, 10, 64);
         write_cu(&b, 100, 0, 11, 64);
-        let d = compute_diff(&a, &b, SketchKind::ChanUpdates);
+        let d = compute_diff(&a, &b, SketchKind::ChanUpdates, WhichSide::Both);
         assert_eq!(d.intersection, 0);
         assert_eq!(d.a_only_count, 1);
         assert_eq!(d.b_only_count, 1);
-        assert!(d.a_newer.is_empty()); // a's ts=10 is stale
+        assert!(d.a_newer.is_empty());
         assert_eq!(d.b_newer.len(), 1);
         assert_eq!(d.b_newer[0].timestamp, 11);
     }
 
-    /// Capacity check uses the strict counts (so a single
-    /// stale/newer pair counts as 2 elements toward capacity).
     #[test]
     fn diff_chan_updates_capacity_counts_stale() {
         let a = st(0);
         let b = st(1);
         write_cu(&a, 100, 0, 10, 64);
         write_cu(&b, 100, 0, 15, 64);
-        let d = compute_diff(&a, &b, SketchKind::ChanUpdates);
+        let d = compute_diff(&a, &b, SketchKind::ChanUpdates, WhichSide::Both);
         let total = d.a_only_count + d.b_only_count;
-        assert_eq!(total, 2); // capacity check sees both sides
-        assert_eq!(d.b_newer.len(), 1); // but reply has just the newer one
+        assert_eq!(total, 2);
+        assert_eq!(d.b_newer.len(), 1);
     }
 
     #[test]
@@ -484,7 +551,7 @@ mod tests {
         write_na(&a, 666, 100, 200);
         write_na(&b, 555, 100, 200);
         write_na(&b, 777, 100, 200);
-        let d = compute_diff(&a, &b, SketchKind::NodeAnns);
+        let d = compute_diff(&a, &b, SketchKind::NodeAnns, WhichSide::Both);
         assert_eq!(d.intersection, 1);
         assert_eq!(d.a_newer.len(), 1);
         assert_eq!(d.a_newer[0].origin, Some(666));
@@ -492,14 +559,13 @@ mod tests {
         assert_eq!(d.b_newer[0].origin, Some(777));
     }
 
-    /// Stale node_ann (older ts) should not be in *_newer.
     #[test]
     fn diff_node_anns_handles_timestamp_diff() {
         let a = st(0);
         let b = st(1);
         write_na(&a, 555, 100, 200);
         write_na(&b, 555, 200, 200);
-        let d = compute_diff(&a, &b, SketchKind::NodeAnns);
+        let d = compute_diff(&a, &b, SketchKind::NodeAnns, WhichSide::Both);
         assert_eq!(d.a_only_count, 1);
         assert_eq!(d.b_only_count, 1);
         assert!(d.a_newer.is_empty());
@@ -515,7 +581,7 @@ mod tests {
         write_ca(&a, 200, 64);
         write_ca(&b, 100, 64);
         write_ca(&b, 300, 64);
-        let d = compute_diff(&a, &b, SketchKind::ChanAnns);
+        let d = compute_diff(&a, &b, SketchKind::ChanAnns, WhichSide::Both);
         assert_eq!(d.intersection, 1);
         assert_eq!(d.a_newer.len(), 1);
         assert_eq!(d.a_newer[0].scid, Some(200));
@@ -523,22 +589,54 @@ mod tests {
         assert_eq!(d.b_newer[0].scid, Some(300));
     }
 
-    /// Synthesised gossip's id equals the canonical derive_id for
-    /// the same identity tuple — this is what fixes the MsgInflight
-    /// collapse bug on the metrics side.
     #[test]
     fn synth_msg_id_matches_derive() {
         let a = st(0);
         let b = st(1);
         write_cu(&a, 100, 0, 50, 64);
-        let d = compute_diff(&a, &b, SketchKind::ChanUpdates);
+        let d = compute_diff(&a, &b, SketchKind::ChanUpdates, WhichSide::Both);
         assert_eq!(d.a_newer.len(), 1);
         let expected = Gossip::derive_id(None, GossipKind::ChannelUpdate, Some(100), 0, 50);
         assert_eq!(d.a_newer[0].id, expected);
     }
 
-    /// N threads compute pairwise diffs in mixed (a,b) and (b,a)
-    /// orders; lock-by-NodeIdx-min must prevent deadlock.
+    #[test]
+    fn which_side_b_yields_empty_a_newer() {
+        let a = st(0);
+        let b = st(1);
+        write_cu(&a, 100, 0, 10, 64);
+        write_cu(&a, 200, 0, 20, 64);
+        write_cu(&b, 300, 0, 30, 64);
+        let d = compute_diff(&a, &b, SketchKind::ChanUpdates, WhichSide::B);
+        assert!(d.a_newer.is_empty());
+        assert_eq!(d.b_newer.len(), 1);
+        assert_eq!(d.a_only_count, 2);
+        assert_eq!(d.b_only_count, 1);
+    }
+
+    #[test]
+    fn which_side_a_yields_empty_b_newer() {
+        let a = st(0);
+        let b = st(1);
+        write_cu(&a, 100, 0, 10, 64);
+        write_cu(&b, 200, 0, 30, 64);
+        let d = compute_diff(&a, &b, SketchKind::ChanUpdates, WhichSide::A);
+        assert!(d.b_newer.is_empty());
+        assert_eq!(d.a_newer.len(), 1);
+    }
+
+    #[test]
+    fn which_side_b_is_correct_under_swap() {
+        let a = st(5);
+        let b = st(0);
+        write_cu(&a, 100, 0, 99, 64);
+        let d = compute_diff(&a, &b, SketchKind::ChanUpdates, WhichSide::B);
+        assert!(d.a_newer.is_empty());
+        assert!(d.b_newer.is_empty());
+        assert_eq!(d.a_only_count, 1);
+        assert_eq!(d.b_only_count, 0);
+    }
+
     #[test]
     fn lock_order_no_deadlock() {
         const N: usize = 8;
@@ -558,8 +656,8 @@ mod tests {
                 for round in 0..100 {
                     let a = (t + round) % N;
                     let b = (t + round + 3) % N;
-                    let _ = compute_diff(&states[a], &states[b], SketchKind::ChanUpdates);
-                    let _ = compute_diff(&states[b], &states[a], SketchKind::ChanUpdates);
+                    let _ = compute_diff(&states[a], &states[b], SketchKind::ChanUpdates, WhichSide::Both);
+                    let _ = compute_diff(&states[b], &states[a], SketchKind::ChanUpdates, WhichSide::B);
                 }
             }));
         }

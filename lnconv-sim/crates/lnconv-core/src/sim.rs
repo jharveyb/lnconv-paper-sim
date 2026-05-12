@@ -131,6 +131,7 @@ pub fn run(cfg: &SimConfig, percentiles: Vec<f64>) -> Result<RunResult> {
         }
         TopologyCfg::FromCsv {
             k,
+            max_peer,
             enforce_hub_cap,
             ..
         } => {
@@ -146,9 +147,22 @@ pub fn run(cfg: &SimConfig, percentiles: Vec<f64>) -> Result<RunResult> {
                 NodeAlgo::Lnd { .. } => k_lnd,
                 NodeAlgo::Sketch { .. } => k_sketch,
             };
+            let mp_cln = max_peer.cln;
+            let mp_lnd = max_peer.lnd;
+            let mp_flooding = max_peer.flooding;
+            let mp_sketch = max_peer
+                .sketch
+                .unwrap_or_else(crate::config::default_max_peer_sketch);
+            let max_peer_for = move |a: &NodeAlgo| match a {
+                NodeAlgo::Flooding => mp_flooding,
+                NodeAlgo::Cln { .. } => mp_cln,
+                NodeAlgo::Lnd { .. } => mp_lnd,
+                NodeAlgo::Sketch { .. } => mp_sketch,
+            };
             crate::topology::synthetic::build_peer_graph(
                 &mut topology,
                 k_for,
+                max_peer_for,
                 cfg.seed,
                 *enforce_hub_cap,
             );
@@ -165,7 +179,13 @@ pub fn run(cfg: &SimConfig, percentiles: Vec<f64>) -> Result<RunResult> {
         registry.mean_per_node()
     );
 
-    let metrics = MetricsHandle::new(n, percentiles);
+    let stats_path = crate::stats_writer::auto_path(
+        topology_kind_name(&cfg.topology),
+        algo_kind_name(&cfg.algo),
+        event_kind_name(&cfg.event),
+    );
+    println!("stats: streaming finalised MsgStats to {}", stats_path.display());
+    let metrics = MetricsHandle::new(n, percentiles, Some(stats_path));
     let run_duration = Duration::from_secs(cfg.run.duration_seconds);
 
     // Snapshot the topology's NodeIds in NodeIdx order so event
@@ -185,6 +205,7 @@ pub fn run(cfg: &SimConfig, percentiles: Vec<f64>) -> Result<RunResult> {
             &topology,
             metrics.clone(),
             Duration::from_millis(latency_ms(&cfg.latency)),
+            run_duration,
             event_tuples,
             deadline,
         )?,
@@ -192,7 +213,14 @@ pub fn run(cfg: &SimConfig, percentiles: Vec<f64>) -> Result<RunResult> {
         | AlgoCfg::Lnd { .. }
         | AlgoCfg::Mix { .. }
         | AlgoCfg::Sketch { .. } => {
-            run_stagger_population(cfg, &topology, metrics.clone(), event_tuples, deadline)?;
+            run_stagger_population(
+                cfg,
+                &topology,
+                metrics.clone(),
+                run_duration,
+                event_tuples,
+                deadline,
+            )?;
         }
     }
 
@@ -494,6 +522,7 @@ fn run_flooding(
     topology: &Topology,
     metrics: MetricsHandle,
     forward_delay: Duration,
+    run_duration: Duration,
     events: Vec<(Duration, NodeId, Gossip)>,
     deadline: MonotonicTime,
 ) -> Result<()> {
@@ -521,6 +550,7 @@ fn run_flooding(
                 meta.id,
                 meta.idx,
                 forward_delay,
+                run_duration,
                 state,
                 peer_states,
                 metrics.clone(),
@@ -590,6 +620,7 @@ fn run_stagger_population(
     cfg: &SimConfig,
     topology: &Topology,
     metrics: MetricsHandle,
+    run_duration: Duration,
     events: Vec<(Duration, NodeId, Gossip)>,
     deadline: MonotonicTime,
 ) -> Result<()> {
@@ -632,6 +663,7 @@ fn run_stagger_population(
                     idx,
                     Duration::from_millis(*stagger_ms),
                     phase,
+                    run_duration,
                     state,
                     peer_states,
                     metrics.clone(),
@@ -651,6 +683,7 @@ fn run_stagger_population(
                     phase,
                     Duration::from_millis(*trickle_ms),
                     *min_batch_size,
+                    run_duration,
                     state,
                     peer_states,
                     metrics.clone(),
@@ -672,6 +705,7 @@ fn run_stagger_population(
                     *capacity_chan_updates,
                     *capacity_node_anns,
                     *capacity_chan_anns,
+                    run_duration,
                     state,
                     peer_states,
                     metrics.clone(),
@@ -899,4 +933,36 @@ fn sample_phase(rng: &mut ChaCha8Rng, stagger: Duration) -> Duration {
     let u = rng.random::<f64>().clamp(f64::EPSILON, 1.0 - f64::EPSILON);
     let secs = dist.inverse_cdf(u).max(1e-9);
     Duration::from_secs_f64(secs)
+}
+
+/// Short identifier for the topology kind, used in the auto-generated
+/// stats output filename.
+fn topology_kind_name(c: &TopologyCfg) -> &'static str {
+    match c {
+        TopologyCfg::KRegular { .. } => "k_regular",
+        TopologyCfg::FromCsv { .. } => "from_csv",
+    }
+}
+
+/// Short identifier for the algorithm kind, used in the auto-generated
+/// stats output filename.
+fn algo_kind_name(c: &AlgoCfg) -> &'static str {
+    match c {
+        AlgoCfg::Flooding {} => "flooding",
+        AlgoCfg::Cln { .. } => "cln",
+        AlgoCfg::Lnd { .. } => "lnd",
+        AlgoCfg::Mix { .. } => "mix",
+        AlgoCfg::Sketch { .. } => "sketch",
+    }
+}
+
+/// Short identifier for the event source kind, used in the
+/// auto-generated stats output filename.
+fn event_kind_name(c: &EventCfg) -> &'static str {
+    match c {
+        EventCfg::OneShotSingle { .. } => "oneshot_single",
+        EventCfg::OneShotAll {} => "oneshot_all",
+        EventCfg::PoissonRandom { .. } => "poisson",
+        EventCfg::ParquetReplay { .. } => "parquet_replay",
+    }
 }

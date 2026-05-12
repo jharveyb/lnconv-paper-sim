@@ -140,6 +140,16 @@ impl SketchKind {
             GossipKind::ChannelAnnouncement => SketchKind::ChanAnns,
         }
     }
+
+    /// Inverse of [`Self::from_gossip`] — the `GossipKind` whose
+    /// dedup container this sketch covers.
+    pub fn to_gossip(self) -> GossipKind {
+        match self {
+            SketchKind::ChanUpdates => GossipKind::ChannelUpdate,
+            SketchKind::NodeAnns => GossipKind::NodeAnnouncement,
+            SketchKind::ChanAnns => GossipKind::ChannelAnnouncement,
+        }
+    }
 }
 
 /// Minisketch-style summary of a node's state for one kind. The
@@ -215,6 +225,29 @@ impl GossipBatch {
                 GossipKind::ChannelUpdate => out.chan_updates.push(g),
                 GossipKind::NodeAnnouncement => out.node_anns.push(g),
                 GossipKind::ChannelAnnouncement => out.chan_anns.push(g),
+            }
+        }
+        out
+    }
+
+    /// Build a `GossipBatch` from a slice known to contain only one
+    /// `kind`. The matching slot is pre-sized to `gossips.len()`; the
+    /// other two stay empty. Used by the sketch reply path where the
+    /// upper bound is `sketch.capacity` and the kind is fixed by
+    /// `Sketch.kind`. `debug_assert`s that every input gossip matches
+    /// the declared kind.
+    pub fn from_mixed_for_kind(gossips: Vec<Gossip>, kind: GossipKind) -> Self {
+        debug_assert!(gossips.iter().all(|g| g.kind == kind));
+        let mut out = GossipBatch::default();
+        match kind {
+            GossipKind::ChannelUpdate => {
+                out.chan_updates = gossips;
+            }
+            GossipKind::NodeAnnouncement => {
+                out.node_anns = gossips;
+            }
+            GossipKind::ChannelAnnouncement => {
+                out.chan_anns = gossips;
             }
         }
         out
