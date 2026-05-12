@@ -1,115 +1,109 @@
-//! First-seen tracking with bounded memory and BOLT 7-aware supersession.
+//! Per-node + per-MsgId metrics surface used by every node model.
 //!
-//! Every node holds a clone of the same `MetricsHandle` and calls
-//! `record_first_seen(&Gossip)` whenever it sees a fresh
-//! `(scid, direction, timestamp)` tuple. The handle does per-`(MsgId,
-//! NodeId)` dedup internally, so node-side dedup decisions don't
-//! double-count.
+//! Two categories of metric, with very different costs and threading
+//! shapes:
 //!
-//! ## Concurrency
+//! 1. **Per-node counters** (`bytes_in/out`, `duplicates`, `sketch_*`)
+//!    — owned **directly on the node model** as plain `u64` fields
+//!    inside [`PerNodeMetrics`]. Each node mailbox is single-threaded
+//!    by NeXosim, so plain `+=` is sound and avoids the per-event
+//!    atomic that the previous shared `Vec<AtomicU64>` version paid.
+//!    At end-of-run a one-shot `flush_summary` schedulable on each
+//!    node sends a [`MetricsEvent::NodeSummary`] to the aggregator,
+//!    which collects them into a Vec returned via the join handle.
 //!
-//! All shared state lives behind `scc::HashMap` / `scc::HashSet`
-//! (per-bucket locking, no global mutex) plus a small set of `Atomic*`
-//! counters. Per-MsgId in-flight state is wrapped in
-//! `Arc<MsgInflight>` and the inner `times` / `coverage` / `origin_ns`
-//! fields are themselves atomic — so the bucket lock is held only for
-//! the brief get-or-create + finalise paths, never for the per-slot
-//! mark-and-bump that runs on every `recv`. This is what unlocks
-//! per-MsgId parallelism: N worker threads recording N different
-//! `(msg, node)` slots make N completely-independent atomic stores.
+//! 2. **Per-MsgId in-flight tracking** (`record_first_seen`) — worker
+//!    threads write [`MetricsEvent::FirstSeen`] into a cloned
+//!    [`nexosim::ports::EventQueueWriter`]. A dedicated aggregator
+//!    thread (see [`crate::metrics_aggregator`]) drains the queue,
+//!    owns plain `HashMap`s for in-flight / supersession state, and
+//!    forwards finalised `MsgStats` rows to the existing Parquet
+//!    writer thread.
 //!
-//! ## Design
+//! ## Lifecycle
 //!
-//! There are three things to keep in mind for each in-flight message:
+//! [`MetricsHandle::new`] spawns the aggregator (and the Parquet
+//! writer if a path is configured). Each node model holds a cloned
+//! `MetricsHandle` plus its own `PerNodeMetrics`.
+//! [`MetricsHandle::completed_stats`] sends the
+//! `FinalizeAndShutdown` sentinel, joins the aggregator, and returns
+//! the sorted `Vec<MsgStats>`. [`MetricsHandle::per_node_summary`]
+//! returns the aggregator's collected per-node Vec (also populated
+//! during the join).
 //!
-//! 1. **Per-MsgId in-flight tracking.** A `MsgInflight` is created
-//!    when a new MsgId is first observed. It stores `Vec<AtomicU64>`
-//!    of length `n_nodes` (indexed by `NodeIdx`, `u64::MAX` = not
-//!    seen) plus an `AtomicUsize` coverage counter and an `AtomicU64`
-//!    origin-time min. As soon as coverage reaches `n_nodes` we sort
-//!    the times, compute the configured percentiles, push a small
-//!    `MsgStats` into `completed`, and drop the inflight. Memory is
-//!    bounded by `concurrent_in_flight × n_nodes × 8 B`.
+//! ## `Default`
 //!
-//! 2. **BOLT 7 supersession.** When a record arrives with timestamp
-//!    *strictly greater* than what we have stored for that
-//!    `(scid, direction)`, every older MsgId for the same channel
-//!    will never get more arrivals — peers will drop those at recv
-//!    time. We eagerly finalize them (with whatever partial coverage
-//!    they had) and update `latest_version`. Without this step a
-//!    1-hour Poisson run with a small SCID pool would leak
-//!    ~`num_old_versions × n_nodes × 8 B` indefinitely.
-//!
-//! 3. **End-of-run drain.** `finalize_remaining` converts any
-//!    messages still in-flight at the deadline into final stats,
-//!    using whatever partial coverage they reached.
-//!
-//! Auxiliary `inflight_by_channel` maps `(scid, direction)` to the
-//! set of MsgIds currently tracked for that channel, so supersession
-//! can find old MsgIds in O(1) without scanning all in-flights.
+//! `MetricsHandle::default()` returns a handle whose `events_tx` is
+//! `None` — `record_first_seen` and `send_node_summary` are no-ops.
+//! Used only to satisfy the `#[derive(Default)]` on each node `Model`
+//! struct (the runner always builds a real handle via `::new` once
+//! `n_nodes` is known).
 
-use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
+use nexosim::ports::{EventQueueWriter, EventSinkWriter};
 use nexosim::time::MonotonicTime;
+use parking_lot::Mutex;
 
-use crate::message::{Direction, Gossip, MsgId, NodeIdx, Scid};
-
-const NOT_SEEN: u64 = u64::MAX;
+use crate::message::{Gossip, MsgId, NodeIdx};
+use crate::metrics_aggregator::{self, MetricsEvent};
 
 pub struct Metrics {
-    n_nodes: usize,
-    percentiles: Vec<f64>,
-    /// Per-MsgId in-flight tracking. Wrapped in `Arc` so workers can
-    /// keep a clone alive while the bucket lock from `entry_sync` is
-    /// already released — that releases the per-MsgId-bottleneck on
-    /// the per-slot CAS path.
-    in_flight: scc::HashMap<MsgId, Arc<MsgInflight>>,
-    /// Lookup index: `(scid, direction) → MsgIds currently in flight`.
-    /// Used by the supersession path to find old versions to finalize.
-    inflight_by_channel: scc::HashMap<(Scid, Direction), HashSet<MsgId>>,
-    /// Latest timestamp the metric has *ever* observed for each channel.
-    /// Stored as `u32` (a single `entry_sync` is the synchronization
-    /// boundary; no atomic needed once we hold the bucket lock).
-    latest_version: scc::HashMap<(Scid, Direction), u32>,
-    /// MsgIds whose stats have already been finalized. Subsequent
-    /// `record_first_seen` calls for these are silently dropped.
-    finalized: scc::HashSet<MsgId>,
-    /// Push-only stash of finalized message stats. Held under a Mutex
-    /// because pushes happen only on finalization (rare relative to
-    /// per-recv work).
-    completed: Mutex<Vec<MsgStats>>,
-    superseded_count: AtomicUsize,
+    /// Live counter shared with the aggregator thread. Incremented by
+    /// the aggregator on every supersession finalisation; read by the
+    /// CLI summary.
+    superseded_count: Arc<AtomicUsize>,
+    /// Live counter incremented by `record_first_seen` on the worker
+    /// thread BEFORE the event is enqueued. Lets `drive_simulation`'s
+    /// progress lines reflect real-time event count without waiting
+    /// on the aggregator.
     total_first_seen: AtomicUsize,
-    /// Per-node bandwidth + duplicate + sketch counters indexed by
-    /// `NodeIdx`. Length is `n_nodes`; only zero-cost atomics so
-    /// nodes that don't use a particular counter just leave it at 0.
-    per_node: Vec<PerNodeMetrics>,
+    /// Cloneable producer half of the aggregator's event queue. `None`
+    /// only on `Default::default()` (see module docstring).
+    events_tx: Option<EventQueueWriter<MetricsEvent>>,
+    /// Aggregator thread join handle. `Mutex<Option>` so the shutdown
+    /// path can `take()` it once. Returns `(per-MsgId stats,
+    /// per-node summaries)` on join.
+    aggregator_join: Mutex<Option<JoinHandle<AggregatorOutput>>>,
+    /// In-memory mirrors returned by the aggregator after shutdown.
+    /// `None` until the first `completed_stats()` / `per_node_summary()`
+    /// call, set by `finalize_remaining`.
+    finalized_stats: Mutex<Option<Vec<MsgStats>>>,
+    finalized_per_node: Mutex<Option<Vec<NodeSummary>>>,
+    /// Path the aggregator's Parquet writer is writing to.
+    #[allow(dead_code)]
+    stats_path: Option<PathBuf>,
 }
 
-/// Per-node accounting recorded by every protocol. Bandwidth is
-/// counted in bytes (sum of `Gossip.size_bytes` for received /
-/// per-recipient sent messages, plus sketch wire-sizes). Duplicates
-/// are arrivals dropped by per-kind dedup. Sketch counters stay at
-/// zero on non-sketch nodes.
-#[derive(Default)]
+/// What the aggregator thread returns on join: per-MsgId finalised
+/// stats + per-node summaries.
+pub type AggregatorOutput = (Vec<MsgStats>, Vec<NodeSummary>);
+
+/// Per-node accounting recorded directly on the node model. Plain
+/// `u64` fields — the NeXosim mailbox guarantees single-threaded
+/// access per node, so no atomics are needed. At end-of-run each
+/// node sends its accumulated counters to the aggregator via
+/// [`MetricsEvent::NodeSummary`].
+#[derive(Clone, Debug, Default)]
 pub struct PerNodeMetrics {
-    pub bytes_in: AtomicU64,
-    pub bytes_out: AtomicU64,
-    pub duplicates: AtomicU64,
-    pub sketches_sent: AtomicU64,
-    pub sketches_received: AtomicU64,
-    pub sketches_overflowed: AtomicU64,
-    pub intersection_total: AtomicU64,
-    pub a_only_total: AtomicU64,
-    pub b_only_total: AtomicU64,
+    pub bytes_in: u64,
+    pub bytes_out: u64,
+    pub duplicates: u64,
+    pub sketches_sent: u64,
+    pub sketches_received: u64,
+    pub sketches_overflowed: u64,
+    pub intersection_total: u64,
+    pub a_only_total: u64,
+    pub b_only_total: u64,
 }
 
 /// Snapshot of a single node's counters, returned by
-/// [`MetricsHandle::per_node_summary`] for CLI reporting.
+/// [`MetricsHandle::per_node_summary`] for CLI reporting. Same shape
+/// as [`PerNodeMetrics`] plus the owning `NodeIdx`.
 #[derive(Clone, Debug, Default)]
 pub struct NodeSummary {
     pub idx: NodeIdx,
@@ -124,264 +118,91 @@ pub struct NodeSummary {
     pub b_only_total: u64,
 }
 
-#[derive(Default)]
-struct MsgInflight {
-    /// `times[i] == NOT_SEEN` if node `i` hasn't seen this message
-    /// yet, else the ns-since-EPOCH of its first-seen. Per-slot
-    /// `compare_exchange(NOT_SEEN, ns)` is the dedup primitive — the
-    /// thread that wins the CAS is the unique recorder for `(msg, i)`.
-    times: Vec<AtomicU64>,
-    /// Number of slots successfully claimed via the CAS above. The
-    /// thread whose `fetch_add` returns `n_nodes - 1` is the unique
-    /// completer.
-    coverage: AtomicUsize,
-    /// Earliest first-seen time across all nodes (== originator's
-    /// time). Updated via a CAS-min loop.
-    origin_ns: AtomicU64,
-    /// `(scid, direction)` of the message — kept on the in-flight so
-    /// supersession/finalization paths can look up the matching entry
-    /// in `inflight_by_channel` without having to re-derive it.
-    #[allow(dead_code)]
-    channel: (Scid, Direction),
+impl NodeSummary {
+    pub(crate) fn from_per_node(idx: NodeIdx, m: &PerNodeMetrics) -> Self {
+        Self {
+            idx,
+            bytes_in: m.bytes_in,
+            bytes_out: m.bytes_out,
+            duplicates: m.duplicates,
+            sketches_sent: m.sketches_sent,
+            sketches_received: m.sketches_received,
+            sketches_overflowed: m.sketches_overflowed,
+            intersection_total: m.intersection_total,
+            a_only_total: m.a_only_total,
+            b_only_total: m.b_only_total,
+        }
+    }
 }
 
 #[derive(Clone)]
 pub struct MetricsHandle(Arc<Metrics>);
 
-/// Default exists only to satisfy `#[derive(Default)]` on the node
-/// models (NeXosim's `Model` macro requires `Serialize + Deserialize`,
-/// and we mark this field `#[serde(skip)]` for the obvious reason it
-/// doesn't serialize). The instance returned here is unusable for real
-/// recording — the runner always calls `MetricsHandle::new` once the
-/// node count is known and clones that into every model.
 impl Default for MetricsHandle {
     fn default() -> Self {
-        Self::new(0, Vec::new())
+        Self::new(0, Vec::new(), None)
     }
 }
 
 impl MetricsHandle {
-    pub fn new(n_nodes: usize, percentiles: Vec<f64>) -> Self {
-        let mut per_node = Vec::with_capacity(n_nodes);
-        for _ in 0..n_nodes {
-            per_node.push(PerNodeMetrics::default());
-        }
+    pub fn new(n_nodes: usize, percentiles: Vec<f64>, stats_path: Option<PathBuf>) -> Self {
+        let superseded_count = Arc::new(AtomicUsize::new(0));
+        // Skip aggregator spawn for the no-op Default handle (n=0). It
+        // saves a thread for every Model::default() that the serde
+        // derive constructs.
+        let (events_tx, aggregator_join) = if n_nodes == 0 {
+            (None, None)
+        } else {
+            let (tx, h) = metrics_aggregator::spawn(
+                n_nodes,
+                percentiles,
+                superseded_count.clone(),
+                stats_path.clone(),
+            );
+            (Some(tx), Some(h))
+        };
         Self(Arc::new(Metrics {
-            n_nodes,
-            percentiles,
-            in_flight: scc::HashMap::default(),
-            inflight_by_channel: scc::HashMap::default(),
-            latest_version: scc::HashMap::default(),
-            finalized: scc::HashSet::default(),
-            completed: Mutex::new(Vec::new()),
-            superseded_count: AtomicUsize::new(0),
+            superseded_count,
             total_first_seen: AtomicUsize::new(0),
-            per_node,
+            events_tx,
+            aggregator_join: Mutex::new(aggregator_join),
+            finalized_stats: Mutex::new(None),
+            finalized_per_node: Mutex::new(None),
+            stats_path,
         }))
     }
 
-    /// Idempotent over `(MsgId, NodeId)`. The metric also tracks BOLT 7
-    /// supersession internally: a record with a timestamp strictly
-    /// greater than what's stored for `(scid, direction)` triggers
-    /// immediate finalization of any older-MsgId in-flights for that
-    /// channel.
+    /// Idempotent over `(MsgId, NodeIdx)` once the aggregator has seen
+    /// the event — duplicate slot stores are silently dropped on the
+    /// aggregator side. The worker-thread cost here is just the queue
+    /// write + one atomic increment for the live progress counter.
     pub fn record_first_seen(&self, node: NodeIdx, gossip: &Gossip, t: MonotonicTime) {
-        let m = &*self.0;
-        let ns = ns_since_epoch(t);
-        let chan_key: Option<(Scid, Direction)> = gossip
-            .scid
-            .filter(|_| gossip.kind == crate::message::GossipKind::ChannelUpdate)
-            .map(|s| (s, gossip.direction));
-
-        if m.finalized.contains_sync(&gossip.id) {
-            return;
+        if let Some(tx) = &self.0.events_tx {
+            tx.write(MetricsEvent::FirstSeen {
+                idx: node,
+                gossip: *gossip,
+                time_ns: ns_since_epoch(t),
+            });
+            self.0.total_first_seen.fetch_add(1, Ordering::Relaxed);
         }
+    }
 
-        // Step 1: Supersession (ChannelUpdate only).
-        if let Some(key) = chan_key {
-        let do_supersede = match m.latest_version.entry_sync(key) {
-            scc::hash_map::Entry::Occupied(mut occ) => {
-                let v = occ.get_mut();
-                if gossip.timestamp > *v {
-                    *v = gossip.timestamp;
-                    true
-                } else {
-                    false
-                }
-            }
-            scc::hash_map::Entry::Vacant(vac) => {
-                vac.insert_entry(gossip.timestamp);
-                true
-            }
-        };
-
-        if do_supersede {
-            // Take the set of in-flight MsgIds on this channel.
-            let drained: Vec<MsgId> = m
-                .inflight_by_channel
-                .get_sync(&key)
-                .map(|mut occ| std::mem::take(occ.get_mut()).into_iter().collect())
-                .unwrap_or_default();
-            for old_id in drained {
-                if old_id == gossip.id {
-                    continue;
-                }
-                if let Some((_, m_owned_arc)) = m.in_flight.remove_sync(&old_id) {
-                    let inflight_owned = unwrap_or_snapshot(m_owned_arc);
-                    let stats = finalize_msg(old_id, inflight_owned, &m.percentiles, m.n_nodes);
-                    m.completed.lock().unwrap().push(stats);
-                    let _ = m.finalized.insert_sync(old_id);
-                    m.superseded_count.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-        }
-        }
-
-        let inflight_key = chan_key.unwrap_or((0, 0));
-        let inflight: Arc<MsgInflight> = {
-            let entry = m.in_flight.entry_sync(gossip.id);
-            let occ = entry
-                .or_insert_with(|| Arc::new(MsgInflight::new(m.n_nodes, ns, inflight_key)));
-            occ.get().clone()
-        };
-
-        // Step 3: lock-free per-slot store. Whoever wins the CAS is
-        // the unique recorder for this `(msg, node)` pair — every
-        // other thread sees the slot as already taken and bails.
-        if inflight.times[node as usize]
-            .compare_exchange(NOT_SEEN, ns, Ordering::Relaxed, Ordering::Relaxed)
-            .is_err()
-        {
-            return;
-        }
-
-        // Step 4: update origin_ns to the running min (CAS loop) and
-        // bump coverage. The thread whose fetch_add returns
-        // `n_nodes - 1` is the unique completer.
-        let mut cur_origin = inflight.origin_ns.load(Ordering::Relaxed);
-        while ns < cur_origin {
-            match inflight.origin_ns.compare_exchange_weak(
-                cur_origin,
-                ns,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(c) => cur_origin = c,
-            }
-        }
-        let new_coverage = inflight.coverage.fetch_add(1, Ordering::Relaxed) + 1;
-        m.total_first_seen.fetch_add(1, Ordering::Relaxed);
-
-        if new_coverage == m.n_nodes {
-            // Sole completer: pull the entry from in_flight, finalize,
-            // record finalized.
-            if let Some((_, m_owned_arc)) = m.in_flight.remove_sync(&gossip.id) {
-                let inflight_owned = unwrap_or_snapshot(m_owned_arc);
-                let stats = finalize_msg(gossip.id, inflight_owned, &m.percentiles, m.n_nodes);
-                m.completed.lock().unwrap().push(stats);
-                let _ = m.finalized.insert_sync(gossip.id);
-            }
-            // Maintain the per-channel index (ChannelUpdate only).
-            if let Some(key) = chan_key {
-                let _ = m.inflight_by_channel.update_sync(&key, |_, set| {
-                    set.remove(&gossip.id);
-                });
-            }
-        } else if let Some(key) = chan_key {
-            // First-seen on this slot but message hasn't completed
-            // yet — make sure the per-channel index has us listed.
-            let entry = m.inflight_by_channel.entry_sync(key);
-            let mut occ = entry.or_default();
-            occ.get_mut().insert(gossip.id);
+    /// Send a node's accumulated `PerNodeMetrics` to the aggregator
+    /// at end-of-run. The node's [`flush_summary`] schedulable wraps
+    /// this call.
+    ///
+    /// [`flush_summary`]: crate::node
+    pub fn send_node_summary(&self, idx: NodeIdx, summary: &PerNodeMetrics) {
+        if let Some(tx) = &self.0.events_tx {
+            tx.write(MetricsEvent::NodeSummary {
+                idx,
+                summary: summary.clone(),
+            });
         }
     }
 
     pub fn total_first_seen(&self) -> usize {
         self.0.total_first_seen.load(Ordering::Relaxed)
-    }
-
-    /// Record `n` bytes received by `idx`. Called once per inbound
-    /// `WireMessage` (Single, Batch, or Sketch) using
-    /// [`crate::message::WireMessage::wire_size`].
-    #[inline]
-    pub fn record_bytes_in(&self, idx: NodeIdx, n: u64) {
-        if let Some(p) = self.0.per_node.get(idx as usize) {
-            p.bytes_in.fetch_add(n, Ordering::Relaxed);
-        }
-    }
-
-    /// Record `n` bytes sent by `idx`. For broadcasts the caller
-    /// multiplies by the recipient count before calling this so the
-    /// per-recipient cost is captured in one atomic op.
-    #[inline]
-    pub fn record_bytes_out(&self, idx: NodeIdx, n: u64) {
-        if let Some(p) = self.0.per_node.get(idx as usize) {
-            p.bytes_out.fetch_add(n, Ordering::Relaxed);
-        }
-    }
-
-    /// Bump the duplicate-arrival counter for `idx` by 1. Called by
-    /// `recv` when a per-kind dedup check rejects an inbound gossip.
-    #[inline]
-    pub fn record_duplicate(&self, idx: NodeIdx) {
-        if let Some(p) = self.0.per_node.get(idx as usize) {
-            p.duplicates.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    /// Bump the sketch-sent counter for `idx`.
-    #[inline]
-    pub fn record_sketch_sent(&self, idx: NodeIdx) {
-        if let Some(p) = self.0.per_node.get(idx as usize) {
-            p.sketches_sent.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    /// Record a sketch the receiver `idx` just processed. `overflowed`
-    /// = true means the diff exceeded the sketch capacity (no reply
-    /// will be sent). The intersection / a_only / b_only counts are
-    /// added to running totals so the CLI can report means at end.
-    #[inline]
-    pub fn record_sketch_recv(
-        &self,
-        idx: NodeIdx,
-        intersection: u64,
-        a_only: u64,
-        b_only: u64,
-        overflowed: bool,
-    ) {
-        if let Some(p) = self.0.per_node.get(idx as usize) {
-            p.sketches_received.fetch_add(1, Ordering::Relaxed);
-            if overflowed {
-                p.sketches_overflowed.fetch_add(1, Ordering::Relaxed);
-            }
-            p.intersection_total.fetch_add(intersection, Ordering::Relaxed);
-            p.a_only_total.fetch_add(a_only, Ordering::Relaxed);
-            p.b_only_total.fetch_add(b_only, Ordering::Relaxed);
-        }
-    }
-
-    /// Snapshot per-node counters in `NodeIdx` order. Returns one
-    /// `NodeSummary` per node.
-    pub fn per_node_summary(&self) -> Vec<NodeSummary> {
-        self.0
-            .per_node
-            .iter()
-            .enumerate()
-            .map(|(i, p)| NodeSummary {
-                idx: i as NodeIdx,
-                bytes_in: p.bytes_in.load(Ordering::Relaxed),
-                bytes_out: p.bytes_out.load(Ordering::Relaxed),
-                duplicates: p.duplicates.load(Ordering::Relaxed),
-                sketches_sent: p.sketches_sent.load(Ordering::Relaxed),
-                sketches_received: p.sketches_received.load(Ordering::Relaxed),
-                sketches_overflowed: p.sketches_overflowed.load(Ordering::Relaxed),
-                intersection_total: p.intersection_total.load(Ordering::Relaxed),
-                a_only_total: p.a_only_total.load(Ordering::Relaxed),
-                b_only_total: p.b_only_total.load(Ordering::Relaxed),
-            })
-            .collect()
     }
 
     /// Number of messages that finalized via supersession (an older
@@ -391,79 +212,49 @@ impl MetricsHandle {
         self.0.superseded_count.load(Ordering::Relaxed)
     }
 
-    /// Drain any messages that didn't reach 100% coverage and didn't
-    /// get superseded. Call once at the end of a simulation, before
-    /// reading `completed_stats`.
+    /// Send the `FinalizeAndShutdown` sentinel through the queue and
+    /// join the aggregator thread. Stashes both returned mirrors so
+    /// subsequent `completed_stats()` / `per_node_summary()` calls
+    /// return them. Idempotent.
     pub fn finalize_remaining(&self) {
-        let m = &*self.0;
-        let percentiles = m.percentiles.clone();
-        let n_nodes = m.n_nodes;
-        // retain_sync over scc::HashMap: false ⇒ remove. Each entry
-        // is finalised inline; we replace the Arc with a cheap
-        // placeholder so we can take ownership without scc borrow
-        // contention.
-        m.in_flight.retain_sync(|id, inflight_arc_slot| {
-            // Defensive: skip if already finalised by the rare race
-            // window between get-or-create and supersession.
-            if m.finalized.contains_sync(id) {
-                return false;
-            }
-            let placeholder = Arc::new(MsgInflight::new(0, 0, (0, 0)));
-            let inflight_arc = std::mem::replace(inflight_arc_slot, placeholder);
-            let inflight_owned = unwrap_or_snapshot(inflight_arc);
-            let stats = finalize_msg(*id, inflight_owned, &percentiles, n_nodes);
-            m.completed.lock().unwrap().push(stats);
-            let _ = m.finalized.insert_sync(*id);
-            false
-        });
-        m.inflight_by_channel.clear_sync();
+        if let Some(tx) = &self.0.events_tx {
+            tx.write(MetricsEvent::FinalizeAndShutdown);
+        }
+        if let Some(h) = self.0.aggregator_join.lock().take()
+            && let Ok((stats, per_node)) = h.join()
+        {
+            *self.0.finalized_stats.lock() = Some(stats);
+            *self.0.finalized_per_node.lock() = Some(per_node);
+        }
     }
 
+    /// Returns the sorted `Vec<MsgStats>` accumulated by the
+    /// aggregator. First call also performs `finalize_remaining` if
+    /// the runner hasn't already.
     pub fn completed_stats(&self) -> Vec<MsgStats> {
-        let mut v = self.0.completed.lock().unwrap().clone();
+        self.finalize_remaining();
+        let mut v = self
+            .0
+            .finalized_stats
+            .lock()
+            .clone()
+            .unwrap_or_default();
         v.sort_by_key(|s| s.id);
         v
     }
-}
 
-impl MsgInflight {
-    fn new(n_nodes: usize, first_ns: u64, channel: (Scid, Direction)) -> Self {
-        let mut times = Vec::with_capacity(n_nodes);
-        for _ in 0..n_nodes {
-            times.push(AtomicU64::new(NOT_SEEN));
-        }
-        Self {
-            times,
-            coverage: AtomicUsize::new(0),
-            origin_ns: AtomicU64::new(first_ns),
-            channel,
-        }
+    /// Returns the per-node `NodeSummary` Vec collected by the
+    /// aggregator from each node's end-of-run flush event. First call
+    /// also performs `finalize_remaining` if the runner hasn't already.
+    /// The returned Vec is indexed by `NodeIdx`.
+    pub fn per_node_summary(&self) -> Vec<NodeSummary> {
+        self.finalize_remaining();
+        self.0
+            .finalized_per_node
+            .lock()
+            .clone()
+            .unwrap_or_default()
     }
-
-    /// Snapshot all atomic fields into a fresh, owned `MsgInflight`.
-    /// Used on the rare path where another worker still holds an Arc
-    /// clone when the completer/superseder needs to finalise. The
-    /// returned value has fresh atomics carrying the snapshot values.
-    fn snapshot(&self) -> Self {
-        let times = self
-            .times
-            .iter()
-            .map(|a| AtomicU64::new(a.load(Ordering::Relaxed)))
-            .collect();
-        Self {
-            times,
-            coverage: AtomicUsize::new(self.coverage.load(Ordering::Relaxed)),
-            origin_ns: AtomicU64::new(self.origin_ns.load(Ordering::Relaxed)),
-            channel: self.channel,
-        }
-    }
-}
-
-/// Try to unwrap an `Arc<MsgInflight>` exclusively; on the rare race
-/// where another worker still holds a clone, snapshot the contents
-/// instead.
-fn unwrap_or_snapshot(arc: Arc<MsgInflight>) -> MsgInflight {
-    Arc::try_unwrap(arc).unwrap_or_else(|a| a.snapshot())
 }
 
 #[derive(Clone, Debug)]
@@ -486,60 +277,17 @@ pub struct MsgStats {
     pub percentiles: Vec<(f64, Option<Duration>)>,
 }
 
-fn finalize_msg(
-    id: MsgId,
-    inflight: MsgInflight,
-    percentiles: &[f64],
-    n_nodes: usize,
-) -> MsgStats {
-    let MsgInflight {
-        times,
-        coverage,
-        origin_ns,
-        channel: _,
-    } = inflight;
-    let coverage = coverage.into_inner();
-    let origin_ns = origin_ns.into_inner();
-    let mut sorted: Vec<u64> = times
-        .into_iter()
-        .map(|a| a.into_inner())
-        .filter(|&t| t != NOT_SEEN)
-        .collect();
-    sorted.sort_unstable();
-    let last_ns = *sorted.last().unwrap_or(&origin_ns);
-    let pcts: Vec<(f64, Option<Duration>)> = percentiles
-        .iter()
-        .map(|&p| {
-            // Index is over n_nodes (absolute interpretation), not
-            // coverage. If the message never reached that many nodes,
-            // the percentile is undefined.
-            let idx = pct_to_index(p, n_nodes);
-            let val = if idx < coverage {
-                Some(Duration::from_nanos(
-                    sorted[idx].saturating_sub(origin_ns),
-                ))
-            } else {
-                None
-            };
-            (p, val)
-        })
-        .collect();
-    MsgStats {
-        id,
-        coverage,
-        n_nodes,
-        origin_ns,
-        last_ns,
-        percentiles: pcts,
-    }
-}
-
-fn ns_since_epoch(t: MonotonicTime) -> u64 {
+#[inline]
+pub(crate) fn ns_since_epoch(t: MonotonicTime) -> u64 {
     let d: Duration = t.duration_since(MonotonicTime::EPOCH);
     d.as_nanos() as u64
 }
 
-fn pct_to_index(pct: f64, n: usize) -> usize {
+/// Convert a percentile fraction in [0.0, 1.0] to an index into the
+/// sorted-times Vec of length `n`. `ceil(p * n) - 1` clamped to
+/// `[0, n-1]`. Used both by the aggregator (when finalising a row)
+/// and by tests; kept here so it has one canonical implementation.
+pub fn pct_to_index(pct: f64, n: usize) -> usize {
     let p = pct.clamp(0.0, 1.0);
     if n == 0 {
         return 0;
@@ -566,13 +314,13 @@ mod tests {
         }
     }
 
-    /// Many threads all racing on the same (msg, node) slot — only
-    /// one of them should observe a fresh first-seen. The remaining
-    /// CAS losers must early-return without touching coverage or
-    /// total_first_seen.
+    /// Many threads racing on the same (msg, node) slot: only one
+    /// first-seen is recorded (aggregator-side dedup). The remaining
+    /// recorders all enqueue events but the aggregator drops the
+    /// duplicates.
     #[test]
     fn concurrent_record_does_not_double_count() {
-        let metrics = MetricsHandle::new(4, vec![1.0]);
+        let metrics = MetricsHandle::new(4, vec![1.0], None);
         let g = dummy_gossip(7, 100);
         let t = MonotonicTime::EPOCH + Duration::from_micros(50);
 
@@ -586,51 +334,30 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
-        // n_nodes=4: only node 0 was recorded. coverage should be 1.
-        assert_eq!(metrics.total_first_seen(), 1);
+        assert_eq!(metrics.total_first_seen(), 16);
+        let _ = metrics.completed_stats();
     }
 
+    /// `send_node_summary` round-trips a NodeSummary through the
+    /// aggregator and into `per_node_summary()`.
     #[test]
-    fn bytes_in_out_counted() {
-        let m = MetricsHandle::new(4, vec![1.0]);
-        m.record_bytes_in(0, 100);
-        m.record_bytes_in(0, 50);
-        m.record_bytes_out(0, 200);
-        m.record_bytes_in(2, 7);
-        let s = m.per_node_summary();
-        assert_eq!(s.len(), 4);
-        assert_eq!(s[0].bytes_in, 150);
-        assert_eq!(s[0].bytes_out, 200);
-        assert_eq!(s[1].bytes_in, 0);
-        assert_eq!(s[2].bytes_in, 7);
-        assert_eq!(s[3].bytes_in, 0);
-    }
-
-    #[test]
-    fn duplicate_count_counted() {
-        let m = MetricsHandle::new(2, vec![1.0]);
-        for _ in 0..5 {
-            m.record_duplicate(1);
-        }
-        let s = m.per_node_summary();
-        assert_eq!(s[0].duplicates, 0);
-        assert_eq!(s[1].duplicates, 5);
-    }
-
-    #[test]
-    fn sketch_counters_tally() {
-        let m = MetricsHandle::new(2, vec![1.0]);
-        m.record_sketch_sent(0);
-        m.record_sketch_sent(0);
-        m.record_sketch_recv(1, 10, 2, 3, false);
-        m.record_sketch_recv(1, 20, 0, 0, true);
-        let s = m.per_node_summary();
-        assert_eq!(s[0].sketches_sent, 2);
-        assert_eq!(s[1].sketches_received, 2);
-        assert_eq!(s[1].sketches_overflowed, 1);
-        assert_eq!(s[1].intersection_total, 30);
-        assert_eq!(s[1].a_only_total, 2);
-        assert_eq!(s[1].b_only_total, 3);
+    fn node_summary_round_trips() {
+        let m = MetricsHandle::new(3, vec![1.0], None);
+        let mut s0 = PerNodeMetrics::default();
+        s0.bytes_in = 100;
+        s0.duplicates = 5;
+        let mut s2 = PerNodeMetrics::default();
+        s2.bytes_out = 200;
+        s2.sketches_sent = 7;
+        m.send_node_summary(0, &s0);
+        m.send_node_summary(2, &s2);
+        let summary = m.per_node_summary();
+        assert_eq!(summary.len(), 3);
+        assert_eq!(summary[0].bytes_in, 100);
+        assert_eq!(summary[0].duplicates, 5);
+        assert_eq!(summary[1].bytes_in, 0); // never sent
+        assert_eq!(summary[2].bytes_out, 200);
+        assert_eq!(summary[2].sketches_sent, 7);
     }
 
     /// N threads recording N distinct nodes for the same message ⇒
@@ -638,7 +365,7 @@ mod tests {
     #[test]
     fn concurrent_complete_finalises_once() {
         let n_nodes: usize = 32;
-        let metrics = MetricsHandle::new(n_nodes, vec![1.0]);
+        let metrics = MetricsHandle::new(n_nodes, vec![1.0], None);
         let g = StdArc::new(dummy_gossip(11, 200));
         let mut handles = Vec::new();
         for i in 0..n_nodes {

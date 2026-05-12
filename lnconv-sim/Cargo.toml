@@ -21,10 +21,14 @@ rustworkx-core = "0.17"
 # workspace and rustworkx-core agree on petgraph types.
 petgraph = "0.8"
 statrs = "0.18"
-scc = "3"
+ahash = "0.8"
+nohash-hasher = "0.2"
+parking_lot = "0.12"
 csv = "1"
 twox-hash = { version = "2", features = ["xxhash3_64"] }
 thiserror = "2"
 parquet = { version = "55", features = ["zstd"] }
 arrow-array = "55"
+arrow-schema = "55"
 glob = "0.3"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }

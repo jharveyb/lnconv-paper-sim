@@ -1,3 +1,6 @@
 /target
 Cargo.lock
 .serena/
+
+# Per-run stats output (auto-named: {topology}-{algo}-{event}-{stamp}.parquet)
+/*.parquet

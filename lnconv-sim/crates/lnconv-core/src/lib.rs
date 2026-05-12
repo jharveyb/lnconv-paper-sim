@@ -19,9 +19,11 @@ pub mod events;
 pub mod latency;
 pub mod message;
 pub mod metrics;
+pub mod metrics_aggregator;
 pub mod node;
 pub mod sim;
 pub mod state;
+pub mod stats_writer;
 pub mod topology;
 
 pub use message::{

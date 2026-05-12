@@ -28,11 +28,11 @@ struct Cli {
 /// Per-message percentiles: time at which X% of *all* nodes had received
 /// the message. Each one shows up as a column in the per-message table
 /// AND as a row in the per-coverage-tier aggregate.
-const PERCENTILES: &[f64] = &[0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.99, 1.00];
+const PERCENTILES: &[f64] = &[0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95, 0.99, 1.00];
 
 /// Coverage tiers used to bucket messages for aggregate reports.
 /// "messages with coverage >= 25% of n_nodes" gets one bucket, etc.
-const COVERAGE_TIERS: &[f64] = &[0.25, 0.50, 0.75, 1.00];
+const COVERAGE_TIERS: &[f64] = &[0.05, 0.25, 0.50, 0.75, 0.95, 0.99, 1.00];
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
