@@ -173,6 +173,23 @@ pub fn run(cfg: &SimConfig, percentiles: Vec<f64>) -> Result<RunResult> {
     let topo_stats = topology_metrics::compute(&topology, cfg.seed, 2000, 1000);
     println!("topology: {topo_stats:#?}");
 
+    // For sketch protocol, print the closed-form predicted coverage
+    // times so they can be compared against the observed time-to-reach
+    // table at end-of-run. See `spread_model` for the derivation.
+    if let Some(stagger_secs) = sketch_stagger_secs(&cfg.algo) {
+        let peers = &topo_stats.peers;
+        print!(
+            "{}",
+            crate::spread_model::render_prediction_table(
+                stagger_secs,
+                peers.mean_degree,
+                peers.n,
+                peers.diameter as f64,
+                peers.mean_path_length,
+            )
+        );
+    }
+
     println!(
         "channels: count={} (mean {:.1} per node)",
         registry.num_scids,

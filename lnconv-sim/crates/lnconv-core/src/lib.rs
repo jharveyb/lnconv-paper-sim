@@ -22,6 +22,7 @@ pub mod metrics;
 pub mod metrics_aggregator;
 pub mod node;
 pub mod sim;
+pub mod spread_model;
 pub mod state;
 pub mod stats_writer;
 pub mod topology;
