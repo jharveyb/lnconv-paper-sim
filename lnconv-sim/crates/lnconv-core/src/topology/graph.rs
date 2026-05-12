@@ -70,7 +70,6 @@ pub enum NodeAlgo {
         capacity_chan_updates: u32,
         capacity_node_anns: u32,
         capacity_chan_anns: u32,
-        peer_offset_max_ms: Option<u64>,
     },
 }
 
@@ -94,13 +93,11 @@ impl From<&NodeAlgoKind> for NodeAlgo {
                 capacity_chan_updates,
                 capacity_node_anns,
                 capacity_chan_anns,
-                peer_offset_max_ms,
             } => NodeAlgo::Sketch {
                 stagger_ms: *stagger_ms,
                 capacity_chan_updates: *capacity_chan_updates,
                 capacity_node_anns: *capacity_node_anns,
                 capacity_chan_anns: *capacity_chan_anns,
-                peer_offset_max_ms: *peer_offset_max_ms,
             },
         }
     }

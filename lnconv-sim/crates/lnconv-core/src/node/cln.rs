@@ -117,7 +117,7 @@ impl ClnNode {
 
     /// Input port. BOLT 7 per-kind dedup, then queue for next tick.
     pub async fn recv(&mut self, wire: WireMessage, cx: &Context<Self>) {
-        self.metrics_local.bytes_in += wire.wire_size();
+        self.metrics_local.bytes_in_gossip += wire.wire_size();
         match &wire {
             WireMessage::Single(g) => {
                 let g_copy = *g;
@@ -140,7 +140,7 @@ impl ClnNode {
         }
         self.metrics.record_first_seen(self.idx, &msg, cx.time());
         let n_peers = self.outputs.len() as u64;
-        self.metrics_local.bytes_out += msg.size_bytes as u64 * n_peers;
+        self.metrics_local.bytes_out_gossip += msg.size_bytes as u64 * n_peers;
         for out in &mut self.outputs {
             out.send(WireMessage::Single(msg)).await;
         }
@@ -157,7 +157,7 @@ impl ClnNode {
         let drained = std::mem::take(&mut self.pending);
         let bytes_per_peer: u64 = drained.iter().map(|g| g.size_bytes as u64).sum();
         let n_peers = self.outputs.len() as u64;
-        self.metrics_local.bytes_out += bytes_per_peer * n_peers;
+        self.metrics_local.bytes_out_gossip += bytes_per_peer * n_peers;
         let arc_batch = Arc::new(GossipBatch::from_mixed(drained));
         for out in &mut self.outputs {
             out.send(WireMessage::Batch(arc_batch.clone())).await;

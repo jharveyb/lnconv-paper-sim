@@ -57,6 +57,30 @@ pub fn hash_scid_string(seed: u64, scid_str: &str) -> Scid {
     XX3Hasher::oneshot_with_seed(seed ^ SCID_SUBSEED, scid_str.as_bytes()) & 0x7FFF_FFFF_FFFF_FFFF
 }
 
+
+/// Re-read just the nodes CSV and build a reverse-lookup from hashed
+/// `NodeId` to the original 66-hex pubkey string. The CLI calls this
+/// at end-of-run to pretty-print real pubkeys in the overflow-pair
+/// summary (only `FromCsv` topologies — synthetic topologies use dense
+/// `0..n` ids that print fine as integers). Cheap relative to the
+/// simulation itself; ~12k rows takes a few ms.
+pub fn read_pubkey_lookup(
+    nodes_csv: &Path,
+    seed: u64,
+) -> Result<HashMap<NodeId, String>, LoadError> {
+    let mut map = HashMap::new();
+    let mut reader = csv::Reader::from_reader(open(nodes_csv)?);
+    for record in reader.deserialize::<NodeRow>() {
+        let row = record.map_err(|e| LoadError::Csv {
+            path: nodes_csv.display().to_string(),
+            source: e,
+        })?;
+        let id = hash_pubkey(seed, &row.pubkey);
+        map.insert(id, row.pubkey);
+    }
+    Ok(map)
+}
+
 #[derive(Debug)]
 pub struct LnSnapshot {
     /// Hash-derived NodeId for each pubkey, in CSV row order. Index

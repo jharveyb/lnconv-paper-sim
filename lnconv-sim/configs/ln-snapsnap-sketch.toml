@@ -20,8 +20,8 @@ ms = 100
 kind = "sketch"
 stagger_ms = 30000
 capacity_chan_updates = 512
-capacity_node_anns = 128
-capacity_chan_anns = 128
+capacity_node_anns = 256
+capacity_chan_anns = 64
 
 [event]
 kind = "parquet_replay"

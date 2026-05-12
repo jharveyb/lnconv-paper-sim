@@ -41,7 +41,7 @@ use crate::events::EventSchedule;
 use crate::events::oneshot::{OneShotAll, OneShotSingle};
 use crate::events::parquet_replay::ParquetReplay;
 use crate::events::poisson::PoissonRandom;
-use crate::message::{Gossip, NodeId};
+use crate::message::{Gossip, GossipKind, NodeId};
 use crate::metrics::MetricsHandle;
 use crate::node::cln::ClnNode;
 use crate::node::flooding::FloodingNode;
@@ -197,6 +197,7 @@ pub fn run(cfg: &SimConfig, percentiles: Vec<f64>) -> Result<RunResult> {
         "events: scheduled {} message(s) over the run window",
         event_tuples.len()
     );
+    log_event_kind_breakdown(&event_tuples, run_duration);
     let deadline = MonotonicTime::EPOCH + run_duration;
 
     match &cfg.algo {
@@ -255,13 +256,11 @@ fn default_algo_from(cfg: &AlgoCfg) -> NodeAlgo {
             capacity_chan_updates,
             capacity_node_anns,
             capacity_chan_anns,
-            peer_offset_max_ms,
         } => NodeAlgo::Sketch {
             stagger_ms: *stagger_ms,
             capacity_chan_updates: *capacity_chan_updates,
             capacity_node_anns: *capacity_node_anns,
             capacity_chan_anns: *capacity_chan_anns,
-            peer_offset_max_ms: *peer_offset_max_ms,
         },
     }
 }
@@ -402,6 +401,59 @@ fn log_mix_summary(assignments: &[NodeAlgoKind]) {
         lnd,
         100.0 * lnd as f64 / n as f64,
     );
+}
+
+
+/// Break down the scheduled event-tuples by `GossipKind` and print
+/// counts + rates. Works for any event source — parquet replay sees a
+/// mix of all three kinds, Poisson/OneShot are pure `ChannelUpdate`.
+/// Rate is averaged over the full run window (`duration_seconds`),
+/// which matches what the user reads off `[run]`.
+fn log_event_kind_breakdown(tuples: &[(Duration, NodeId, Gossip)], window: Duration) {
+    if tuples.is_empty() {
+        return;
+    }
+    let mut chan_upd: u64 = 0;
+    let mut node_ann: u64 = 0;
+    let mut chan_ann: u64 = 0;
+    for (_, _, g) in tuples {
+        match g.kind {
+            GossipKind::ChannelUpdate => chan_upd += 1,
+            GossipKind::NodeAnnouncement => node_ann += 1,
+            GossipKind::ChannelAnnouncement => chan_ann += 1,
+        }
+    }
+    let secs = window.as_secs_f64().max(1e-9);
+    let total = chan_upd + node_ann + chan_ann;
+    let pct = |x: u64| -> f64 { 100.0 * x as f64 / total as f64 };
+    println!(
+        "  by kind: chan_update={} ({:.1}%, {:.2}/s), \
+                  node_ann={} ({:.1}%, {:.2}/s), \
+                  chan_ann={} ({:.1}%, {:.2}/s)",
+        chan_upd, pct(chan_upd), chan_upd as f64 / secs,
+        node_ann, pct(node_ann), node_ann as f64 / secs,
+        chan_ann, pct(chan_ann), chan_ann as f64 / secs,
+    );
+}
+
+
+/// Return the sketch protocol's `stagger` in seconds if the run uses
+/// sketch — either as a homogeneous algo or in a Mix population. For
+/// Mix runs the homogeneous-algo formula is a rough first-order fit;
+/// it's exact when the whole population is sketch. None for non-sketch
+/// runs (the predictor doesn't model flooding / cln / lnd dynamics).
+fn sketch_stagger_secs(algo: &AlgoCfg) -> Option<f64> {
+    match algo {
+        AlgoCfg::Sketch { stagger_ms, .. } => Some(*stagger_ms as f64 / 1000.0),
+        AlgoCfg::Mix { population } => population.iter().find_map(|e| {
+            if let NodeAlgoKind::Sketch { stagger_ms, .. } = &e.algo {
+                Some(*stagger_ms as f64 / 1000.0)
+            } else {
+                None
+            }
+        }),
+        _ => None,
+    }
 }
 
 /// Pre-schedule every origination event into the simulator's priority
@@ -695,7 +747,6 @@ fn run_stagger_population(
                 capacity_chan_updates,
                 capacity_node_anns,
                 capacity_chan_anns,
-                peer_offset_max_ms: _,
             } => {
                 sketch_local[nx.index()] = Some(sketch_nodes.len());
                 sketch_nodes.push(SketchNode::new(

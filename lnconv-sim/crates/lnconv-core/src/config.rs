@@ -161,10 +161,6 @@ pub enum AlgoCfg {
         capacity_node_anns: u32,
         #[serde(default = "default_ca_capacity")]
         capacity_chan_anns: u32,
-        /// Cap per-peer offset within each stagger window. None ⇒
-        /// uniform in (0, stagger_ms].
-        #[serde(default)]
-        peer_offset_max_ms: Option<u64>,
     },
 }
 
@@ -197,10 +193,6 @@ pub enum NodeAlgoKind {
         capacity_node_anns: u32,
         #[serde(default = "default_ca_capacity")]
         capacity_chan_anns: u32,
-        /// Cap per-peer offset within each stagger window. None ⇒
-        /// uniform in (0, stagger_ms].
-        #[serde(default)]
-        peer_offset_max_ms: Option<u64>,
     },
 }
 

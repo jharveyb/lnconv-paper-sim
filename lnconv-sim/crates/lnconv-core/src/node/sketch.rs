@@ -26,6 +26,7 @@ use std::time::Duration;
 
 use nexosim::model::{Context, Model, schedulable};
 use nexosim::ports::Output;
+use nexosim::time::MonotonicTime;
 use serde::{Deserialize, Serialize};
 
 use crate::message::{
@@ -79,6 +80,8 @@ impl SketchNode {
         cap_chan_updates: u32,
         cap_node_anns: u32,
         cap_chan_anns: u32,
+        reservoir_cap: u32,
+        reservoir_seed: u64,
         run_duration: Duration,
         state: SharedNodeState,
         peer_states: Vec<SharedNodeState>,
@@ -99,7 +102,7 @@ impl SketchNode {
             next_sketch_id: 0,
             run_duration,
             state,
-            metrics_local: PerNodeMetrics::default(),
+            metrics_local: PerNodeMetrics::with_sketch_reservoirs(reservoir_cap, reservoir_seed),
             metrics,
         }
     }
@@ -168,17 +171,20 @@ impl SketchNode {
     /// * `Sketch` — schedule the diff/reply via a schedulable
     ///   helper because `recv` is sync and can't `.await` on Outputs.
     pub fn recv(&mut self, wire: WireMessage, cx: &Context<Self>) {
-        self.metrics_local.bytes_in += wire.wire_size();
+        let wire_size = wire.wire_size();
         match wire {
             WireMessage::Single(g) => {
+                self.metrics_local.bytes_in_gossip += wire_size;
                 self.absorb_one(g, cx);
             }
             WireMessage::Batch(batch) => {
+                self.metrics_local.bytes_in_gossip += wire_size;
                 self.absorb_chan_updates(&batch.chan_updates, cx);
                 self.absorb_node_anns(&batch.node_anns, cx);
                 self.absorb_chan_anns(&batch.chan_anns, cx);
             }
             WireMessage::Sketch(sketch) => {
+                self.metrics_local.bytes_in_sketch += wire_size;
                 cx.schedule_event(
                     // 1 ms delay should give some breathing room.
                     Duration::from_nanos(1000000),
@@ -201,7 +207,7 @@ impl SketchNode {
     }
 
     /// Per-peer ticker handler. Builds three sketches (one per kind)
-    /// and sends them to one peer.
+    /// and sends them to one peer in sequence.
     #[nexosim(schedulable)]
     async fn tick_for_peer(&mut self, peer_local: usize) {
         for (kind, capacity) in [
@@ -219,7 +225,7 @@ impl SketchNode {
                 size_bytes: ((capacity as usize * 8).min(u16::MAX as usize)) as u16,
             };
             self.metrics_local.sketches_sent += 1;
-            self.metrics_local.bytes_out += sketch.size_bytes as u64;
+            self.metrics_local.bytes_out_sketch += sketch.size_bytes as u64;
             if let Some(out) = self.outputs.get_mut(peer_local) {
                 out.send(WireMessage::Sketch(sketch)).await;
             }
@@ -245,13 +251,45 @@ impl SketchNode {
         let total_diff = diff.a_only_count + diff.b_only_count;
         let overflow = total_diff > sketch.capacity as usize;
         self.metrics_local.sketches_received += 1;
+        // Per-kind reconciliation stats.
+        let kind_stats = match sketch.kind {
+            SketchKind::ChanUpdates => &mut self.metrics_local.chan_updates_stats,
+            SketchKind::NodeAnns => &mut self.metrics_local.node_anns_stats,
+            SketchKind::ChanAnns => &mut self.metrics_local.chan_anns_stats,
+        };
+        kind_stats.intersection += diff.intersection as u64;
+        kind_stats.a_only += diff.a_only_count as u64;
+        kind_stats.b_only += diff.b_only_count as u64;
+        kind_stats
+            .rounds_intersection
+            .observe(diff.intersection.min(u32::MAX as usize) as u32);
+        kind_stats
+            .rounds_a_only
+            .observe(diff.a_only_count.min(u32::MAX as usize) as u32);
+        kind_stats
+            .rounds_b_only
+            .observe(diff.b_only_count.min(u32::MAX as usize) as u32);
         if overflow {
-            self.metrics_local.sketches_overflowed += 1;
-        }
-        self.metrics_local.intersection_total += diff.intersection as u64;
-        self.metrics_local.a_only_total += diff.a_only_count as u64;
-        self.metrics_local.b_only_total += diff.b_only_count as u64;
-        if overflow {
+            // Per-kind overflow count.
+            match sketch.kind {
+                SketchKind::ChanUpdates => self.metrics_local.overflowed_chan_updates += 1,
+                SketchKind::NodeAnns => self.metrics_local.overflowed_node_anns += 1,
+                SketchKind::ChanAnns => self.metrics_local.overflowed_chan_anns += 1,
+            }
+            let amount = (total_diff - sketch.capacity as usize).min(u32::MAX as usize) as u32;
+            let total_diff_u32 = total_diff.min(u32::MAX as usize) as u32;
+            let time_ns = _cx
+                .time()
+                .duration_since(MonotonicTime::EPOCH)
+                .as_nanos() as u64;
+            self.metrics_local.overflow_events.push(crate::metrics::OverflowEvent {
+                time_ns,
+                receiver_idx: self.idx,
+                peer_id: sketch.from,
+                kind: sketch.kind,
+                amount,
+                total_diff: total_diff_u32,
+            });
             return;
         }
         // Reply with items the sender is missing AND that are
@@ -262,7 +300,7 @@ impl SketchNode {
             return;
         }
         let bytes: u64 = diff.b_newer.iter().map(|g| g.size_bytes as u64).sum();
-        self.metrics_local.bytes_out += bytes;
+        self.metrics_local.bytes_out_gossip += bytes;
         let batch = Arc::new(GossipBatch::from_mixed_for_kind(diff.b_newer, sketch.kind.to_gossip()));
         if let Some(out) = self.outputs.get_mut(local) {
             out.send(WireMessage::Batch(batch)).await;

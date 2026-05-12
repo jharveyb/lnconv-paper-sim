@@ -135,7 +135,7 @@ impl LndNode {
 
     /// Input port. BOLT 7 per-kind dedup, then queue.
     pub async fn recv(&mut self, wire: WireMessage, cx: &Context<Self>) {
-        self.metrics_local.bytes_in += wire.wire_size();
+        self.metrics_local.bytes_in_gossip += wire.wire_size();
         match &wire {
             WireMessage::Single(g) => {
                 let g_copy = *g;
@@ -206,7 +206,7 @@ impl LndNode {
     async fn broadcast_arc(&mut self, batch: Arc<GossipBatch>) {
         let bytes_per_peer: u64 = batch.wire_size();
         let n_peers = self.outputs.len() as u64;
-        self.metrics_local.bytes_out += bytes_per_peer * n_peers;
+        self.metrics_local.bytes_out_gossip += bytes_per_peer * n_peers;
         for out in &mut self.outputs {
             out.send(WireMessage::Batch(batch.clone())).await;
         }

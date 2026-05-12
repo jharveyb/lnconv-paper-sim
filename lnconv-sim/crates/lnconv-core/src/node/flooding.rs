@@ -145,7 +145,7 @@ impl FloodingNode {
     /// dropped. Kept messages are recorded in metrics and scheduled
     /// for forward after `forward_delay`.
     pub fn recv(&mut self, wire: WireMessage, cx: &Context<Self>) {
-        self.metrics_local.bytes_in += wire.wire_size();
+        self.metrics_local.bytes_in_gossip += wire.wire_size();
         match &wire {
             WireMessage::Single(g) => {
                 let g_copy = *g;
@@ -285,7 +285,7 @@ impl FloodingNode {
     /// in, on the local plain-u64 counter.
     async fn broadcast_single(&mut self, msg: Gossip) {
         let n_peers = self.outputs.len() as u64;
-        self.metrics_local.bytes_out += msg.size_bytes as u64 * n_peers;
+        self.metrics_local.bytes_out_gossip += msg.size_bytes as u64 * n_peers;
         for out in &mut self.outputs {
             out.send(WireMessage::Single(msg)).await;
         }

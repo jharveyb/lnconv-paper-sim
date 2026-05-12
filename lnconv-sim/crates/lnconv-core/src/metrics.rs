@@ -49,7 +49,7 @@ use nexosim::ports::{EventQueueWriter, EventSinkWriter};
 use nexosim::time::MonotonicTime;
 use parking_lot::Mutex;
 
-use crate::message::{Gossip, MsgId, NodeIdx};
+use crate::message::{Gossip, MsgId, NodeId, NodeIdx, SketchKind};
 use crate::metrics_aggregator::{self, MetricsEvent};
 
 pub struct Metrics {
@@ -83,22 +83,83 @@ pub struct Metrics {
 /// stats + per-node summaries.
 pub type AggregatorOutput = (Vec<MsgStats>, Vec<NodeSummary>);
 
+/// Per-sketch-kind reconciliation counters. Three of these on each
+/// [`PerNodeMetrics`] / [`NodeSummary`] — one per `SketchKind` — so
+/// the CLI can break down where the reconciliation work goes.
+///
+/// Running totals (`intersection` / `a_only` / `b_only`) live as plain
+/// `u64`. Per-round samples ride in three [`Reservoir<u32>`]s so
+/// memory stays bounded for arbitrarily long sims; computing p99 of
+/// `a_only + b_only` over the reservoir gives a useful lower bound on
+/// the sketch capacity needed to keep overflows rare.
+#[derive(Clone, Debug, Default)]
+pub struct SketchKindStats {
+    pub intersection: u64,
+    pub a_only: u64,
+    pub b_only: u64,
+    pub rounds_intersection: Reservoir<u32>,
+    pub rounds_a_only: Reservoir<u32>,
+    pub rounds_b_only: Reservoir<u32>,
+}
+
+
+/// Single overflow event recorded by the receiver of a `Sketch` whose
+/// symmetric-diff size exceeded the sketch capacity. Accumulated in a
+/// small preallocated per-node buffer that gets drained every flush
+/// interval into the `overflow_events-<tag>.parquet` writer — no
+/// in-memory accumulation across the run.
+#[derive(Clone, Debug)]
+pub struct OverflowEvent {
+    /// Sim time at which the overflow was observed.
+    pub time_ns: u64,
+    /// Dense index of the receiver (the node that computed the diff).
+    pub receiver_idx: NodeIdx,
+    /// `NodeId` of the peer that sent the overflowing sketch.
+    pub peer_id: NodeId,
+    pub kind: SketchKind,
+    /// `total_diff - sketch.capacity` — how far over the configured
+    /// capacity the actual diff went.
+    pub amount: u32,
+    /// `a_only + b_only` — the strict-diff total that triggered the
+    /// overflow. Useful context for tuning capacity.
+    pub total_diff: u32,
+}
+
 /// Per-node accounting recorded directly on the node model. Plain
 /// `u64` fields — the NeXosim mailbox guarantees single-threaded
 /// access per node, so no atomics are needed. At end-of-run each
 /// node sends its accumulated counters to the aggregator via
 /// [`MetricsEvent::NodeSummary`].
+///
+/// Bandwidth is split into two buckets: `*_sketch` for
+/// `WireMessage::Sketch` (reconciliation overhead) and `*_gossip` for
+/// `WireMessage::Single` + `WireMessage::Batch` (gossip payload).
+/// Sketch stats are broken down per `SketchKind` via
+/// [`SketchKindStats`]; overflows likewise have per-kind counters
+/// plus a detailed event log in `overflow_events`.
 #[derive(Clone, Debug, Default)]
 pub struct PerNodeMetrics {
-    pub bytes_in: u64,
-    pub bytes_out: u64,
+    pub bytes_in_sketch: u64,
+    pub bytes_out_sketch: u64,
+    pub bytes_in_gossip: u64,
+    pub bytes_out_gossip: u64,
     pub duplicates: u64,
     pub sketches_sent: u64,
     pub sketches_received: u64,
-    pub sketches_overflowed: u64,
-    pub intersection_total: u64,
-    pub a_only_total: u64,
-    pub b_only_total: u64,
+    pub overflowed_chan_updates: u64,
+    pub overflowed_node_anns: u64,
+    pub overflowed_chan_anns: u64,
+    pub chan_updates_stats: SketchKindStats,
+    pub node_anns_stats: SketchKindStats,
+    pub chan_anns_stats: SketchKindStats,
+    /// Pending per-overflow events. Drained every periodic flush into
+    /// the `overflow_events-<tag>.parquet` writer — never accumulates
+    /// across the run. Preallocated to `expected_per_interval` by
+    /// [`Self::with_sketch_reservoirs`] so steady-state pushes don't
+    /// re-allocate.
+    pub overflow_events: Vec<OverflowEvent>,
+}
+
 }
 
 /// Snapshot of a single node's counters, returned by
@@ -107,30 +168,40 @@ pub struct PerNodeMetrics {
 #[derive(Clone, Debug, Default)]
 pub struct NodeSummary {
     pub idx: NodeIdx,
-    pub bytes_in: u64,
-    pub bytes_out: u64,
+    pub bytes_in_sketch: u64,
+    pub bytes_out_sketch: u64,
+    pub bytes_in_gossip: u64,
+    pub bytes_out_gossip: u64,
     pub duplicates: u64,
     pub sketches_sent: u64,
     pub sketches_received: u64,
-    pub sketches_overflowed: u64,
-    pub intersection_total: u64,
-    pub a_only_total: u64,
-    pub b_only_total: u64,
+    pub overflowed_chan_updates: u64,
+    pub overflowed_node_anns: u64,
+    pub overflowed_chan_anns: u64,
+    pub chan_updates_stats: SketchKindStats,
+    pub node_anns_stats: SketchKindStats,
+    pub chan_anns_stats: SketchKindStats,
+    pub overflow_events: Vec<OverflowEvent>,
 }
 
 impl NodeSummary {
     pub(crate) fn from_per_node(idx: NodeIdx, m: &PerNodeMetrics) -> Self {
         Self {
             idx,
-            bytes_in: m.bytes_in,
-            bytes_out: m.bytes_out,
+            bytes_in_sketch: m.bytes_in_sketch,
+            bytes_out_sketch: m.bytes_out_sketch,
+            bytes_in_gossip: m.bytes_in_gossip,
+            bytes_out_gossip: m.bytes_out_gossip,
             duplicates: m.duplicates,
             sketches_sent: m.sketches_sent,
             sketches_received: m.sketches_received,
-            sketches_overflowed: m.sketches_overflowed,
-            intersection_total: m.intersection_total,
-            a_only_total: m.a_only_total,
-            b_only_total: m.b_only_total,
+            overflowed_chan_updates: m.overflowed_chan_updates,
+            overflowed_node_anns: m.overflowed_node_anns,
+            overflowed_chan_anns: m.overflowed_chan_anns,
+            chan_updates_stats: m.chan_updates_stats.clone(),
+            node_anns_stats: m.node_anns_stats.clone(),
+            chan_anns_stats: m.chan_anns_stats.clone(),
+            overflow_events: m.overflow_events.clone(),
         }
     }
 }
@@ -344,20 +415,39 @@ mod tests {
     fn node_summary_round_trips() {
         let m = MetricsHandle::new(3, vec![1.0], None);
         let mut s0 = PerNodeMetrics::default();
-        s0.bytes_in = 100;
+        s0.bytes_in_gossip = 100;
         s0.duplicates = 5;
         let mut s2 = PerNodeMetrics::default();
-        s2.bytes_out = 200;
+        s2.bytes_out_sketch = 200;
         s2.sketches_sent = 7;
+        s2.chan_updates_stats.intersection = 11;
+        s2.chan_updates_stats.a_only = 3;
+        s2.chan_updates_stats.b_only = 5;
+        s2.overflowed_chan_updates = 1;
+        s2.overflow_events.push(OverflowEvent {
+            time_ns: 1_000_000,
+            receiver_idx: 2,
+            peer_id: 9999,
+            kind: SketchKind::ChanUpdates,
+            amount: 42,
+            total_diff: 64,
+        });
         m.send_node_summary(0, &s0);
         m.send_node_summary(2, &s2);
         let summary = m.per_node_summary();
         assert_eq!(summary.len(), 3);
-        assert_eq!(summary[0].bytes_in, 100);
+        assert_eq!(summary[0].bytes_in_gossip, 100);
         assert_eq!(summary[0].duplicates, 5);
-        assert_eq!(summary[1].bytes_in, 0); // never sent
-        assert_eq!(summary[2].bytes_out, 200);
+        assert_eq!(summary[1].bytes_in_gossip, 0); // never sent
+        assert_eq!(summary[2].bytes_out_sketch, 200);
         assert_eq!(summary[2].sketches_sent, 7);
+        assert_eq!(summary[2].chan_updates_stats.intersection, 11);
+        assert_eq!(summary[2].chan_updates_stats.a_only, 3);
+        assert_eq!(summary[2].chan_updates_stats.b_only, 5);
+        assert_eq!(summary[2].overflowed_chan_updates, 1);
+        assert_eq!(summary[2].overflow_events.len(), 1);
+        assert_eq!(summary[2].overflow_events[0].peer_id, 9999);
+        assert_eq!(summary[2].overflow_events[0].amount, 42);
     }
 
     /// N threads recording N distinct nodes for the same message ⇒
