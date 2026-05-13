@@ -287,7 +287,7 @@ fn diff_node_anns(la: &NodeAnnsMap, lb: &NodeAnnsMap, which: WhichSide) -> DiffR
     let mut a_only_count = 0usize;
     let mut b_only_count = 0usize;
     let mut intersection = 0usize;
-    let difference_count_estimate = 128;
+    let difference_count_estimate = 256;
     let mut a_newer = if want_a { Vec::with_capacity(difference_count_estimate) } else { Vec::new() };
     let mut b_newer = if want_b { Vec::with_capacity(difference_count_estimate) } else { Vec::new() };
     for (origin, (ts_a, size_a)) in la {

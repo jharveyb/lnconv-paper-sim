@@ -32,7 +32,9 @@ use serde::{Deserialize, Serialize};
 use crate::message::{
     Gossip, GossipBatch, GossipKind, MsgId, NodeId, NodeIdx, Sketch, SketchKind, WireMessage,
 };
-use crate::metrics::{MetricsHandle, PerNodeMetrics};
+use crate::metrics::{
+    FIRST_SEEN_FORCE_FLUSH, FirstSeenEntry, MetricsHandle, PerNodeMetrics, ns_since_epoch,
+};
 use crate::state::{SharedNodeState, WhichSide, compute_diff, originate_stamp};
 
 #[derive(Default, Serialize, Deserialize)]
@@ -58,9 +60,18 @@ pub struct SketchNode {
     cap_node_anns: u32,
     cap_chan_anns: u32,
     next_sketch_id: u32,
-    /// How long until end of run; used to schedule the one-shot
-    /// `flush_summary` event in `arm_per_peer_tickers`.
+    /// How long until end of run; used to schedule the final
+    /// `flush_summary` event.
     run_duration: Duration,
+    /// Periodic per-node metrics flush interval. Each firing drains
+    /// pending overflow events + sends a counter snapshot to the
+    /// aggregator (Parquet `node_counters` row + per-event overflow
+    /// rows). Zero disables periodic flushing.
+    flush_interval: Duration,
+    /// Deterministic per-node phase offset for the first periodic
+    /// flush. Spreads load across the interval so 11 875 nodes don't
+    /// all flush at the same sim instant.
+    flush_phase: Duration,
     #[serde(skip)]
     state: SharedNodeState,
     /// Plain-u64 per-node counters. Single-threaded mailbox access ⇒
@@ -83,6 +94,8 @@ impl SketchNode {
         reservoir_cap: u32,
         reservoir_seed: u64,
         run_duration: Duration,
+        flush_interval: Duration,
+        flush_phase: Duration,
         state: SharedNodeState,
         peer_states: Vec<SharedNodeState>,
         metrics: MetricsHandle,
@@ -101,6 +114,8 @@ impl SketchNode {
             cap_chan_anns,
             next_sketch_id: 0,
             run_duration,
+            flush_interval,
+            flush_phase,
             state,
             metrics_local: PerNodeMetrics::with_sketch_reservoirs(reservoir_cap, reservoir_seed),
             metrics,
@@ -141,24 +156,58 @@ impl SketchNode {
 impl SketchNode {
     /// Arm one periodic ticker per peer at its individual offset.
     /// Each tick fires three sketches (one per kind) to that peer.
-    /// Also schedule a one-shot `flush_summary` event at the end of
-    /// the run so the per-node counters get pushed to the aggregator.
+    /// Also schedules:
+    /// * a **periodic** `flush_summary` every `flush_interval` (starting
+    ///   at the per-node `flush_phase`) so memory stays bounded and the
+    ///   `node_counters.parquet` accumulates a time series;
+    /// * a **one-shot** `flush_summary` at `run_duration` so the final
+    ///   snapshot is guaranteed regardless of how the periodic
+    ///   schedule lines up with the deadline.
     #[nexosim(init)]
     async fn arm_per_peer_tickers(&mut self, cx: &Context<Self>) {
         for (i, &offset) in self.per_peer_offsets.iter().enumerate() {
             cx.schedule_periodic_event(offset, self.stagger, schedulable!(Self::tick_for_peer), i)
                 .expect("schedule per-peer sketch tick");
         }
+        if self.flush_interval > Duration::ZERO {
+            cx.schedule_periodic_event(
+                self.flush_phase,
+                self.flush_interval,
+                schedulable!(Self::flush_summary),
+                (),
+            )
+            .expect("schedule periodic sketch flush_summary");
+        }
         cx.schedule_event(self.run_duration, schedulable!(Self::flush_summary), ())
-            .expect("schedule sketch flush_summary");
+            .expect("schedule sketch final flush_summary");
     }
 
-    /// One-shot end-of-run handler: send the accumulated per-node
-    /// counters to the aggregator. Idempotent in spirit — the runner
-    /// only schedules it once.
+    /// Periodic + final flush. Drains:
+    ///   - the first-seen pending buffer (moved, not cloned)
+    ///   - the pending overflow events (moved)
+    ///   - a lightweight `NodeCounters` snapshot (~120 B copy)
+    /// At end-of-run (`run_duration`), additionally ships the
+    /// reservoir buffers once via `NodeReservoirDump`.
     #[nexosim(schedulable)]
-    async fn flush_summary(&mut self, _: ()) {
-        self.metrics.send_node_summary(self.idx, &self.metrics_local);
+    async fn flush_summary(&mut self, _: (), cx: &Context<Self>) {
+        let time_ns = ns_since_epoch(cx.time());
+
+        // Drain first-seen tuples — the busiest channel in the system.
+        // Moving the Vec means zero copies; reset to a fresh
+        // pre-allocated buffer for the next interval.
+        let first_seen = std::mem::take(&mut self.metrics_local.first_seen_pending);
+        self.metrics_local.first_seen_pending = Vec::with_capacity(FIRST_SEEN_FORCE_FLUSH);
+        self.metrics.send_first_seen_batch(self.idx, first_seen);
+
+        let counters = self.metrics_local.snapshot_counters();
+        let drained = std::mem::take(&mut self.metrics_local.overflow_events);
+        self.metrics_local.overflow_events = Vec::with_capacity(256);
+        self.metrics.send_counters_delta(self.idx, time_ns, counters, drained);
+
+        if time_ns >= self.run_duration.as_nanos() as u64 {
+            let (cu, na, ca) = self.metrics_local.take_reservoirs();
+            self.metrics.send_reservoir_dump(self.idx, cu, na, ca);
+        }
     }
 
     /// Inbound port. Three message kinds:
@@ -203,7 +252,11 @@ impl SketchNode {
         if !originate_stamp(&self.state, self.id, &mut msg, cx.time()) {
             return;
         }
-        self.metrics.record_first_seen(self.idx, &msg, cx.time());
+        self.metrics_local.first_seen_pending.push(FirstSeenEntry {
+            gossip: msg,
+            time_ns: ns_since_epoch(cx.time()),
+        });
+        self.metrics.bump_first_seen_count(1);
     }
 
     /// Per-peer ticker handler. Builds three sketches (one per kind)
@@ -222,7 +275,8 @@ impl SketchNode {
                 from: self.id,
                 kind,
                 capacity,
-                size_bytes: ((capacity as usize * 8).min(u16::MAX as usize)) as u16,
+                // Caller must limit capacity to 8192
+                size_bytes: (capacity as usize * 8) as u16,
             };
             self.metrics_local.sketches_sent += 1;
             self.metrics_local.bytes_out_sketch += sketch.size_bytes as u64;
@@ -262,13 +316,13 @@ impl SketchNode {
         kind_stats.b_only += diff.b_only_count as u64;
         kind_stats
             .rounds_intersection
-            .observe(diff.intersection.min(u32::MAX as usize) as u32);
+            .observe(diff.intersection as u32);
         kind_stats
             .rounds_a_only
-            .observe(diff.a_only_count.min(u32::MAX as usize) as u32);
+            .observe(diff.a_only_count as u32);
         kind_stats
             .rounds_b_only
-            .observe(diff.b_only_count.min(u32::MAX as usize) as u32);
+            .observe(diff.b_only_count as u32);
         if overflow {
             // Per-kind overflow count.
             match sketch.kind {
@@ -276,8 +330,8 @@ impl SketchNode {
                 SketchKind::NodeAnns => self.metrics_local.overflowed_node_anns += 1,
                 SketchKind::ChanAnns => self.metrics_local.overflowed_chan_anns += 1,
             }
-            let amount = (total_diff - sketch.capacity as usize).min(u32::MAX as usize) as u32;
-            let total_diff_u32 = total_diff.min(u32::MAX as usize) as u32;
+            let amount = (total_diff - sketch.capacity as usize) as u32;
+            let total_diff_u32 = total_diff as u32;
             let time_ns = _cx
                 .time()
                 .duration_since(MonotonicTime::EPOCH)
@@ -321,14 +375,15 @@ impl SketchNode {
         if gs.is_empty() {
             return;
         }
-        // Phase A: write lock held only for dedup + insert. Record
-        // duplicates inline (lock-free atomic); collect fresh indices
-        // so the scc bucket-lock storm of record_first_seen happens
-        // AFTER the write lock is released.
-        let mut fresh: Vec<usize> = Vec::with_capacity(gs.len());
+        // Phase A: write lock held only for dedup + insert. Fresh
+        // first-seen tuples are pushed straight into the per-node
+        // pending buffer (no event-queue write per gossip — the
+        // batched delivery to the aggregator happens via flush_summary).
+        let now_ns = ns_since_epoch(cx.time());
+        let mut fresh_count: usize = 0;
         {
             let mut m = self.state.chan_updates.write();
-            for (i, g) in gs.iter().enumerate() {
+            for g in gs {
                 let scid = g.scid.expect("ChannelUpdate must carry scid");
                 let key = crate::state::pack_cu_key(scid, g.direction);
                 let supersedes = m
@@ -337,16 +392,19 @@ impl SketchNode {
                     .unwrap_or(true);
                 if supersedes {
                     m.insert(key, (g.timestamp, g.size_bytes));
-                    fresh.push(i);
+                    self.metrics_local.first_seen_pending.push(FirstSeenEntry {
+                        gossip: *g,
+                        time_ns: now_ns,
+                    });
+                    fresh_count += 1;
                 } else {
                     self.metrics_local.duplicates += 1;
                 }
             }
         }
-        // Phase B: outside the lock.
-        let now = cx.time();
-        for &i in &fresh {
-            self.metrics.record_first_seen(self.idx, &gs[i], now);
+        if fresh_count > 0 {
+            self.metrics.bump_first_seen_count(fresh_count);
+            self.maybe_force_flush(cx);
         }
     }
 
@@ -354,10 +412,11 @@ impl SketchNode {
         if gs.is_empty() {
             return;
         }
-        let mut fresh: Vec<usize> = Vec::with_capacity(gs.len());
+        let now_ns = ns_since_epoch(cx.time());
+        let mut fresh_count: usize = 0;
         {
             let mut m = self.state.node_anns.write();
-            for (i, g) in gs.iter().enumerate() {
+            for g in gs {
                 let origin = g.origin.expect("NodeAnnouncement must carry origin");
                 let supersedes = m
                     .get(&origin)
@@ -365,15 +424,19 @@ impl SketchNode {
                     .unwrap_or(true);
                 if supersedes {
                     m.insert(origin, (g.timestamp, g.size_bytes));
-                    fresh.push(i);
+                    self.metrics_local.first_seen_pending.push(FirstSeenEntry {
+                        gossip: *g,
+                        time_ns: now_ns,
+                    });
+                    fresh_count += 1;
                 } else {
                     self.metrics_local.duplicates += 1;
                 }
             }
         }
-        let now = cx.time();
-        for &i in &fresh {
-            self.metrics.record_first_seen(self.idx, &gs[i], now);
+        if fresh_count > 0 {
+            self.metrics.bump_first_seen_count(fresh_count);
+            self.maybe_force_flush(cx);
         }
     }
 
@@ -381,21 +444,41 @@ impl SketchNode {
         if gs.is_empty() {
             return;
         }
-        let mut fresh: Vec<usize> = Vec::with_capacity(gs.len());
+        let now_ns = ns_since_epoch(cx.time());
+        let mut fresh_count: usize = 0;
         {
             let mut m = self.state.chan_anns.write();
-            for (i, g) in gs.iter().enumerate() {
+            for g in gs {
                 let scid = g.scid.expect("ChannelAnnouncement must carry scid");
                 if m.insert(scid, g.size_bytes).is_none() {
-                    fresh.push(i);
+                    self.metrics_local.first_seen_pending.push(FirstSeenEntry {
+                        gossip: *g,
+                        time_ns: now_ns,
+                    });
+                    fresh_count += 1;
                 } else {
                     self.metrics_local.duplicates += 1;
                 }
             }
         }
-        let now = cx.time();
-        for &i in &fresh {
-            self.metrics.record_first_seen(self.idx, &gs[i], now);
+        if fresh_count > 0 {
+            self.metrics.bump_first_seen_count(fresh_count);
+            self.maybe_force_flush(cx);
+        }
+    }
+
+    /// Schedule an early `flush_summary` if the first-seen pending
+    /// buffer is at the soft cap. Caps per-node memory regardless of
+    /// the configured `flush_interval`.
+    fn maybe_force_flush(&self, cx: &Context<Self>) {
+        if self.metrics_local.first_seen_pending.len() >= FIRST_SEEN_FORCE_FLUSH {
+            let _ = cx.schedule_event(
+                // 100 ms from now.
+                Duration::from_nanos(100000000),
+                schedulable!(Self::flush_summary),
+                (),
+            );
         }
     }
 }
+

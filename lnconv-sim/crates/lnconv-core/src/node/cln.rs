@@ -24,7 +24,9 @@ use nexosim::ports::Output;
 use serde::{Deserialize, Serialize};
 
 use crate::message::{Gossip, GossipBatch, GossipKind, NodeId, NodeIdx, WireMessage};
-use crate::metrics::{MetricsHandle, PerNodeMetrics};
+use crate::metrics::{
+    FIRST_SEEN_FORCE_FLUSH, FirstSeenEntry, MetricsHandle, PerNodeMetrics, ns_since_epoch,
+};
 use crate::state::{SharedNodeState, originate_stamp};
 
 #[derive(Default, Serialize, Deserialize)]
@@ -39,14 +41,17 @@ pub struct ClnNode {
     /// Absolute time of this node's *first* tick. Sampled uniformly in
     /// (0, stagger] by the runner — see `sim::sample_phase`.
     first_tick: Duration,
-    /// How long until end of run; used to schedule `flush_summary`.
+    /// How long until end of run; used to schedule the final
+    /// `flush_summary`.
     run_duration: Duration,
+    flush_interval: Duration,
+    flush_phase: Duration,
     #[serde(skip)]
     state: SharedNodeState,
     #[serde(skip)]
     #[allow(dead_code)]
     peer_states: Vec<SharedNodeState>,
-    /// Plain-u64 per-node counters; flushed at end-of-run.
+    /// Plain-u64 per-node counters; flushed periodically + at end-of-run.
     #[serde(skip)]
     metrics_local: PerNodeMetrics,
     #[serde(skip)]
@@ -63,6 +68,8 @@ impl ClnNode {
         stagger: Duration,
         first_tick: Duration,
         run_duration: Duration,
+        flush_interval: Duration,
+        flush_phase: Duration,
         state: SharedNodeState,
         peer_states: Vec<SharedNodeState>,
         metrics: MetricsHandle,
@@ -76,6 +83,8 @@ impl ClnNode {
             stagger,
             first_tick,
             run_duration,
+            flush_interval,
+            flush_phase,
             state,
             peer_states,
             metrics_local: PerNodeMetrics::default(),
@@ -97,22 +106,36 @@ impl ClnNode {
 
 #[Model]
 impl ClnNode {
-    /// One-time setup at sim start. Arms the periodic stagger tick:
-    /// first fire at `first_tick`, then every `stagger` thereafter.
-    /// Also schedules the one-shot end-of-run `flush_summary`.
+    /// One-time setup at sim start. Arms the periodic stagger tick +
+    /// the periodic and final `flush_summary` schedules.
     #[nexosim(init)]
     async fn arm_ticks(&mut self, cx: &Context<Self>) {
         cx.schedule_periodic_event(self.first_tick, self.stagger, schedulable!(Self::tick), ())
             .expect("schedule cln tick");
+        if self.flush_interval > Duration::ZERO {
+            cx.schedule_periodic_event(
+                self.flush_phase,
+                self.flush_interval,
+                schedulable!(Self::flush_summary),
+                (),
+            )
+            .expect("schedule periodic cln flush_summary");
+        }
         cx.schedule_event(self.run_duration, schedulable!(Self::flush_summary), ())
-            .expect("schedule cln flush_summary");
+            .expect("schedule cln final flush_summary");
     }
 
-    /// One-shot end-of-run handler: send the accumulated per-node
-    /// counters to the aggregator.
+    /// Periodic + final flush. Drains first-seen + overflow buffers
+    /// and sends a counter snapshot.
     #[nexosim(schedulable)]
-    async fn flush_summary(&mut self, _: ()) {
-        self.metrics.send_node_summary(self.idx, &self.metrics_local);
+    async fn flush_summary(&mut self, _: (), cx: &Context<Self>) {
+        let time_ns = ns_since_epoch(cx.time());
+        let first_seen = std::mem::take(&mut self.metrics_local.first_seen_pending);
+        self.metrics_local.first_seen_pending = Vec::with_capacity(FIRST_SEEN_FORCE_FLUSH);
+        self.metrics.send_first_seen_batch(self.idx, first_seen);
+        let counters = self.metrics_local.snapshot_counters();
+        let drained = std::mem::take(&mut self.metrics_local.overflow_events);
+        self.metrics.send_counters_delta(self.idx, time_ns, counters, drained);
     }
 
     /// Input port. BOLT 7 per-kind dedup, then queue for next tick.
@@ -138,7 +161,11 @@ impl ClnNode {
         if !originate_stamp(&self.state, self.id, &mut msg, cx.time()) {
             return;
         }
-        self.metrics.record_first_seen(self.idx, &msg, cx.time());
+        self.metrics_local.first_seen_pending.push(FirstSeenEntry {
+            gossip: msg,
+            time_ns: ns_since_epoch(cx.time()),
+        });
+        self.metrics.bump_first_seen_count(1);
         let n_peers = self.outputs.len() as u64;
         self.metrics_local.bytes_out_gossip += msg.size_bytes as u64 * n_peers;
         for out in &mut self.outputs {
@@ -178,10 +205,11 @@ impl ClnNode {
         if gs.is_empty() {
             return;
         }
-        let mut fresh: Vec<usize> = Vec::with_capacity(gs.len());
+        let now_ns = ns_since_epoch(cx.time());
+        let mut fresh_count: usize = 0;
         {
             let mut m = self.state.chan_updates.write();
-            for (i, g) in gs.iter().enumerate() {
+            for g in gs {
                 let scid = g.scid.expect("ChannelUpdate must carry scid");
                 let key = crate::state::pack_cu_key(scid, g.direction);
                 let supersedes = m
@@ -190,17 +218,20 @@ impl ClnNode {
                     .unwrap_or(true);
                 if supersedes {
                     m.insert(key, (g.timestamp, g.size_bytes));
-                    fresh.push(i);
+                    self.metrics_local.first_seen_pending.push(FirstSeenEntry {
+                        gossip: *g,
+                        time_ns: now_ns,
+                    });
+                    self.pending.push(*g);
+                    fresh_count += 1;
                 } else {
                     self.metrics_local.duplicates += 1;
                 }
             }
         }
-        let now = cx.time();
-        self.pending.reserve(fresh.len());
-        for &i in &fresh {
-            self.metrics.record_first_seen(self.idx, &gs[i], now);
-            self.pending.push(gs[i]);
+        if fresh_count > 0 {
+            self.metrics.bump_first_seen_count(fresh_count);
+            self.maybe_force_flush(cx);
         }
     }
 
@@ -208,10 +239,11 @@ impl ClnNode {
         if gs.is_empty() {
             return;
         }
-        let mut fresh: Vec<usize> = Vec::with_capacity(gs.len());
+        let now_ns = ns_since_epoch(cx.time());
+        let mut fresh_count: usize = 0;
         {
             let mut m = self.state.node_anns.write();
-            for (i, g) in gs.iter().enumerate() {
+            for g in gs {
                 let origin = g.origin.expect("NodeAnnouncement must carry origin");
                 let supersedes = m
                     .get(&origin)
@@ -219,17 +251,20 @@ impl ClnNode {
                     .unwrap_or(true);
                 if supersedes {
                     m.insert(origin, (g.timestamp, g.size_bytes));
-                    fresh.push(i);
+                    self.metrics_local.first_seen_pending.push(FirstSeenEntry {
+                        gossip: *g,
+                        time_ns: now_ns,
+                    });
+                    self.pending.push(*g);
+                    fresh_count += 1;
                 } else {
                     self.metrics_local.duplicates += 1;
                 }
             }
         }
-        let now = cx.time();
-        self.pending.reserve(fresh.len());
-        for &i in &fresh {
-            self.metrics.record_first_seen(self.idx, &gs[i], now);
-            self.pending.push(gs[i]);
+        if fresh_count > 0 {
+            self.metrics.bump_first_seen_count(fresh_count);
+            self.maybe_force_flush(cx);
         }
     }
 
@@ -237,23 +272,37 @@ impl ClnNode {
         if gs.is_empty() {
             return;
         }
-        let mut fresh: Vec<usize> = Vec::with_capacity(gs.len());
+        let now_ns = ns_since_epoch(cx.time());
+        let mut fresh_count: usize = 0;
         {
             let mut m = self.state.chan_anns.write();
-            for (i, g) in gs.iter().enumerate() {
+            for g in gs {
                 let scid = g.scid.expect("ChannelAnnouncement must carry scid");
                 if m.insert(scid, g.size_bytes).is_none() {
-                    fresh.push(i);
+                    self.metrics_local.first_seen_pending.push(FirstSeenEntry {
+                        gossip: *g,
+                        time_ns: now_ns,
+                    });
+                    self.pending.push(*g);
+                    fresh_count += 1;
                 } else {
                     self.metrics_local.duplicates += 1;
                 }
             }
         }
-        let now = cx.time();
-        self.pending.reserve(fresh.len());
-        for &i in &fresh {
-            self.metrics.record_first_seen(self.idx, &gs[i], now);
-            self.pending.push(gs[i]);
+        if fresh_count > 0 {
+            self.metrics.bump_first_seen_count(fresh_count);
+            self.maybe_force_flush(cx);
+        }
+    }
+
+    fn maybe_force_flush(&self, cx: &Context<Self>) {
+        if self.metrics_local.first_seen_pending.len() >= FIRST_SEEN_FORCE_FLUSH {
+            let _ = cx.schedule_event(
+                Duration::from_nanos(1),
+                schedulable!(Self::flush_summary),
+                (),
+            );
         }
     }
 }

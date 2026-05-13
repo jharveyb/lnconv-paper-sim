@@ -1,43 +1,42 @@
 //! Per-node + per-MsgId metrics surface used by every node model.
 //!
-//! Two categories of metric, with very different costs and threading
-//! shapes:
+//! Three categories of metric, each with a different threading shape:
 //!
 //! 1. **Per-node counters** (`bytes_in/out`, `duplicates`, `sketch_*`)
-//!    — owned **directly on the node model** as plain `u64` fields
-//!    inside [`PerNodeMetrics`]. Each node mailbox is single-threaded
-//!    by NeXosim, so plain `+=` is sound and avoids the per-event
-//!    atomic that the previous shared `Vec<AtomicU64>` version paid.
-//!    At end-of-run a one-shot `flush_summary` schedulable on each
-//!    node sends a [`MetricsEvent::NodeSummary`] to the aggregator,
-//!    which collects them into a Vec returned via the join handle.
+//!    — owned directly on the node model as plain `u64` fields inside
+//!    [`PerNodeMetrics`]. Each node mailbox is single-threaded by
+//!    NeXosim, so plain `+=` is sound and avoids any atomic. Periodic
+//!    + final flush schedulables snapshot them into a small
+//!    [`NodeCounters`] (~120 B) and ship via
+//!    [`MetricsEvent::NodeCountersDelta`].
 //!
 //! 2. **Per-MsgId in-flight tracking** (`record_first_seen`) — worker
 //!    threads write [`MetricsEvent::FirstSeen`] into a cloned
 //!    [`nexosim::ports::EventQueueWriter`]. A dedicated aggregator
-//!    thread (see [`crate::metrics_aggregator`]) drains the queue,
-//!    owns plain `HashMap`s for in-flight / supersession state, and
-//!    forwards finalised `MsgStats` rows to the existing Parquet
-//!    writer thread.
+//!    thread drains the queue, owns plain `HashMap`s for in-flight /
+//!    supersession state, and forwards finalised `MsgStats` rows to
+//!    the multi-Parquet writer thread.
+//!
+//! 3. **Per-(node, kind) reservoir samples** — accumulated on the
+//!    node's [`SketchKindStats`] reservoirs throughout the run, then
+//!    `mem::take`'d out via [`SketchKindStats::take_samples`] at
+//!    end-of-run and shipped via [`MetricsEvent::NodeReservoirDump`].
+//!    Buffers move (no clone); this is the key perf win over the
+//!    earlier full-`PerNodeMetrics::clone()` design.
 //!
 //! ## Lifecycle
 //!
-//! [`MetricsHandle::new`] spawns the aggregator (and the Parquet
-//! writer if a path is configured). Each node model holds a cloned
-//! `MetricsHandle` plus its own `PerNodeMetrics`.
-//! [`MetricsHandle::completed_stats`] sends the
-//! `FinalizeAndShutdown` sentinel, joins the aggregator, and returns
-//! the sorted `Vec<MsgStats>`. [`MetricsHandle::per_node_summary`]
-//! returns the aggregator's collected per-node Vec (also populated
-//! during the join).
+//! [`MetricsHandle::new`] spawns the aggregator + the multi-Parquet
+//! writer thread. Each node model holds a cloned `MetricsHandle` plus
+//! its own `PerNodeMetrics`. [`MetricsHandle::finalize_remaining`]
+//! sends the `FinalizeAndShutdown` sentinel, joins the aggregator,
+//! drops the run-time writer-tx clone, and joins the writer.
 //!
 //! ## `Default`
 //!
-//! `MetricsHandle::default()` returns a handle whose `events_tx` is
-//! `None` — `record_first_seen` and `send_node_summary` are no-ops.
-//! Used only to satisfy the `#[derive(Default)]` on each node `Model`
-//! struct (the runner always builds a real handle via `::new` once
-//! `n_nodes` is known).
+//! `MetricsHandle::default()` returns a no-op handle (no aggregator
+//! thread, no Parquet output). Used only to satisfy the
+//! `#[derive(Default)]` on each node `Model` struct.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -51,6 +50,10 @@ use parking_lot::Mutex;
 
 use crate::message::{Gossip, MsgId, NodeId, NodeIdx, SketchKind};
 use crate::metrics_aggregator::{self, MetricsEvent};
+use crate::reservoir::Reservoir;
+use crate::stats_writer::{
+    self, NodePubkeyRow, OutputPaths, RowSender, RunMetaRow, Writer, WriterRow,
+};
 
 pub struct Metrics {
     /// Live counter shared with the aggregator thread. Incremented by
@@ -58,34 +61,96 @@ pub struct Metrics {
     /// CLI summary.
     superseded_count: Arc<AtomicUsize>,
     /// Live counter incremented by `record_first_seen` on the worker
-    /// thread BEFORE the event is enqueued. Lets `drive_simulation`'s
-    /// progress lines reflect real-time event count without waiting
-    /// on the aggregator.
+    /// thread BEFORE the event is enqueued.
     total_first_seen: AtomicUsize,
-    /// Cloneable producer half of the aggregator's event queue. `None`
-    /// only on `Default::default()` (see module docstring).
+    /// Producer half of the aggregator's event queue. `None` only on
+    /// `Default::default()`.
     events_tx: Option<EventQueueWriter<MetricsEvent>>,
-    /// Aggregator thread join handle. `Mutex<Option>` so the shutdown
-    /// path can `take()` it once. Returns `(per-MsgId stats,
-    /// per-node summaries)` on join.
+    /// Aggregator thread join handle.
     aggregator_join: Mutex<Option<JoinHandle<AggregatorOutput>>>,
-    /// In-memory mirrors returned by the aggregator after shutdown.
-    /// `None` until the first `completed_stats()` / `per_node_summary()`
-    /// call, set by `finalize_remaining`.
+    /// In-memory `MsgStats` mirror returned by the aggregator after
+    /// shutdown. Populated by `finalize_remaining`.
     finalized_stats: Mutex<Option<Vec<MsgStats>>>,
-    finalized_per_node: Mutex<Option<Vec<NodeSummary>>>,
-    /// Path the aggregator's Parquet writer is writing to.
-    #[allow(dead_code)]
-    stats_path: Option<PathBuf>,
+    /// Sender into the multi-Parquet writer. Cloned from the `Writer`
+    /// owned in `writer_holder` and used directly for sim-init-time
+    /// run_meta + node_pubkey rows that bypass the aggregator. Wrapped
+    /// in Mutex<Option> so `finalize_remaining` can drop this clone
+    /// before joining the writer thread (otherwise the join blocks
+    /// forever waiting for this sender to drop — there's an Arc cycle
+    /// via MetricsHandle that would only break on full handle drop,
+    /// which happens AFTER `completed_stats()` returns).
+    writer_tx: Mutex<Option<RowSender>>,
+    /// Writer handle. Stashed so `completed_stats` can close it after
+    /// the aggregator finishes and recover the mirror.
+    writer_holder: Mutex<Option<Writer>>,
+    /// Tag prefix used to derive all six Parquet filenames. None when
+    /// no output was configured.
+    tag_prefix: Option<PathBuf>,
 }
 
-/// What the aggregator thread returns on join: per-MsgId finalised
-/// stats + per-node summaries.
-pub type AggregatorOutput = (Vec<MsgStats>, Vec<NodeSummary>);
+/// What the aggregator thread returns on join: the per-MsgId
+/// finalised stats mirror. Per-node data goes straight to the
+/// Parquet writers — the aggregator no longer keeps an in-memory
+/// per-node Vec.
+pub type AggregatorOutput = Vec<MsgStats>;
+
+/// Lightweight per-(node, flush) counter snapshot. Used as the
+/// payload of [`MetricsEvent::NodeCountersDelta`]; just plain integer
+/// fields — no `Vec` / `Reservoir`. About ~120 B; cheap to clone +
+/// send over the metrics event queue.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct NodeCounters {
+    pub bytes_in_sketch: u64,
+    pub bytes_out_sketch: u64,
+    pub bytes_in_gossip: u64,
+    pub bytes_out_gossip: u64,
+    pub duplicates: u64,
+    pub sketches_sent: u64,
+    pub sketches_received: u64,
+    pub overflowed_chan_updates: u64,
+    pub overflowed_node_anns: u64,
+    pub overflowed_chan_anns: u64,
+    pub chan_updates: KindCounters,
+    pub node_anns: KindCounters,
+    pub chan_anns: KindCounters,
+}
+
+/// Per-kind reconciliation running totals — the integer-only subset
+/// of [`SketchKindStats`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct KindCounters {
+    pub intersection: u64,
+    pub a_only: u64,
+    pub b_only: u64,
+}
+
+impl From<&SketchKindStats> for KindCounters {
+    fn from(s: &SketchKindStats) -> Self {
+        Self {
+            intersection: s.intersection,
+            a_only: s.a_only,
+            b_only: s.b_only,
+        }
+    }
+}
+
+/// Reservoir samples for one (node, kind) pair, moved out of a
+/// [`SketchKindStats`] at end-of-run via [`SketchKindStats::take_samples`].
+/// Used as the payload of [`MetricsEvent::NodeReservoirDump`].
+#[derive(Debug, Default)]
+pub struct KindReservoirSamples {
+    pub intersection: Vec<u32>,
+    pub a_only: Vec<u32>,
+    pub b_only: Vec<u32>,
+    /// Total observation count (so the writer can record how many
+    /// rounds the reservoir was sampled from, even when the reservoir
+    /// hit capacity).
+    pub total_seen: u64,
+}
 
 /// Per-sketch-kind reconciliation counters. Three of these on each
-/// [`PerNodeMetrics`] / [`NodeSummary`] — one per `SketchKind` — so
-/// the CLI can break down where the reconciliation work goes.
+/// [`PerNodeMetrics`] — one per `SketchKind` — so the DuckDB report
+/// can break down where the reconciliation work goes.
 ///
 /// Running totals (`intersection` / `a_only` / `b_only`) live as plain
 /// `u64`. Per-round samples ride in three [`Reservoir<u32>`]s so
@@ -102,13 +167,75 @@ pub struct SketchKindStats {
     pub rounds_b_only: Reservoir<u32>,
 }
 
+impl SketchKindStats {
+    /// Build with reservoirs of the given capacity, all seeded from
+    /// `seed` xor'd with a per-vec sub-seed for independence.
+    pub fn with_reservoir_capacity(cap: u32, seed: u64) -> Self {
+        let cap = cap as usize;
+        Self {
+            intersection: 0,
+            a_only: 0,
+            b_only: 0,
+            rounds_intersection: Reservoir::new(cap, seed ^ 0xA1),
+            rounds_a_only: Reservoir::new(cap, seed ^ 0xA2),
+            rounds_b_only: Reservoir::new(cap, seed ^ 0xA3),
+        }
+    }
+
+    /// Move the reservoir buffers out into a [`KindReservoirSamples`]
+    /// for end-of-run shipping. The reservoirs are reset to empty
+    /// capacity-0 placeholders afterwards (caller is done with the
+    /// node anyway). `total_seen` comes from the rounds_intersection
+    /// reservoir; all three rounds_* reservoirs share the same count
+    /// in lockstep.
+    pub fn take_samples(&mut self) -> KindReservoirSamples {
+        let total_seen = self.rounds_intersection.seen();
+        let intersection =
+            std::mem::replace(&mut self.rounds_intersection, Reservoir::new(0, 0))
+                .into_inner();
+        let a_only =
+            std::mem::replace(&mut self.rounds_a_only, Reservoir::new(0, 0)).into_inner();
+        let b_only =
+            std::mem::replace(&mut self.rounds_b_only, Reservoir::new(0, 0)).into_inner();
+        KindReservoirSamples {
+            intersection,
+            a_only,
+            b_only,
+            total_seen,
+        }
+    }
+}
+
+/// Stamped first-seen tuple. Buffered in
+/// [`PerNodeMetrics::first_seen_pending`] on every absorb / originate
+/// and shipped via [`MetricsEvent::FirstSeenBatch`] when the node's
+/// `flush_summary` schedulable fires (periodic OR force-flushed when
+/// the buffer hits `FIRST_SEEN_FORCE_FLUSH`).
+///
+/// `time_ns` is captured at the absorb site (`cx.time()`) BEFORE
+/// buffering, so the aggregator's per-(node, MsgId) percentile math
+/// sees the original sim-time of receipt regardless of how much later
+/// the event hits the queue.
+#[derive(Copy, Clone, Debug)]
+pub struct FirstSeenEntry {
+    pub gossip: Gossip,
+    pub time_ns: u64,
+}
+
+/// Per-node soft cap on the pending first-seen buffer. When a node's
+/// `first_seen_pending` Vec hits this size, the absorb call schedules
+/// an early `flush_summary` (next-ns delay) so memory is bounded
+/// regardless of flush interval. ~4096 × ~48 B ≈ 200 KB per node at
+/// the cap; ~2.4 GB across 11 875 LN-snapshot nodes during a brief
+/// spike (well within budget).
+pub const FIRST_SEEN_FORCE_FLUSH: usize = 4096;
 
 /// Single overflow event recorded by the receiver of a `Sketch` whose
 /// symmetric-diff size exceeded the sketch capacity. Accumulated in a
 /// small preallocated per-node buffer that gets drained every flush
 /// interval into the `overflow_events-<tag>.parquet` writer — no
 /// in-memory accumulation across the run.
-#[derive(Clone, Debug)]
+#[derive(Copy, Clone, Debug)]
 pub struct OverflowEvent {
     /// Sim time at which the overflow was observed.
     pub time_ns: u64,
@@ -127,9 +254,11 @@ pub struct OverflowEvent {
 
 /// Per-node accounting recorded directly on the node model. Plain
 /// `u64` fields — the NeXosim mailbox guarantees single-threaded
-/// access per node, so no atomics are needed. At end-of-run each
-/// node sends its accumulated counters to the aggregator via
-/// [`MetricsEvent::NodeSummary`].
+/// access per node, so no atomics are needed. Each periodic flush
+/// snapshots the counters into a [`NodeCounters`] (~120 B) via
+/// [`Self::snapshot_counters`]; the reservoir buffers and pending
+/// overflow events ride separately via dedicated events so the
+/// hot-path send is allocation-free.
 ///
 /// Bandwidth is split into two buckets: `*_sketch` for
 /// `WireMessage::Sketch` (reconciliation overhead) and `*_gossip` for
@@ -158,51 +287,71 @@ pub struct PerNodeMetrics {
     /// [`Self::with_sketch_reservoirs`] so steady-state pushes don't
     /// re-allocate.
     pub overflow_events: Vec<OverflowEvent>,
+    /// Pending per-(gossip, time_ns) first-seen tuples. Drained on
+    /// every `flush_summary` schedulable (periodic OR force-flushed
+    /// at [`FIRST_SEEN_FORCE_FLUSH`]) and shipped via
+    /// [`MetricsEvent::FirstSeenBatch`]. Preallocated to the cap so
+    /// steady-state pushes don't trigger Vec growth.
+    pub first_seen_pending: Vec<FirstSeenEntry>,
 }
 
-}
-
-/// Snapshot of a single node's counters, returned by
-/// [`MetricsHandle::per_node_summary`] for CLI reporting. Same shape
-/// as [`PerNodeMetrics`] plus the owning `NodeIdx`.
-#[derive(Clone, Debug, Default)]
-pub struct NodeSummary {
-    pub idx: NodeIdx,
-    pub bytes_in_sketch: u64,
-    pub bytes_out_sketch: u64,
-    pub bytes_in_gossip: u64,
-    pub bytes_out_gossip: u64,
-    pub duplicates: u64,
-    pub sketches_sent: u64,
-    pub sketches_received: u64,
-    pub overflowed_chan_updates: u64,
-    pub overflowed_node_anns: u64,
-    pub overflowed_chan_anns: u64,
-    pub chan_updates_stats: SketchKindStats,
-    pub node_anns_stats: SketchKindStats,
-    pub chan_anns_stats: SketchKindStats,
-    pub overflow_events: Vec<OverflowEvent>,
-}
-
-impl NodeSummary {
-    pub(crate) fn from_per_node(idx: NodeIdx, m: &PerNodeMetrics) -> Self {
+impl PerNodeMetrics {
+    /// Build with reservoirs sized for sketch nodes. Per-kind seed is
+    /// xor'd with a kind index so the three kinds' reservoirs sample
+    /// independently. The overflow buffer is preallocated to a small
+    /// capacity (a few hundred events fits one flush interval at the
+    /// LN-snapshot rate).
+    pub fn with_sketch_reservoirs(reservoir_cap: u32, seed: u64) -> Self {
         Self {
-            idx,
-            bytes_in_sketch: m.bytes_in_sketch,
-            bytes_out_sketch: m.bytes_out_sketch,
-            bytes_in_gossip: m.bytes_in_gossip,
-            bytes_out_gossip: m.bytes_out_gossip,
-            duplicates: m.duplicates,
-            sketches_sent: m.sketches_sent,
-            sketches_received: m.sketches_received,
-            overflowed_chan_updates: m.overflowed_chan_updates,
-            overflowed_node_anns: m.overflowed_node_anns,
-            overflowed_chan_anns: m.overflowed_chan_anns,
-            chan_updates_stats: m.chan_updates_stats.clone(),
-            node_anns_stats: m.node_anns_stats.clone(),
-            chan_anns_stats: m.chan_anns_stats.clone(),
-            overflow_events: m.overflow_events.clone(),
+            chan_updates_stats: SketchKindStats::with_reservoir_capacity(
+                reservoir_cap,
+                seed ^ 0x10C0,
+            ),
+            node_anns_stats: SketchKindStats::with_reservoir_capacity(
+                reservoir_cap,
+                seed ^ 0x10C1,
+            ),
+            chan_anns_stats: SketchKindStats::with_reservoir_capacity(
+                reservoir_cap,
+                seed ^ 0x10C2,
+            ),
+            overflow_events: Vec::with_capacity(256),
+            first_seen_pending: Vec::with_capacity(FIRST_SEEN_FORCE_FLUSH),
+            ..Default::default()
         }
+    }
+
+    /// Cheap counter-only snapshot used by each periodic flush. Touches
+    /// only the integer fields — no `Vec` / `Reservoir` clone. ~120 B
+    /// per call vs ~36 KB for a full `PerNodeMetrics::clone()`.
+    pub fn snapshot_counters(&self) -> NodeCounters {
+        NodeCounters {
+            bytes_in_sketch: self.bytes_in_sketch,
+            bytes_out_sketch: self.bytes_out_sketch,
+            bytes_in_gossip: self.bytes_in_gossip,
+            bytes_out_gossip: self.bytes_out_gossip,
+            duplicates: self.duplicates,
+            sketches_sent: self.sketches_sent,
+            sketches_received: self.sketches_received,
+            overflowed_chan_updates: self.overflowed_chan_updates,
+            overflowed_node_anns: self.overflowed_node_anns,
+            overflowed_chan_anns: self.overflowed_chan_anns,
+            chan_updates: KindCounters::from(&self.chan_updates_stats),
+            node_anns: KindCounters::from(&self.node_anns_stats),
+            chan_anns: KindCounters::from(&self.chan_anns_stats),
+        }
+    }
+
+    /// Move all three kinds' reservoir samples out. Called once per
+    /// node at end-of-run; reservoirs become empty placeholders.
+    pub fn take_reservoirs(
+        &mut self,
+    ) -> (KindReservoirSamples, KindReservoirSamples, KindReservoirSamples) {
+        (
+            self.chan_updates_stats.take_samples(),
+            self.node_anns_stats.take_samples(),
+            self.chan_anns_stats.take_samples(),
+        )
     }
 }
 
@@ -216,19 +365,46 @@ impl Default for MetricsHandle {
 }
 
 impl MetricsHandle {
-    pub fn new(n_nodes: usize, percentiles: Vec<f64>, stats_path: Option<PathBuf>) -> Self {
+    /// Build a handle bound to a tag prefix. The writer thread opens
+    /// six Parquet files keyed off `tag_prefix` and routes rows from
+    /// both the aggregator (msg_stats, node_counters, node_reservoirs,
+    /// overflow_events) and direct sends from `sim::run`
+    /// (run_meta, node_pubkey). `tag_prefix=None` disables Parquet
+    /// output entirely (used by the no-op `Default` handle).
+    pub fn new(
+        n_nodes: usize,
+        percentiles: Vec<f64>,
+        tag_prefix: Option<PathBuf>,
+    ) -> Self {
         let superseded_count = Arc::new(AtomicUsize::new(0));
-        // Skip aggregator spawn for the no-op Default handle (n=0). It
-        // saves a thread for every Model::default() that the serde
-        // derive constructs.
-        let (events_tx, aggregator_join) = if n_nodes == 0 {
-            (None, None)
-        } else {
+        // Skip aggregator + writer spawn for the no-op Default handle.
+        if n_nodes == 0 {
+            return Self(Arc::new(Metrics {
+                superseded_count,
+                total_first_seen: AtomicUsize::new(0),
+                events_tx: None,
+                aggregator_join: Mutex::new(None),
+                finalized_stats: Mutex::new(None),
+                writer_tx: Mutex::new(None),
+                writer_holder: Mutex::new(None),
+                tag_prefix: None,
+            }));
+        }
+        let (writer, writer_tx) = match &tag_prefix {
+            Some(tag) => {
+                let paths = OutputPaths::from_tag(tag);
+                let w = stats_writer::spawn(paths, percentiles.clone());
+                let tx = w.sender();
+                (Some(w), Some(tx))
+            }
+            None => (None, None),
+        };
+        let (events_tx, aggregator_join) = {
             let (tx, h) = metrics_aggregator::spawn(
                 n_nodes,
                 percentiles,
                 superseded_count.clone(),
-                stats_path.clone(),
+                writer_tx.clone(),
             );
             (Some(tx), Some(h))
         };
@@ -238,36 +414,100 @@ impl MetricsHandle {
             events_tx,
             aggregator_join: Mutex::new(aggregator_join),
             finalized_stats: Mutex::new(None),
-            finalized_per_node: Mutex::new(None),
-            stats_path,
+            writer_tx: Mutex::new(writer_tx),
+            writer_holder: Mutex::new(writer),
+            tag_prefix,
         }))
     }
 
-    /// Idempotent over `(MsgId, NodeIdx)` once the aggregator has seen
-    /// the event — duplicate slot stores are silently dropped on the
-    /// aggregator side. The worker-thread cost here is just the queue
-    /// write + one atomic increment for the live progress counter.
-    pub fn record_first_seen(&self, node: NodeIdx, gossip: &Gossip, t: MonotonicTime) {
-        if let Some(tx) = &self.0.events_tx {
-            tx.write(MetricsEvent::FirstSeen {
-                idx: node,
-                gossip: *gossip,
-                time_ns: ns_since_epoch(t),
-            });
-            self.0.total_first_seen.fetch_add(1, Ordering::Relaxed);
+    /// Sim-init helper: write the run-meta single-row Parquet. Called
+    /// from `sim::run` after topology metrics are computed. No-op on
+    /// the no-output handle.
+    pub fn write_run_meta(&self, row: RunMetaRow) {
+        if let Some(tx) = self.0.writer_tx.lock().as_ref() {
+            tx.send(WriterRow::RunMeta(row))
+                .expect("stats writer channel closed while sending RunMeta");
         }
     }
 
-    /// Send a node's accumulated `PerNodeMetrics` to the aggregator
-    /// at end-of-run. The node's [`flush_summary`] schedulable wraps
-    /// this call.
-    ///
-    /// [`flush_summary`]: crate::node
-    pub fn send_node_summary(&self, idx: NodeIdx, summary: &PerNodeMetrics) {
+    /// Sim-init helper: write per-node pubkey lookup rows (FromCsv
+    /// runs only). Sent as a batch; each row goes through the same
+    /// bounded channel.
+    pub fn write_node_pubkey_rows(&self, rows: Vec<NodePubkeyRow>) {
+        if let Some(tx) = self.0.writer_tx.lock().as_ref() {
+            for row in rows {
+                tx.send(WriterRow::NodePubkey(row))
+                    .expect("stats writer channel closed while sending NodePubkey");
+            }
+        }
+    }
+
+    /// Tag prefix used to derive the six Parquet paths (or `None`
+    /// when no output was configured). The CLI uses this to point the
+    /// DuckDB report module at the right files.
+    pub fn tag_prefix(&self) -> Option<PathBuf> {
+        self.0.tag_prefix.clone()
+    }
+
+    /// Bump the live "events processed" counter by `count`. Called on
+    /// the worker thread from each absorb / originate site after the
+    /// fresh-after-dedup count is known. The actual first-seen tuples
+    /// go through the per-node `first_seen_pending` buffer + the
+    /// node's `flush_summary` schedulable, NOT through the events
+    /// queue per absorption — this is the channel-batching win.
+    pub fn bump_first_seen_count(&self, count: usize) {
+        self.0.total_first_seen.fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// Ship a batch of stamped first-seen tuples drained from a
+    /// node's `first_seen_pending` buffer. Called by the node's
+    /// `flush_summary` (periodic + final + force-flush at cap).
+    pub fn send_first_seen_batch(&self, idx: NodeIdx, entries: Vec<FirstSeenEntry>) {
+        if entries.is_empty() {
+            return;
+        }
         if let Some(tx) = &self.0.events_tx {
-            tx.write(MetricsEvent::NodeSummary {
+            tx.write(MetricsEvent::FirstSeenBatch { idx, entries });
+        }
+    }
+
+    /// Send a periodic per-(node, flush) counters delta to the
+    /// aggregator. Cheap: `NodeCounters` is ~120 B (no Vec / Reservoir
+    /// inside). `drained_overflow` is moved by the caller via
+    /// `mem::take`. Called by each node's `flush_summary` schedulable.
+    pub fn send_counters_delta(
+        &self,
+        idx: NodeIdx,
+        time_ns: u64,
+        counters: NodeCounters,
+        drained_overflow: Vec<OverflowEvent>,
+    ) {
+        if let Some(tx) = &self.0.events_tx {
+            tx.write(MetricsEvent::NodeCountersDelta {
                 idx,
-                summary: summary.clone(),
+                time_ns,
+                counters,
+                drained_overflow,
+            });
+        }
+    }
+
+    /// Ship the per-(node, kind) reservoir buffers to the aggregator
+    /// once, at end-of-run. Buffers are moved (not cloned) — the
+    /// caller already drained them via `PerNodeMetrics::take_reservoirs`.
+    pub fn send_reservoir_dump(
+        &self,
+        idx: NodeIdx,
+        chan_updates: KindReservoirSamples,
+        node_anns: KindReservoirSamples,
+        chan_anns: KindReservoirSamples,
+    ) {
+        if let Some(tx) = &self.0.events_tx {
+            tx.write(MetricsEvent::NodeReservoirDump {
+                idx,
+                chan_updates,
+                node_anns,
+                chan_anns,
             });
         }
     }
@@ -283,19 +523,26 @@ impl MetricsHandle {
         self.0.superseded_count.load(Ordering::Relaxed)
     }
 
-    /// Send the `FinalizeAndShutdown` sentinel through the queue and
-    /// join the aggregator thread. Stashes both returned mirrors so
-    /// subsequent `completed_stats()` / `per_node_summary()` calls
-    /// return them. Idempotent.
+    /// Send the `FinalizeAndShutdown` sentinel, join the aggregator,
+    /// drop the run-time writer_tx clone, then close the writer
+    /// (flushes remaining buffers + closes all files). Idempotent.
     pub fn finalize_remaining(&self) {
         if let Some(tx) = &self.0.events_tx {
             tx.write(MetricsEvent::FinalizeAndShutdown);
         }
         if let Some(h) = self.0.aggregator_join.lock().take()
-            && let Ok((stats, per_node)) = h.join()
+            && let Ok(stats) = h.join()
         {
+            // Drop the run-time writer_tx clone BEFORE closing the
+            // Writer. Without this, the writer thread's join blocks
+            // forever — it waits for ALL sender clones to drop, but
+            // this one would otherwise live until Arc<Metrics> drops
+            // (which only happens after CLI is fully done).
+            drop(self.0.writer_tx.lock().take());
+            if let Some(writer) = self.0.writer_holder.lock().take() {
+                writer.close();
+            }
             *self.0.finalized_stats.lock() = Some(stats);
-            *self.0.finalized_per_node.lock() = Some(per_node);
         }
     }
 
@@ -312,19 +559,6 @@ impl MetricsHandle {
             .unwrap_or_default();
         v.sort_by_key(|s| s.id);
         v
-    }
-
-    /// Returns the per-node `NodeSummary` Vec collected by the
-    /// aggregator from each node's end-of-run flush event. First call
-    /// also performs `finalize_remaining` if the runner hasn't already.
-    /// The returned Vec is indexed by `NodeIdx`.
-    pub fn per_node_summary(&self) -> Vec<NodeSummary> {
-        self.finalize_remaining();
-        self.0
-            .finalized_per_node
-            .lock()
-            .clone()
-            .unwrap_or_default()
     }
 }
 
@@ -349,7 +583,7 @@ pub struct MsgStats {
 }
 
 #[inline]
-pub(crate) fn ns_since_epoch(t: MonotonicTime) -> u64 {
+pub fn ns_since_epoch(t: MonotonicTime) -> u64 {
     let d: Duration = t.duration_since(MonotonicTime::EPOCH);
     d.as_nanos() as u64
 }
@@ -389,17 +623,23 @@ mod tests {
     /// first-seen is recorded (aggregator-side dedup). The remaining
     /// recorders all enqueue events but the aggregator drops the
     /// duplicates.
+    ///
+    /// Post-batching: each "absorption" pushes one entry into a
+    /// per-node buffer; this test simulates 16 such batches arriving
+    /// at the aggregator and confirms the per-MsgId slot is only
+    /// stored once (idempotent in the aggregator).
     #[test]
-    fn concurrent_record_does_not_double_count() {
+    fn concurrent_batches_idempotent_per_slot() {
         let metrics = MetricsHandle::new(4, vec![1.0], None);
         let g = dummy_gossip(7, 100);
-        let t = MonotonicTime::EPOCH + Duration::from_micros(50);
+        let entry = FirstSeenEntry { gossip: g, time_ns: 50_000 };
 
         let mut handles = Vec::new();
         for _ in 0..16 {
             let m = metrics.clone();
             handles.push(thread::spawn(move || {
-                m.record_first_seen(0, &g, t);
+                m.send_first_seen_batch(0, vec![entry]);
+                m.bump_first_seen_count(1);
             }));
         }
         for h in handles {
@@ -409,49 +649,58 @@ mod tests {
         let _ = metrics.completed_stats();
     }
 
-    /// `send_node_summary` round-trips a NodeSummary through the
-    /// aggregator and into `per_node_summary()`.
+    /// `snapshot_counters` copies the integer fields cheaply without
+    /// touching the reservoir buffers — verifies the new hot-path
+    /// avoids the `PerNodeMetrics::clone()` cost.
     #[test]
-    fn node_summary_round_trips() {
-        let m = MetricsHandle::new(3, vec![1.0], None);
-        let mut s0 = PerNodeMetrics::default();
-        s0.bytes_in_gossip = 100;
-        s0.duplicates = 5;
-        let mut s2 = PerNodeMetrics::default();
-        s2.bytes_out_sketch = 200;
-        s2.sketches_sent = 7;
-        s2.chan_updates_stats.intersection = 11;
-        s2.chan_updates_stats.a_only = 3;
-        s2.chan_updates_stats.b_only = 5;
-        s2.overflowed_chan_updates = 1;
-        s2.overflow_events.push(OverflowEvent {
-            time_ns: 1_000_000,
-            receiver_idx: 2,
-            peer_id: 9999,
-            kind: SketchKind::ChanUpdates,
-            amount: 42,
-            total_diff: 64,
-        });
-        m.send_node_summary(0, &s0);
-        m.send_node_summary(2, &s2);
-        let summary = m.per_node_summary();
-        assert_eq!(summary.len(), 3);
-        assert_eq!(summary[0].bytes_in_gossip, 100);
-        assert_eq!(summary[0].duplicates, 5);
-        assert_eq!(summary[1].bytes_in_gossip, 0); // never sent
-        assert_eq!(summary[2].bytes_out_sketch, 200);
-        assert_eq!(summary[2].sketches_sent, 7);
-        assert_eq!(summary[2].chan_updates_stats.intersection, 11);
-        assert_eq!(summary[2].chan_updates_stats.a_only, 3);
-        assert_eq!(summary[2].chan_updates_stats.b_only, 5);
-        assert_eq!(summary[2].overflowed_chan_updates, 1);
-        assert_eq!(summary[2].overflow_events.len(), 1);
-        assert_eq!(summary[2].overflow_events[0].peer_id, 9999);
-        assert_eq!(summary[2].overflow_events[0].amount, 42);
+    fn snapshot_counters_copies_fields() {
+        let mut m = PerNodeMetrics::with_sketch_reservoirs(8, 42);
+        m.bytes_in_gossip = 100;
+        m.bytes_out_sketch = 200;
+        m.sketches_sent = 7;
+        m.chan_updates_stats.intersection = 11;
+        m.chan_updates_stats.a_only = 3;
+        m.chan_updates_stats.b_only = 5;
+        m.overflowed_chan_updates = 1;
+        // Push some reservoir samples to confirm they're NOT copied.
+        m.chan_updates_stats.rounds_intersection.observe(99);
+        let c = m.snapshot_counters();
+        assert_eq!(c.bytes_in_gossip, 100);
+        assert_eq!(c.bytes_out_sketch, 200);
+        assert_eq!(c.sketches_sent, 7);
+        assert_eq!(c.chan_updates.intersection, 11);
+        assert_eq!(c.chan_updates.a_only, 3);
+        assert_eq!(c.chan_updates.b_only, 5);
+        assert_eq!(c.overflowed_chan_updates, 1);
+        // Reservoir buffer wasn't touched — original observation is
+        // still there.
+        assert_eq!(m.chan_updates_stats.rounds_intersection.samples(), &[99]);
     }
 
-    /// N threads recording N distinct nodes for the same message ⇒
-    /// the message finalises exactly once and lands in completed_stats.
+    /// `take_reservoirs` moves the buffers out for end-of-run shipping
+    /// without cloning. The original reservoirs become capacity-0
+    /// placeholders.
+    #[test]
+    fn take_reservoirs_moves_buffers() {
+        let mut m = PerNodeMetrics::with_sketch_reservoirs(8, 42);
+        for i in 0..5u32 {
+            m.chan_updates_stats.rounds_intersection.observe(i);
+            m.chan_updates_stats.rounds_a_only.observe(i + 10);
+            m.chan_updates_stats.rounds_b_only.observe(i + 20);
+        }
+        let (cu, _na, _ca) = m.take_reservoirs();
+        assert_eq!(cu.intersection, vec![0, 1, 2, 3, 4]);
+        assert_eq!(cu.a_only, vec![10, 11, 12, 13, 14]);
+        assert_eq!(cu.b_only, vec![20, 21, 22, 23, 24]);
+        assert_eq!(cu.total_seen, 5);
+        // Original reservoir is now empty + capacity-0.
+        assert_eq!(m.chan_updates_stats.rounds_intersection.samples(), &[] as &[u32]);
+        assert_eq!(m.chan_updates_stats.rounds_intersection.capacity(), 0);
+    }
+
+    /// N threads each shipping a 1-entry batch from N distinct nodes
+    /// for the same message ⇒ the message finalises exactly once and
+    /// lands in completed_stats.
     #[test]
     fn concurrent_complete_finalises_once() {
         let n_nodes: usize = 32;
@@ -462,8 +711,12 @@ mod tests {
             let m = metrics.clone();
             let g = g.clone();
             handles.push(thread::spawn(move || {
-                let t = MonotonicTime::EPOCH + Duration::from_micros(i as u64);
-                m.record_first_seen(i as NodeIdx, &g, t);
+                let entry = FirstSeenEntry {
+                    gossip: *g,
+                    time_ns: i as u64 * 1_000,
+                };
+                m.send_first_seen_batch(i as NodeIdx, vec![entry]);
+                m.bump_first_seen_count(1);
             }));
         }
         for h in handles {

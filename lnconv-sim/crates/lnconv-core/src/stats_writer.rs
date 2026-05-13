@@ -1,89 +1,583 @@
-//! Background Parquet writer for finalised `MsgStats`.
+//! Background Parquet writer multiplex.
 //!
-//! At sim init the runner spawns one writer thread per `MetricsHandle`.
-//! The thread owns an `ArrowWriter<File>` plus an in-memory mirror of
-//! every `MsgStats` it received, then exits when the channel closes.
-//! `MetricsHandle::close_writer` drops the sender to signal EOF, joins
-//! the thread, and recovers the mirror Vec — that's what
-//! `completed_stats()` returns to the CLI.
+//! Five logical row kinds, each going to its own Parquet file sharing
+//! a common `<tag>` suffix:
 //!
-//! Schema (one row per finalised message):
+//! | file                                  | one row per                                |
+//! |---------------------------------------|--------------------------------------------|
+//! | `<tag>-msg_stats.parquet`             | finalised message                          |
+//! | `<tag>-node_counters.parquet`         | (node, flush_event) snapshot               |
+//! | `<tag>-node_reservoirs.parquet`       | (node, kind, reservoir_sample)             |
+//! | `<tag>-overflow_events.parquet`       | overflow event                             |
+//! | `<tag>-run_meta.parquet`              | single row, written once at sim init       |
+//! | `<tag>-node_pubkey.parquet`           | node, FromCsv runs only                    |
 //!
-//! ```text
-//! msg_id    : UInt64
-//! coverage  : UInt64
-//! n_nodes   : UInt64
-//! origin_ns : UInt64
-//! last_ns   : UInt64
-//! p25_ns    : UInt64?   (one nullable column per configured percentile;
-//!                       column name derived from the f64 fraction)
-//! ...
-//! ```
+//! All row types implement the [`WriteRow`] trait, which exposes a
+//! schema + a single `to_batch()` that uses Arrow's typed builders to
+//! avoid the per-column `collect::<Vec<_>>()` intermediates.
 //!
-//! `Option<Duration>::None` (CLAUDE.md invariant #6: partial coverage
-//! can't reach the percentile) writes as a NULL.
+//! One writer thread owns all six output streams. Events arrive via
+//! `mpsc::sync_channel(N)`; bounded so backpressure surfaces as
+//! wall-time rather than RAM growth. Send failures `panic!` — the
+//! writer crashing is a hard error, not silent corruption.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 
-use arrow_array::{ArrayRef, RecordBatch, UInt64Array};
+use arrow_array::builder::{
+    Float64Builder, StringBuilder, UInt8Builder, UInt32Builder, UInt64Builder,
+};
+use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
+use crossbeam_channel::{Receiver, Sender, bounded};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 
-use crate::metrics::MsgStats;
+use crate::message::{NodeId, NodeIdx};
+use crate::metrics::{MsgStats, NodeCounters, OverflowEvent};
 
-/// Rows are accumulated in memory in batches of this size, then
-/// flushed to the parquet writer as one `RecordBatch`. Keeps peak
-/// per-row dispatch overhead low while bounding memory.
-const FLUSH_EVERY: usize = 1024;
+/// Per-writer buffer flush threshold.
+const FLUSH_EVERY: usize = 65_536;
 
-/// Spawn the writer thread. Returns the sender end of the mpsc channel
-/// (cheap to clone via the surrounding `Arc<Metrics>` but typically
-/// held as a single shared sender) plus the join handle. On shutdown
-/// drop the sender and `.join()` the handle to recover the mirror.
-pub fn spawn(
-    path: PathBuf,
-    percentiles: Vec<f64>,
-) -> (Sender<MsgStats>, JoinHandle<Vec<MsgStats>>) {
-    let (tx, rx) = mpsc::channel::<MsgStats>();
-    let handle = thread::spawn(move || run(path, percentiles, rx));
-    (tx, handle)
+/// Channel depth between worker threads and the writer thread.
+/// Bounded so backpressure surfaces as wall-time, not RAM growth.
+const CHANNEL_DEPTH: usize = 1_000_000;
+
+/// Output multiplex sender — cloneable. `crossbeam_channel::Sender`
+/// is ~3× faster than `std::sync::mpsc::SyncSender` on multi-producer
+/// MPSC traffic; the aggregator + runner both feed this channel and
+/// the per-event overflow stream is high-throughput, so the switch
+/// matters.
+pub type RowSender = Sender<WriterRow>;
+
+/// All row variants the writer thread can route.
+#[derive(Debug)]
+pub enum WriterRow {
+    MsgStats(MsgStats),
+    NodeCounters(NodeCountersRow),
+    NodeReservoir(NodeReservoirRow),
+    OverflowEvent(OverflowEventRow),
+    RunMeta(RunMetaRow),
+    NodePubkey(NodePubkeyRow),
 }
 
-fn run(path: PathBuf, percentiles: Vec<f64>, rx: Receiver<MsgStats>) -> Vec<MsgStats> {
-    let schema = build_schema(&percentiles);
-    let file = File::create(&path).expect("create stats parquet");
-    let props = WriterProperties::builder()
-        .set_compression(Compression::ZSTD(ZstdLevel::default()))
-        .build();
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props))
-        .expect("init parquet ArrowWriter");
+// ---- row types ------------------------------------------------------
 
-    let mut buf: Vec<MsgStats> = Vec::with_capacity(FLUSH_EVERY);
-    let mut mirror: Vec<MsgStats> = Vec::new();
-    for stats in rx {
-        mirror.push(stats.clone());
-        buf.push(stats);
-        if buf.len() >= FLUSH_EVERY {
-            let rb = to_record_batch(&schema, &percentiles, &buf);
-            writer.write(&rb).expect("write parquet batch");
-            buf.clear();
+#[derive(Debug, Clone, Copy)]
+pub struct NodeCountersRow {
+    pub node_idx: NodeIdx,
+    pub time_ns: u64,
+    pub bytes_in_sketch: u64,
+    pub bytes_out_sketch: u64,
+    pub bytes_in_gossip: u64,
+    pub bytes_out_gossip: u64,
+    pub duplicates: u64,
+    pub sketches_sent: u64,
+    pub sketches_received: u64,
+    pub overflowed_chan_updates: u64,
+    pub overflowed_node_anns: u64,
+    pub overflowed_chan_anns: u64,
+    pub chan_updates_intersection: u64,
+    pub chan_updates_a_only: u64,
+    pub chan_updates_b_only: u64,
+    pub node_anns_intersection: u64,
+    pub node_anns_a_only: u64,
+    pub node_anns_b_only: u64,
+    pub chan_anns_intersection: u64,
+    pub chan_anns_a_only: u64,
+    pub chan_anns_b_only: u64,
+}
+
+impl NodeCountersRow {
+    pub fn from_counters(node_idx: NodeIdx, time_ns: u64, c: &NodeCounters) -> Self {
+        Self {
+            node_idx,
+            time_ns,
+            bytes_in_sketch: c.bytes_in_sketch,
+            bytes_out_sketch: c.bytes_out_sketch,
+            bytes_in_gossip: c.bytes_in_gossip,
+            bytes_out_gossip: c.bytes_out_gossip,
+            duplicates: c.duplicates,
+            sketches_sent: c.sketches_sent,
+            sketches_received: c.sketches_received,
+            overflowed_chan_updates: c.overflowed_chan_updates,
+            overflowed_node_anns: c.overflowed_node_anns,
+            overflowed_chan_anns: c.overflowed_chan_anns,
+            chan_updates_intersection: c.chan_updates.intersection,
+            chan_updates_a_only: c.chan_updates.a_only,
+            chan_updates_b_only: c.chan_updates.b_only,
+            node_anns_intersection: c.node_anns.intersection,
+            node_anns_a_only: c.node_anns.a_only,
+            node_anns_b_only: c.node_anns.b_only,
+            chan_anns_intersection: c.chan_anns.intersection,
+            chan_anns_a_only: c.chan_anns.a_only,
+            chan_anns_b_only: c.chan_anns.b_only,
         }
     }
-    if !buf.is_empty() {
-        let rb = to_record_batch(&schema, &percentiles, &buf);
-        writer.write(&rb).expect("write parquet batch (final)");
-    }
-    writer.close().expect("close parquet writer");
-    mirror
 }
 
-fn build_schema(percentiles: &[f64]) -> Arc<Schema> {
+#[derive(Debug, Clone, Copy)]
+pub struct NodeReservoirRow {
+    pub node_idx: NodeIdx,
+    /// `0 = chan_updates`, `1 = node_anns`, `2 = chan_anns`.
+    pub kind: u8,
+    pub intersection: u32,
+    pub a_only: u32,
+    pub b_only: u32,
+    pub total_seen: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct OverflowEventRow {
+    pub time_ns: u64,
+    pub receiver_idx: NodeIdx,
+    pub peer_id: NodeId,
+    pub kind: u8,
+    pub amount: u32,
+    pub total_diff: u32,
+}
+
+impl OverflowEventRow {
+    pub fn from_event(e: &OverflowEvent) -> Self {
+        Self {
+            time_ns: e.time_ns,
+            receiver_idx: e.receiver_idx,
+            peer_id: e.peer_id,
+            kind: e.kind.as_u8(),
+            amount: e.amount,
+            total_diff: e.total_diff,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RunMetaRow {
+    pub seed: u64,
+    pub n_nodes: u64,
+    pub mean_degree: f64,
+    pub min_degree: u64,
+    pub max_degree: u64,
+    pub diameter: u64,
+    pub mean_path_length: f64,
+    pub stagger_secs: f64,
+    pub capacity_chan_updates: u64,
+    pub capacity_node_anns: u64,
+    pub capacity_chan_anns: u64,
+    pub events_chan_update: u64,
+    pub events_node_ann: u64,
+    pub events_chan_ann: u64,
+    pub duration_seconds: u64,
+    pub predicted_p50_secs: f64,
+    pub predicted_p99_secs: f64,
+    pub predicted_p100_secs: f64,
+    pub algo: String,
+    pub topology_kind: String,
+    pub event_kind: String,
+}
+
+/// Inputs to [`RunMetaRow::new`]. Groups the integer config fields so
+/// the constructor signature stays under control.
+pub struct RunMetaInputs<'a> {
+    pub seed: u64,
+    pub duration_seconds: u64,
+    pub algo: &'a str,
+    pub topology_kind: &'a str,
+    pub event_kind: &'a str,
+    pub n_nodes: u64,
+    pub mean_degree: f64,
+    pub min_degree: u64,
+    pub max_degree: u64,
+    pub diameter: u64,
+    pub mean_path_length: f64,
+    pub capacity_chan_updates: u64,
+    pub capacity_node_anns: u64,
+    pub capacity_chan_anns: u64,
+    pub events_chan_update: u64,
+    pub events_node_ann: u64,
+    pub events_chan_ann: u64,
+}
+
+impl RunMetaRow {
+    /// Build a row from grouped inputs + optional sketch predictions.
+    /// `None` predictions encode "non-sketch run" structurally — the
+    /// `stagger_secs` / `predicted_*` fields land as 0.0 in the
+    /// Parquet, and the DuckDB report's `print_run_meta` only renders
+    /// the sketch block when `stagger_secs > 0`.
+    pub fn new(
+        inputs: RunMetaInputs<'_>,
+        predictions: Option<crate::spread_model::SketchPredictions>,
+    ) -> Self {
+        let (stagger_secs, p50, p99, p100) = match predictions {
+            Some(p) => (p.stagger_secs, p.p50_secs, p.p99_secs, p.p100_secs),
+            None => (0.0, 0.0, 0.0, 0.0),
+        };
+        Self {
+            seed: inputs.seed,
+            n_nodes: inputs.n_nodes,
+            mean_degree: inputs.mean_degree,
+            min_degree: inputs.min_degree,
+            max_degree: inputs.max_degree,
+            diameter: inputs.diameter,
+            mean_path_length: inputs.mean_path_length,
+            stagger_secs,
+            capacity_chan_updates: inputs.capacity_chan_updates,
+            capacity_node_anns: inputs.capacity_node_anns,
+            capacity_chan_anns: inputs.capacity_chan_anns,
+            events_chan_update: inputs.events_chan_update,
+            events_node_ann: inputs.events_node_ann,
+            events_chan_ann: inputs.events_chan_ann,
+            duration_seconds: inputs.duration_seconds,
+            predicted_p50_secs: p50,
+            predicted_p99_secs: p99,
+            predicted_p100_secs: p100,
+            algo: inputs.algo.to_string(),
+            topology_kind: inputs.topology_kind.to_string(),
+            event_kind: inputs.event_kind.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct NodePubkeyRow {
+    pub node_idx: NodeIdx,
+    pub node_id: NodeId,
+    pub pubkey: String,
+}
+
+impl NodePubkeyRow {
+    pub fn new(node_idx: NodeIdx, node_id: NodeId, pubkey: String) -> Self {
+        Self { node_idx, node_id, pubkey }
+    }
+}
+
+// ---- WriteRow trait + per-type impls --------------------------------
+
+/// A row that knows its own schema and how to build a `RecordBatch`
+/// from a slice of self. Lets the writer thread dispatch buffered
+/// flushes generically.
+pub trait WriteRow: Sized {
+    fn schema() -> Arc<Schema>;
+    fn to_batch(rows: &[Self]) -> RecordBatch;
+}
+
+impl WriteRow for NodeCountersRow {
+    fn schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("node_idx", DataType::UInt32, false),
+            Field::new("time_ns", DataType::UInt64, false),
+            Field::new("bytes_in_sketch", DataType::UInt64, false),
+            Field::new("bytes_out_sketch", DataType::UInt64, false),
+            Field::new("bytes_in_gossip", DataType::UInt64, false),
+            Field::new("bytes_out_gossip", DataType::UInt64, false),
+            Field::new("duplicates", DataType::UInt64, false),
+            Field::new("sketches_sent", DataType::UInt64, false),
+            Field::new("sketches_received", DataType::UInt64, false),
+            Field::new("overflowed_chan_updates", DataType::UInt64, false),
+            Field::new("overflowed_node_anns", DataType::UInt64, false),
+            Field::new("overflowed_chan_anns", DataType::UInt64, false),
+            Field::new("chan_updates_intersection", DataType::UInt64, false),
+            Field::new("chan_updates_a_only", DataType::UInt64, false),
+            Field::new("chan_updates_b_only", DataType::UInt64, false),
+            Field::new("node_anns_intersection", DataType::UInt64, false),
+            Field::new("node_anns_a_only", DataType::UInt64, false),
+            Field::new("node_anns_b_only", DataType::UInt64, false),
+            Field::new("chan_anns_intersection", DataType::UInt64, false),
+            Field::new("chan_anns_a_only", DataType::UInt64, false),
+            Field::new("chan_anns_b_only", DataType::UInt64, false),
+        ]))
+    }
+
+    fn to_batch(rows: &[Self]) -> RecordBatch {
+        let n = rows.len();
+        // Each builder appends directly into its own typed buffer —
+        // no intermediate Vec, no per-column `collect::<Vec<_>>`.
+        let mut node_idx = UInt32Builder::with_capacity(n);
+        let mut time_ns = UInt64Builder::with_capacity(n);
+        let mut bytes_in_sketch = UInt64Builder::with_capacity(n);
+        let mut bytes_out_sketch = UInt64Builder::with_capacity(n);
+        let mut bytes_in_gossip = UInt64Builder::with_capacity(n);
+        let mut bytes_out_gossip = UInt64Builder::with_capacity(n);
+        let mut duplicates = UInt64Builder::with_capacity(n);
+        let mut sketches_sent = UInt64Builder::with_capacity(n);
+        let mut sketches_received = UInt64Builder::with_capacity(n);
+        let mut o_cu = UInt64Builder::with_capacity(n);
+        let mut o_na = UInt64Builder::with_capacity(n);
+        let mut o_ca = UInt64Builder::with_capacity(n);
+        let mut cu_i = UInt64Builder::with_capacity(n);
+        let mut cu_a = UInt64Builder::with_capacity(n);
+        let mut cu_b = UInt64Builder::with_capacity(n);
+        let mut na_i = UInt64Builder::with_capacity(n);
+        let mut na_a = UInt64Builder::with_capacity(n);
+        let mut na_b = UInt64Builder::with_capacity(n);
+        let mut ca_i = UInt64Builder::with_capacity(n);
+        let mut ca_a = UInt64Builder::with_capacity(n);
+        let mut ca_b = UInt64Builder::with_capacity(n);
+        for r in rows {
+            node_idx.append_value(r.node_idx);
+            time_ns.append_value(r.time_ns);
+            bytes_in_sketch.append_value(r.bytes_in_sketch);
+            bytes_out_sketch.append_value(r.bytes_out_sketch);
+            bytes_in_gossip.append_value(r.bytes_in_gossip);
+            bytes_out_gossip.append_value(r.bytes_out_gossip);
+            duplicates.append_value(r.duplicates);
+            sketches_sent.append_value(r.sketches_sent);
+            sketches_received.append_value(r.sketches_received);
+            o_cu.append_value(r.overflowed_chan_updates);
+            o_na.append_value(r.overflowed_node_anns);
+            o_ca.append_value(r.overflowed_chan_anns);
+            cu_i.append_value(r.chan_updates_intersection);
+            cu_a.append_value(r.chan_updates_a_only);
+            cu_b.append_value(r.chan_updates_b_only);
+            na_i.append_value(r.node_anns_intersection);
+            na_a.append_value(r.node_anns_a_only);
+            na_b.append_value(r.node_anns_b_only);
+            ca_i.append_value(r.chan_anns_intersection);
+            ca_a.append_value(r.chan_anns_a_only);
+            ca_b.append_value(r.chan_anns_b_only);
+        }
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(node_idx.finish()),
+            Arc::new(time_ns.finish()),
+            Arc::new(bytes_in_sketch.finish()),
+            Arc::new(bytes_out_sketch.finish()),
+            Arc::new(bytes_in_gossip.finish()),
+            Arc::new(bytes_out_gossip.finish()),
+            Arc::new(duplicates.finish()),
+            Arc::new(sketches_sent.finish()),
+            Arc::new(sketches_received.finish()),
+            Arc::new(o_cu.finish()),
+            Arc::new(o_na.finish()),
+            Arc::new(o_ca.finish()),
+            Arc::new(cu_i.finish()),
+            Arc::new(cu_a.finish()),
+            Arc::new(cu_b.finish()),
+            Arc::new(na_i.finish()),
+            Arc::new(na_a.finish()),
+            Arc::new(na_b.finish()),
+            Arc::new(ca_i.finish()),
+            Arc::new(ca_a.finish()),
+            Arc::new(ca_b.finish()),
+        ];
+        RecordBatch::try_new(Self::schema(), columns).expect("NodeCountersRow batch")
+    }
+}
+
+impl WriteRow for NodeReservoirRow {
+    fn schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("node_idx", DataType::UInt32, false),
+            Field::new("kind", DataType::UInt8, false),
+            Field::new("intersection", DataType::UInt32, false),
+            Field::new("a_only", DataType::UInt32, false),
+            Field::new("b_only", DataType::UInt32, false),
+            Field::new("total_seen", DataType::UInt64, false),
+        ]))
+    }
+
+    fn to_batch(rows: &[Self]) -> RecordBatch {
+        let n = rows.len();
+        let mut node_idx = UInt32Builder::with_capacity(n);
+        let mut kind = UInt8Builder::with_capacity(n);
+        let mut intersection = UInt32Builder::with_capacity(n);
+        let mut a_only = UInt32Builder::with_capacity(n);
+        let mut b_only = UInt32Builder::with_capacity(n);
+        let mut total_seen = UInt64Builder::with_capacity(n);
+        for r in rows {
+            node_idx.append_value(r.node_idx);
+            kind.append_value(r.kind);
+            intersection.append_value(r.intersection);
+            a_only.append_value(r.a_only);
+            b_only.append_value(r.b_only);
+            total_seen.append_value(r.total_seen);
+        }
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(node_idx.finish()),
+            Arc::new(kind.finish()),
+            Arc::new(intersection.finish()),
+            Arc::new(a_only.finish()),
+            Arc::new(b_only.finish()),
+            Arc::new(total_seen.finish()),
+        ];
+        RecordBatch::try_new(Self::schema(), columns).expect("NodeReservoirRow batch")
+    }
+}
+
+impl WriteRow for OverflowEventRow {
+    fn schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("time_ns", DataType::UInt64, false),
+            Field::new("receiver_idx", DataType::UInt32, false),
+            Field::new("peer_id", DataType::UInt64, false),
+            Field::new("kind", DataType::UInt8, false),
+            Field::new("amount", DataType::UInt32, false),
+            Field::new("total_diff", DataType::UInt32, false),
+        ]))
+    }
+
+    fn to_batch(rows: &[Self]) -> RecordBatch {
+        let n = rows.len();
+        let mut time_ns = UInt64Builder::with_capacity(n);
+        let mut receiver_idx = UInt32Builder::with_capacity(n);
+        let mut peer_id = UInt64Builder::with_capacity(n);
+        let mut kind = UInt8Builder::with_capacity(n);
+        let mut amount = UInt32Builder::with_capacity(n);
+        let mut total_diff = UInt32Builder::with_capacity(n);
+        for r in rows {
+            time_ns.append_value(r.time_ns);
+            receiver_idx.append_value(r.receiver_idx);
+            peer_id.append_value(r.peer_id);
+            kind.append_value(r.kind);
+            amount.append_value(r.amount);
+            total_diff.append_value(r.total_diff);
+        }
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(time_ns.finish()),
+            Arc::new(receiver_idx.finish()),
+            Arc::new(peer_id.finish()),
+            Arc::new(kind.finish()),
+            Arc::new(amount.finish()),
+            Arc::new(total_diff.finish()),
+        ];
+        RecordBatch::try_new(Self::schema(), columns).expect("OverflowEventRow batch")
+    }
+}
+
+impl WriteRow for RunMetaRow {
+    fn schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("seed", DataType::UInt64, false),
+            Field::new("n_nodes", DataType::UInt64, false),
+            Field::new("mean_degree", DataType::Float64, false),
+            Field::new("min_degree", DataType::UInt64, false),
+            Field::new("max_degree", DataType::UInt64, false),
+            Field::new("diameter", DataType::UInt64, false),
+            Field::new("mean_path_length", DataType::Float64, false),
+            Field::new("stagger_secs", DataType::Float64, false),
+            Field::new("capacity_chan_updates", DataType::UInt64, false),
+            Field::new("capacity_node_anns", DataType::UInt64, false),
+            Field::new("capacity_chan_anns", DataType::UInt64, false),
+            Field::new("events_chan_update", DataType::UInt64, false),
+            Field::new("events_node_ann", DataType::UInt64, false),
+            Field::new("events_chan_ann", DataType::UInt64, false),
+            Field::new("duration_seconds", DataType::UInt64, false),
+            Field::new("predicted_p50_secs", DataType::Float64, false),
+            Field::new("predicted_p99_secs", DataType::Float64, false),
+            Field::new("predicted_p100_secs", DataType::Float64, false),
+            Field::new("algo", DataType::Utf8, false),
+            Field::new("topology_kind", DataType::Utf8, false),
+            Field::new("event_kind", DataType::Utf8, false),
+        ]))
+    }
+
+    fn to_batch(rows: &[Self]) -> RecordBatch {
+        let n = rows.len();
+        let mut seed = UInt64Builder::with_capacity(n);
+        let mut n_nodes = UInt64Builder::with_capacity(n);
+        let mut mean_degree = Float64Builder::with_capacity(n);
+        let mut min_degree = UInt64Builder::with_capacity(n);
+        let mut max_degree = UInt64Builder::with_capacity(n);
+        let mut diameter = UInt64Builder::with_capacity(n);
+        let mut mean_path_length = Float64Builder::with_capacity(n);
+        let mut stagger_secs = Float64Builder::with_capacity(n);
+        let mut cap_cu = UInt64Builder::with_capacity(n);
+        let mut cap_na = UInt64Builder::with_capacity(n);
+        let mut cap_ca = UInt64Builder::with_capacity(n);
+        let mut ev_cu = UInt64Builder::with_capacity(n);
+        let mut ev_na = UInt64Builder::with_capacity(n);
+        let mut ev_ca = UInt64Builder::with_capacity(n);
+        let mut duration = UInt64Builder::with_capacity(n);
+        let mut p50 = Float64Builder::with_capacity(n);
+        let mut p99 = Float64Builder::with_capacity(n);
+        let mut p100 = Float64Builder::with_capacity(n);
+        let mut algo = StringBuilder::with_capacity(n, n * 16);
+        let mut topology_kind = StringBuilder::with_capacity(n, n * 16);
+        let mut event_kind = StringBuilder::with_capacity(n, n * 16);
+        for r in rows {
+            seed.append_value(r.seed);
+            n_nodes.append_value(r.n_nodes);
+            mean_degree.append_value(r.mean_degree);
+            min_degree.append_value(r.min_degree);
+            max_degree.append_value(r.max_degree);
+            diameter.append_value(r.diameter);
+            mean_path_length.append_value(r.mean_path_length);
+            stagger_secs.append_value(r.stagger_secs);
+            cap_cu.append_value(r.capacity_chan_updates);
+            cap_na.append_value(r.capacity_node_anns);
+            cap_ca.append_value(r.capacity_chan_anns);
+            ev_cu.append_value(r.events_chan_update);
+            ev_na.append_value(r.events_node_ann);
+            ev_ca.append_value(r.events_chan_ann);
+            duration.append_value(r.duration_seconds);
+            p50.append_value(r.predicted_p50_secs);
+            p99.append_value(r.predicted_p99_secs);
+            p100.append_value(r.predicted_p100_secs);
+            algo.append_value(&r.algo);
+            topology_kind.append_value(&r.topology_kind);
+            event_kind.append_value(&r.event_kind);
+        }
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(seed.finish()),
+            Arc::new(n_nodes.finish()),
+            Arc::new(mean_degree.finish()),
+            Arc::new(min_degree.finish()),
+            Arc::new(max_degree.finish()),
+            Arc::new(diameter.finish()),
+            Arc::new(mean_path_length.finish()),
+            Arc::new(stagger_secs.finish()),
+            Arc::new(cap_cu.finish()),
+            Arc::new(cap_na.finish()),
+            Arc::new(cap_ca.finish()),
+            Arc::new(ev_cu.finish()),
+            Arc::new(ev_na.finish()),
+            Arc::new(ev_ca.finish()),
+            Arc::new(duration.finish()),
+            Arc::new(p50.finish()),
+            Arc::new(p99.finish()),
+            Arc::new(p100.finish()),
+            Arc::new(algo.finish()),
+            Arc::new(topology_kind.finish()),
+            Arc::new(event_kind.finish()),
+        ];
+        RecordBatch::try_new(Self::schema(), columns).expect("RunMetaRow batch")
+    }
+}
+
+impl WriteRow for NodePubkeyRow {
+    fn schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("node_idx", DataType::UInt32, false),
+            Field::new("node_id", DataType::UInt64, false),
+            Field::new("pubkey", DataType::Utf8, false),
+        ]))
+    }
+
+    fn to_batch(rows: &[Self]) -> RecordBatch {
+        let n = rows.len();
+        let mut node_idx = UInt32Builder::with_capacity(n);
+        let mut node_id = UInt64Builder::with_capacity(n);
+        let mut pubkey = StringBuilder::with_capacity(n, n * 66);
+        for r in rows {
+            node_idx.append_value(r.node_idx);
+            node_id.append_value(r.node_id);
+            pubkey.append_value(&r.pubkey);
+        }
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(node_idx.finish()),
+            Arc::new(node_id.finish()),
+            Arc::new(pubkey.finish()),
+        ];
+        RecordBatch::try_new(Self::schema(), columns).expect("NodePubkeyRow batch")
+    }
+}
+
+// `MsgStats` is special — its schema depends on the configured
+// percentile list — so it doesn't fit the parameterless `WriteRow`
+// trait. It gets its own pair of helpers below.
+
+fn build_msg_schema(percentiles: &[f64]) -> Arc<Schema> {
     let mut fields = vec![
         Field::new("msg_id", DataType::UInt64, false),
         Field::new("coverage", DataType::UInt64, false),
@@ -97,45 +591,194 @@ fn build_schema(percentiles: &[f64]) -> Arc<Schema> {
     Arc::new(Schema::new(fields))
 }
 
-fn to_record_batch(schema: &Arc<Schema>, percentiles: &[f64], rows: &[MsgStats]) -> RecordBatch {
+fn msg_to_batch(schema: &Arc<Schema>, percentiles: &[f64], rows: &[MsgStats]) -> RecordBatch {
     let n = rows.len();
-    let mut msg_id = Vec::with_capacity(n);
-    let mut coverage = Vec::with_capacity(n);
-    let mut n_nodes = Vec::with_capacity(n);
-    let mut origin_ns = Vec::with_capacity(n);
-    let mut last_ns = Vec::with_capacity(n);
-    let mut pct_cols: Vec<Vec<Option<u64>>> = (0..percentiles.len())
-        .map(|_| Vec::with_capacity(n))
+    let mut msg_id = UInt64Builder::with_capacity(n);
+    let mut coverage = UInt64Builder::with_capacity(n);
+    let mut n_nodes = UInt64Builder::with_capacity(n);
+    let mut origin_ns = UInt64Builder::with_capacity(n);
+    let mut last_ns = UInt64Builder::with_capacity(n);
+    let mut pct_builders: Vec<UInt64Builder> = (0..percentiles.len())
+        .map(|_| UInt64Builder::with_capacity(n))
         .collect();
     for r in rows {
-        msg_id.push(r.id);
-        coverage.push(r.coverage as u64);
-        n_nodes.push(r.n_nodes as u64);
-        origin_ns.push(r.origin_ns);
-        last_ns.push(r.last_ns);
-        // `MsgStats.percentiles` is `Vec<(f64, Option<Duration>)>`
-        // in the same order as the configured list — index by position.
+        msg_id.append_value(r.id);
+        coverage.append_value(r.coverage as u64);
+        n_nodes.append_value(r.n_nodes as u64);
+        origin_ns.append_value(r.origin_ns);
+        last_ns.append_value(r.last_ns);
         for (i, _p) in percentiles.iter().enumerate() {
             let v = r.percentiles.get(i).and_then(|(_, d)| *d).map(|d| d.as_nanos() as u64);
-            pct_cols[i].push(v);
+            pct_builders[i].append_option(v);
         }
     }
     let mut columns: Vec<ArrayRef> = vec![
-        Arc::new(UInt64Array::from(msg_id)),
-        Arc::new(UInt64Array::from(coverage)),
-        Arc::new(UInt64Array::from(n_nodes)),
-        Arc::new(UInt64Array::from(origin_ns)),
-        Arc::new(UInt64Array::from(last_ns)),
+        Arc::new(msg_id.finish()),
+        Arc::new(coverage.finish()),
+        Arc::new(n_nodes.finish()),
+        Arc::new(origin_ns.finish()),
+        Arc::new(last_ns.finish()),
     ];
-    for col in pct_cols {
-        columns.push(Arc::new(UInt64Array::from(col)));
+    for mut b in pct_builders {
+        columns.push(Arc::new(b.finish()));
     }
-    RecordBatch::try_new(schema.clone(), columns).expect("build RecordBatch")
+    RecordBatch::try_new(schema.clone(), columns).expect("MsgStats batch")
 }
 
-/// Column name for a percentile expressed as a 0..=1 fraction.
-///   `0.25` → `"p25_ns"`, `0.5` → `"p50_ns"`, `1.0` → `"p100_ns"`,
-///   `0.333` → `"p33_3_ns"` (one-decimal precision; `.` replaced by `_`).
+// ---- output paths + writer thread ----------------------------------
+
+/// All output filenames for a given tag prefix.
+pub struct OutputPaths {
+    pub tag: PathBuf,
+    pub msg_stats: PathBuf,
+    pub node_counters: PathBuf,
+    pub node_reservoirs: PathBuf,
+    pub overflow_events: PathBuf,
+    pub run_meta: PathBuf,
+    pub node_pubkey: PathBuf,
+}
+
+impl OutputPaths {
+    pub fn from_tag(tag: &Path) -> Self {
+        let s = tag.to_string_lossy();
+        let mk = |suffix: &str| PathBuf::from(format!("{s}-{suffix}.parquet"));
+        Self {
+            tag: tag.to_path_buf(),
+            msg_stats: mk("msg_stats"),
+            node_counters: mk("node_counters"),
+            node_reservoirs: mk("node_reservoirs"),
+            overflow_events: mk("overflow_events"),
+            run_meta: mk("run_meta"),
+            node_pubkey: mk("node_pubkey"),
+        }
+    }
+}
+
+pub struct Writer {
+    tx: RowSender,
+    join: Option<JoinHandle<()>>,
+}
+
+impl Writer {
+    pub fn sender(&self) -> RowSender {
+        self.tx.clone()
+    }
+
+    /// Close the channel and join the thread.
+    pub fn close(mut self) {
+        drop(self.tx);
+        if let Some(h) = self.join.take() {
+            h.join().expect("stats writer thread panicked");
+        }
+    }
+}
+
+pub fn spawn(paths: OutputPaths, percentiles: Vec<f64>) -> Writer {
+    let (tx, rx) = bounded::<WriterRow>(CHANNEL_DEPTH);
+    let join = thread::spawn(move || run(paths, percentiles, rx));
+    Writer { tx, join: Some(join) }
+}
+
+/// Per-stream state: an open writer + a typed in-memory buffer.
+/// `flush_now` flushes the buffer to Parquet via `R::to_batch`.
+struct Stream<R: WriteRow> {
+    writer: ArrowWriter<File>,
+    buf: Vec<R>,
+}
+
+impl<R: WriteRow> Stream<R> {
+    fn open(path: &Path) -> Self {
+        let file = File::create(path)
+            .unwrap_or_else(|e| panic!("create parquet file {}: {e}", path.display()));
+        let props = WriterProperties::builder()
+            .set_compression(Compression::ZSTD(ZstdLevel::default()))
+            .build();
+        let writer = ArrowWriter::try_new(file, R::schema(), Some(props))
+            .expect("init parquet ArrowWriter");
+        Self {
+            writer,
+            buf: Vec::with_capacity(FLUSH_EVERY),
+        }
+    }
+
+    fn push(&mut self, row: R) {
+        self.buf.push(row);
+        if self.buf.len() >= FLUSH_EVERY {
+            self.flush();
+        }
+    }
+
+    fn flush(&mut self) {
+        if self.buf.is_empty() {
+            return;
+        }
+        let rb = R::to_batch(&self.buf);
+        self.writer.write(&rb).expect("write parquet batch");
+        self.buf.clear();
+    }
+
+    fn close(mut self, label: &'static str) {
+        self.flush();
+        self.writer
+            .close()
+            .unwrap_or_else(|e| panic!("close parquet writer {label}: {e}"));
+    }
+}
+
+fn run(paths: OutputPaths, percentiles: Vec<f64>, rx: Receiver<WriterRow>) {
+    // msg_stats is bespoke (schema depends on `percentiles`).
+    let msg_schema = build_msg_schema(&percentiles);
+    let msg_props = WriterProperties::builder()
+        .set_compression(Compression::ZSTD(ZstdLevel::default()))
+        .build();
+    let msg_file = File::create(&paths.msg_stats)
+        .unwrap_or_else(|e| panic!("create msg_stats parquet: {e}"));
+    let mut msg_writer = ArrowWriter::try_new(msg_file, msg_schema.clone(), Some(msg_props))
+        .expect("init msg_stats ArrowWriter");
+    let mut msg_buf: Vec<MsgStats> = Vec::with_capacity(FLUSH_EVERY);
+
+    let mut counters: Stream<NodeCountersRow> = Stream::open(&paths.node_counters);
+    let mut reservoirs: Stream<NodeReservoirRow> = Stream::open(&paths.node_reservoirs);
+    let mut overflow: Stream<OverflowEventRow> = Stream::open(&paths.overflow_events);
+    let mut run_meta: Stream<RunMetaRow> = Stream::open(&paths.run_meta);
+    let mut pubkey: Stream<NodePubkeyRow> = Stream::open(&paths.node_pubkey);
+
+    let flush_msg = |w: &mut ArrowWriter<File>, buf: &mut Vec<MsgStats>| {
+        if buf.is_empty() {
+            return;
+        }
+        let rb = msg_to_batch(&msg_schema, &percentiles, buf);
+        w.write(&rb).expect("write msg_stats batch");
+        buf.clear();
+    };
+
+    for row in rx {
+        match row {
+            WriterRow::MsgStats(s) => {
+                msg_buf.push(s);
+                if msg_buf.len() >= FLUSH_EVERY {
+                    flush_msg(&mut msg_writer, &mut msg_buf);
+                }
+            }
+            WriterRow::NodeCounters(r) => counters.push(r),
+            WriterRow::NodeReservoir(r) => reservoirs.push(r),
+            WriterRow::OverflowEvent(r) => overflow.push(r),
+            WriterRow::RunMeta(r) => run_meta.push(r),
+            WriterRow::NodePubkey(r) => pubkey.push(r),
+        }
+    }
+
+    flush_msg(&mut msg_writer, &mut msg_buf);
+    msg_writer.close().expect("close msg_stats parquet");
+    counters.close("node_counters");
+    reservoirs.close("node_reservoirs");
+    overflow.close("overflow_events");
+    run_meta.close("run_meta");
+    pubkey.close("node_pubkey");
+}
+
+// ---- helpers --------------------------------------------------------
+
 fn pct_col(p: f64) -> String {
     let v = p * 100.0;
     let r = v.round();
@@ -147,13 +790,14 @@ fn pct_col(p: f64) -> String {
     }
 }
 
-/// Sanity helper used by the runner to compute a stable, human-readable
-/// output filename: `{topology}-{algo}-{event}-{YYYY-MM-DD-HHMM}.parquet`.
-pub fn auto_path(topology: &str, algo: &str, event: &str) -> PathBuf {
+/// `{topology}-{algo}-{event}-{YYYY-MM-DD-HHMM}` — shared filename
+/// stem all six Parquet files derive from.
+pub fn auto_tag(topology: &str, algo: &str, event: &str) -> PathBuf {
     let stamp = chrono::Local::now().format("%Y-%m-%d-%H%M").to_string();
-    PathBuf::from(format!("{topology}-{algo}-{event}-{stamp}.parquet"))
+    PathBuf::from(format!("{topology}-{algo}-{event}-{stamp}"))
 }
 
+/// Convenience used by tests to assert all 6 output files were produced.
 #[allow(dead_code)]
 pub(crate) fn file_exists(p: &Path) -> bool {
     p.exists()
@@ -175,5 +819,22 @@ mod tests {
     fn pct_col_fractional() {
         assert_eq!(pct_col(0.333), "p33_3_ns");
         assert_eq!(pct_col(0.9999), "p100_0_ns");
+    }
+
+    #[test]
+    fn output_paths_share_tag() {
+        let paths = OutputPaths::from_tag(Path::new("foo-bar-baz-2026-05-12"));
+        assert_eq!(
+            paths.msg_stats,
+            PathBuf::from("foo-bar-baz-2026-05-12-msg_stats.parquet")
+        );
+        assert_eq!(
+            paths.node_counters,
+            PathBuf::from("foo-bar-baz-2026-05-12-node_counters.parquet")
+        );
+        assert_eq!(
+            paths.overflow_events,
+            PathBuf::from("foo-bar-baz-2026-05-12-overflow_events.parquet")
+        );
     }
 }

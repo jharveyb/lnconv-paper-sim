@@ -150,6 +150,24 @@ impl SketchKind {
             SketchKind::ChanAnns => GossipKind::ChannelAnnouncement,
         }
     }
+
+    /// Stable 0/1/2 wire encoding for Parquet `kind` columns.
+    pub fn as_u8(self) -> u8 {
+        match self {
+            SketchKind::ChanUpdates => 0,
+            SketchKind::NodeAnns => 1,
+            SketchKind::ChanAnns => 2,
+        }
+    }
+
+    /// Human-readable padded label for table headers.
+    pub fn as_label(self) -> &'static str {
+        match self {
+            SketchKind::ChanUpdates => "chan_updates",
+            SketchKind::NodeAnns => "node_anns   ",
+            SketchKind::ChanAnns => "chan_anns   ",
+        }
+    }
 }
 
 /// Minisketch-style summary of a node's state for one kind. The
