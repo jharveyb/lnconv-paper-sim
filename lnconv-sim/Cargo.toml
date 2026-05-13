@@ -38,6 +38,13 @@ divan = "0.1"
 
 # Add more perf-related settings
 [profile.release]
+# defaults
+opt-level = 3
+strip = "none"
+debug-assertions = false
+overflow-checks = false
+
+# custom
 lto = "fat"
 codegen-units = 1
 panic = "abort"
@@ -47,6 +54,8 @@ debug = "line-tables-only"
 # what the production binary actually runs. Full debuginfo (vs
 # release's `line-tables-only`) helps Divan / samply when drilling
 # into inlined call sites during bench profiling.
-[profile.bench]
+# Use an unreserved name (not bench) so hopefully we have a separate
+# build output dir and don't step on release builds.
+[profile.bench-release]
 inherits = "release"
 debug = "full"
