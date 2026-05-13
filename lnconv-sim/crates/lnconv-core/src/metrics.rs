@@ -7,8 +7,8 @@
 //!    [`PerNodeMetrics`]. Each node mailbox is single-threaded by
 //!    NeXosim, so plain `+=` is sound and avoids any atomic. Periodic
 //!    + final flush schedulables snapshot them into a small
-//!    [`NodeCounters`] (~120 B) and ship via
-//!    [`MetricsEvent::NodeCountersDelta`].
+//!      [`NodeCounters`] (~120 B) and ship via
+//!      [`MetricsEvent::NodeCountersDelta`].
 //!
 //! 2. **Per-MsgId in-flight tracking** (`record_first_seen`) — worker
 //!    threads write [`MetricsEvent::FirstSeen`] into a cloned

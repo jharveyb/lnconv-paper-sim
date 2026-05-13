@@ -185,7 +185,7 @@ impl ClnNode {
         let bytes_per_peer: u64 = drained.iter().map(|g| g.size_bytes as u64).sum();
         let n_peers = self.outputs.len() as u64;
         self.metrics_local.bytes_out_gossip += bytes_per_peer * n_peers;
-        let arc_batch = Arc::new(GossipBatch::from_mixed(drained));
+        let arc_batch = Arc::new(GossipBatch::from_mixed(&drained));
         for out in &mut self.outputs {
             out.send(WireMessage::Batch(arc_batch.clone())).await;
         }

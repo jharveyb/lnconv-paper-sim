@@ -210,7 +210,7 @@ impl LndNode {
         );
         let chunks: Vec<Arc<GossipBatch>> = drained
             .chunks(sub)
-            .map(|c| Arc::new(GossipBatch::from_mixed(c.to_vec())))
+            .map(|c| Arc::new(GossipBatch::from_mixed(c)))
             .collect();
         let mut iter = chunks.into_iter();
         if let Some(first) = iter.next() {

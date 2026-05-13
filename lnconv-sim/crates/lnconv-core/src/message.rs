@@ -202,6 +202,7 @@ pub struct Sketch {
 /// `Vec<Gossip>` produces on heterogeneous batches.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct GossipBatch {
+    wire_size: u64,
     pub chan_updates: Vec<Gossip>,
     pub node_anns: Vec<Gossip>,
     pub chan_anns: Vec<Gossip>,
@@ -216,13 +217,21 @@ impl GossipBatch {
         self.chan_updates.is_empty() && self.node_anns.is_empty() && self.chan_anns.is_empty()
     }
 
+    pub fn new_with_size_estimate(input_size: usize) -> Self {
+        GossipBatch {
+            wire_size: 0,
+            chan_updates: Vec::with_capacity(input_size / 2),
+            node_anns: Vec::with_capacity(input_size / 2),
+            chan_anns: Vec::with_capacity(input_size / 2)
+        }
+    }
+
     /// Sum of `Gossip.size_bytes` across all kinds. Used by
     /// `WireMessage::wire_size`.
+    /// Correct because we only build GossipBatch with the constructors below,
+    /// and those are computing the total size correctly.
     pub fn wire_size(&self) -> u64 {
-        let cu_size = self.chan_updates.iter().map(|g| g.size_bytes as u64).sum::<u64>();
-        let ca_size = self.chan_anns.iter().map(|g| g.size_bytes as u64).sum::<u64>();
-        let na_size = self.node_anns.iter().map(|g| g.size_bytes as u64 ).sum::<u64>();
-        cu_size + ca_size + na_size
+        self.wire_size
     }
 
     /// Build a `GossipBatch` from a mixed `Vec<Gossip>` by
@@ -230,14 +239,15 @@ impl GossipBatch {
     /// `pending: Vec<Gossip>` mixes kinds, and by anywhere a
     /// single-kind Vec needs wrapping (the other two kind Vecs
     /// stay empty).
-    pub fn from_mixed(gossips: Vec<Gossip>) -> Self {
-        let mut out = GossipBatch::default();
+    pub fn from_mixed(gossips: &[Gossip]) -> Self {
+        let mut out = GossipBatch::new_with_size_estimate(gossips.len());
         for g in gossips {
             match g.kind {
-                GossipKind::ChannelUpdate => out.chan_updates.push(g),
-                GossipKind::NodeAnnouncement => out.node_anns.push(g),
-                GossipKind::ChannelAnnouncement => out.chan_anns.push(g),
+                GossipKind::ChannelUpdate => out.chan_updates.push(*g),
+                GossipKind::NodeAnnouncement => out.node_anns.push(*g),
+                GossipKind::ChannelAnnouncement => out.chan_anns.push(*g),
             }
+            out.wire_size += g.size_bytes as u64;
         }
         out
     }
@@ -251,6 +261,7 @@ impl GossipBatch {
     pub fn from_mixed_for_kind(gossips: Vec<Gossip>, kind: GossipKind) -> Self {
         debug_assert!(gossips.iter().all(|g| g.kind == kind));
         let mut out = GossipBatch::default();
+        let total_size = gossips.iter().fold(0, |sum, g| sum + g.size_bytes as u64);
         match kind {
             GossipKind::ChannelUpdate => {
                 out.chan_updates = gossips;
@@ -262,19 +273,7 @@ impl GossipBatch {
                 out.chan_anns = gossips;
             }
         }
-        out
-    }
-
-    /// One-shot batch wrapping a single gossip in the right slot.
-    /// Useful when a sketch reply has a single newer item.
-    #[allow(dead_code)]
-    pub fn from_one(g: Gossip) -> Self {
-        let mut out = GossipBatch::default();
-        match g.kind {
-            GossipKind::ChannelUpdate => out.chan_updates.push(g),
-            GossipKind::NodeAnnouncement => out.node_anns.push(g),
-            GossipKind::ChannelAnnouncement => out.chan_anns.push(g),
-        }
+        out.wire_size = total_size;
         out
     }
 }
@@ -377,7 +376,7 @@ mod tests {
             mk(GossipKind::ChannelAnnouncement),
             mk(GossipKind::ChannelUpdate),
         ];
-        let b = GossipBatch::from_mixed(mixed);
+        let b = GossipBatch::from_mixed(&mixed);
         assert_eq!(b.chan_updates.len(), 2);
         assert_eq!(b.node_anns.len(), 1);
         assert_eq!(b.chan_anns.len(), 1);

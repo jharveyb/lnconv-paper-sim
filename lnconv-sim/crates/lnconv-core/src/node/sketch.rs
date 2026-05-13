@@ -268,7 +268,7 @@ impl SketchNode {
             (SketchKind::NodeAnns, self.cap_node_anns),
             (SketchKind::ChanAnns, self.cap_chan_anns),
         ] {
-            self.next_sketch_id = self.next_sketch_id.wrapping_add(1);
+            self.next_sketch_id += 1;
             let id = self.next_sketch_id as MsgId;
             let sketch = Sketch {
                 id,
@@ -473,8 +473,7 @@ impl SketchNode {
     fn maybe_force_flush(&self, cx: &Context<Self>) {
         if self.metrics_local.first_seen_pending.len() >= FIRST_SEEN_FORCE_FLUSH {
             let _ = cx.schedule_event(
-                // 100 ms from now.
-                Duration::from_nanos(100000000),
+                Duration::from_nanos(1),
                 schedulable!(Self::flush_summary),
                 (),
             );
