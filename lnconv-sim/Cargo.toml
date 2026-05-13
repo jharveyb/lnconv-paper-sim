@@ -34,3 +34,19 @@ glob = "0.3"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 duckdb = { version = "1", features = ["bundled", "parquet"] }
 crossbeam-channel = "0.5"
+divan = "0.1"
+
+# Add more perf-related settings
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = "line-tables-only"
+
+# Bench profile mirrors release-tuning so microbench results reflect
+# what the production binary actually runs. Full debuginfo (vs
+# release's `line-tables-only`) helps Divan / samply when drilling
+# into inlined call sites during bench profiling.
+[profile.bench]
+inherits = "release"
+debug = "full"

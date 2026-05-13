@@ -4,3 +4,6 @@ Cargo.lock
 
 # Per-run stats output (auto-named: {topology}-{algo}-{event}-{stamp}.parquet)
 /*.parquet
+
+# Profiler artifacts (samply JSON, flamegraph SVG, etc.) — see PERF.md.
+/perf/

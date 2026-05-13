@@ -27,3 +27,12 @@ glob.workspace = true
 chrono.workspace = true
 duckdb.workspace = true
 crossbeam-channel.workspace = true
+
+[dev-dependencies]
+divan.workspace = true
+
+# Microbench harness for `compute_diff`. Run with:
+#   cargo bench -p lnconv-core --bench diff
+[[bench]]
+name = "diff"
+harness = false
