@@ -208,15 +208,6 @@ pub struct GossipBatch {
 }
 
 impl GossipBatch {
-    /// Iterate every gossip in chan_updates → node_anns → chan_anns
-    /// order. Receivers that don't care about kind use this.
-    pub fn iter(&self) -> impl Iterator<Item = &Gossip> + '_ {
-        self.chan_updates
-            .iter()
-            .chain(self.node_anns.iter())
-            .chain(self.chan_anns.iter())
-    }
-
     pub fn len(&self) -> usize {
         self.chan_updates.len() + self.node_anns.len() + self.chan_anns.len()
     }
@@ -228,7 +219,10 @@ impl GossipBatch {
     /// Sum of `Gossip.size_bytes` across all kinds. Used by
     /// `WireMessage::wire_size`.
     pub fn wire_size(&self) -> u64 {
-        self.iter().map(|g| g.size_bytes as u64).sum()
+        let cu_size = self.chan_updates.iter().map(|g| g.size_bytes as u64).sum::<u64>();
+        let ca_size = self.chan_anns.iter().map(|g| g.size_bytes as u64).sum::<u64>();
+        let na_size = self.node_anns.iter().map(|g| g.size_bytes as u64 ).sum::<u64>();
+        cu_size + ca_size + na_size
     }
 
     /// Build a `GossipBatch` from a mixed `Vec<Gossip>` by
@@ -299,17 +293,6 @@ pub enum WireMessage {
 }
 
 impl WireMessage {
-    /// Iterate over the inner `Gossip`s regardless of variant. `Sketch`
-    /// yields the empty iterator — sketches are protocol metadata,
-    /// not gossips.
-    pub fn iter_gossips(&self) -> Box<dyn Iterator<Item = &Gossip> + '_> {
-        match self {
-            WireMessage::Single(g) => Box::new(std::iter::once(g)),
-            WireMessage::Batch(b) => Box::new(b.iter()),
-            WireMessage::Sketch(_) => Box::new(std::iter::empty()),
-        }
-    }
-
     /// On-the-wire byte size used for bandwidth metrics. For `Single`
     /// it's the inner gossip's `size_bytes`; for `Batch` it's the
     /// sum of inner gossips' sizes; for `Sketch` it's `Sketch.size_bytes`.

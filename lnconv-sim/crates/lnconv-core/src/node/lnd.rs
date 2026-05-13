@@ -165,9 +165,9 @@ impl LndNode {
                 self.absorb_one(g_copy, cx);
             }
             WireMessage::Batch(batch) => {
+                self.absorb_chan_anns(&batch.chan_anns, cx);
                 self.absorb_chan_updates(&batch.chan_updates, cx);
                 self.absorb_node_anns(&batch.node_anns, cx);
-                self.absorb_chan_anns(&batch.chan_anns, cx);
             }
             WireMessage::Sketch(_) => {}
         }
