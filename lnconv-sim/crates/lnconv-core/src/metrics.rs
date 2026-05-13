@@ -425,8 +425,7 @@ impl MetricsHandle {
     /// the no-output handle.
     pub fn write_run_meta(&self, row: RunMetaRow) {
         if let Some(tx) = self.0.writer_tx.lock().as_ref() {
-            tx.send(WriterRow::RunMeta(row))
-                .expect("stats writer channel closed while sending RunMeta");
+            tx.send(WriterRow::RunMeta(row));
         }
     }
 
@@ -436,8 +435,7 @@ impl MetricsHandle {
     pub fn write_node_pubkey_rows(&self, rows: Vec<NodePubkeyRow>) {
         if let Some(tx) = self.0.writer_tx.lock().as_ref() {
             for row in rows {
-                tx.send(WriterRow::NodePubkey(row))
-                    .expect("stats writer channel closed while sending NodePubkey");
+                tx.send(WriterRow::NodePubkey(row));
             }
         }
     }

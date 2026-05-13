@@ -1,6 +1,6 @@
-//! Background Parquet writer multiplex.
+//! Background Parquet writer multiplex — one OS thread per file.
 //!
-//! Five logical row kinds, each going to its own Parquet file sharing
+//! Six logical row kinds, each going to its own Parquet file sharing
 //! a common `<tag>` suffix:
 //!
 //! | file                                  | one row per                                |
@@ -16,10 +16,15 @@
 //! schema + a single `to_batch()` that uses Arrow's typed builders to
 //! avoid the per-column `collect::<Vec<_>>()` intermediates.
 //!
-//! One writer thread owns all six output streams. Events arrive via
-//! `mpsc::sync_channel(N)`; bounded so backpressure surfaces as
-//! wall-time rather than RAM growth. Send failures `panic!` — the
-//! writer crashing is a hard error, not silent corruption.
+//! Each output file gets its own bounded `crossbeam_channel` and its
+//! own writer OS thread. Arrow encoding + ZSTD compression therefore
+//! run in parallel across files instead of being serialised behind a
+//! single multiplex thread — wall clock collapses from
+//! `Σ per-file encode time` to `max(per-file encode time)`. Hot files
+//! (`msg_stats`, `overflow_events`, `node_counters`) use `ZstdLevel(1)`
+//! for ~2× compression throughput; the cold files keep the default
+//! level. Send failures `panic!` — the writer crashing is a hard error,
+//! not silent corruption.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -39,21 +44,65 @@ use parquet::file::properties::WriterProperties;
 use crate::message::{NodeId, NodeIdx};
 use crate::metrics::{MsgStats, NodeCounters, OverflowEvent};
 
-/// Per-writer buffer flush threshold.
-const FLUSH_EVERY: usize = 65_536;
+/// Per-writer buffer flush threshold. Each typed `Stream<R>` buffers
+/// up to this many rows before encoding them into an Arrow
+/// `RecordBatch` and handing them to the underlying `ArrowWriter`.
+/// Doubled from the previous 65 536 — peak per-stream buffer ~22 MB,
+/// total peak across 6 streams ~140 MB. Trade is fewer encode calls
+/// in exchange for slightly more RAM.
+const FLUSH_EVERY: usize = 131_072;
 
-/// Channel depth between worker threads and the writer thread.
-/// Bounded so backpressure surfaces as wall-time, not RAM growth.
-const CHANNEL_DEPTH: usize = 1_000_000;
+/// Per-file channel depth. Bounded so backpressure surfaces as
+/// wall-time, not RAM growth. With one channel per output file a
+/// stalled writer only blocks its own producer code path.
+const PER_STREAM_DEPTH: usize = 256_000;
 
-/// Output multiplex sender — cloneable. `crossbeam_channel::Sender`
-/// is ~3× faster than `std::sync::mpsc::SyncSender` on multi-producer
-/// MPSC traffic; the aggregator + runner both feed this channel and
-/// the per-event overflow stream is high-throughput, so the switch
-/// matters.
-pub type RowSender = Sender<WriterRow>;
+/// Output multiplex sender — cloneable. Holds one
+/// `crossbeam_channel::Sender` per output Parquet file; `send` does a
+/// single-branch enum dispatch into the right channel. Each channel
+/// is drained by its own writer thread, so encode + compress for
+/// different files runs in parallel instead of being serialised
+/// behind one multiplex thread.
+#[derive(Clone)]
+pub struct RowSender {
+    msg_stats: Sender<MsgStats>,
+    node_counters: Sender<NodeCountersRow>,
+    node_reservoirs: Sender<NodeReservoirRow>,
+    overflow_events: Sender<OverflowEventRow>,
+    run_meta: Sender<RunMetaRow>,
+    node_pubkey: Sender<NodePubkeyRow>,
+}
 
-/// All row variants the writer thread can route.
+impl RowSender {
+    /// Single-branch dispatch into the per-file channel. Panics on
+    /// disconnect — the writer thread crashing is a hard error, not
+    /// silent corruption (see module docs).
+    pub fn send(&self, row: WriterRow) {
+        let r = match row {
+            WriterRow::MsgStats(s) => self.msg_stats.send(s).map_err(|e| WriterRow::MsgStats(e.0)),
+            WriterRow::NodeCounters(r) => self
+                .node_counters
+                .send(r)
+                .map_err(|e| WriterRow::NodeCounters(e.0)),
+            WriterRow::NodeReservoir(r) => self
+                .node_reservoirs
+                .send(r)
+                .map_err(|e| WriterRow::NodeReservoir(e.0)),
+            WriterRow::OverflowEvent(r) => self
+                .overflow_events
+                .send(r)
+                .map_err(|e| WriterRow::OverflowEvent(e.0)),
+            WriterRow::RunMeta(r) => self.run_meta.send(r).map_err(|e| WriterRow::RunMeta(e.0)),
+            WriterRow::NodePubkey(r) => self
+                .node_pubkey
+                .send(r)
+                .map_err(|e| WriterRow::NodePubkey(e.0)),
+        };
+        r.expect("stats writer channel closed before sim end");
+    }
+}
+
+/// All row variants the writer can route.
 #[derive(Debug)]
 pub enum WriterRow {
     MsgStats(MsgStats),
@@ -656,7 +705,7 @@ impl OutputPaths {
 
 pub struct Writer {
     tx: RowSender,
-    join: Option<JoinHandle<()>>,
+    joins: Vec<JoinHandle<()>>,
 }
 
 impl Writer {
@@ -664,34 +713,95 @@ impl Writer {
         self.tx.clone()
     }
 
-    /// Close the channel and join the thread.
-    pub fn close(mut self) {
-        drop(self.tx);
-        if let Some(h) = self.join.take() {
+    /// Drop all senders, then join every per-file writer thread.
+    pub fn close(self) {
+        let Self { tx, joins } = self;
+        drop(tx);
+        for h in joins {
             h.join().expect("stats writer thread panicked");
         }
     }
 }
 
+/// Spawn one writer thread per output Parquet file. Hot files
+/// (`msg_stats`, `node_counters`, `overflow_events`) use ZSTD-1 for
+/// throughput; the other three keep the default level.
 pub fn spawn(paths: OutputPaths, percentiles: Vec<f64>) -> Writer {
-    let (tx, rx) = bounded::<WriterRow>(CHANNEL_DEPTH);
-    let join = thread::spawn(move || run(paths, percentiles, rx));
-    Writer { tx, join: Some(join) }
+    let zstd_fast = Compression::ZSTD(ZstdLevel::try_new(1).expect("ZstdLevel(1)"));
+    let zstd_default = Compression::ZSTD(ZstdLevel::default());
+
+    let (msg_tx, msg_rx) = bounded::<MsgStats>(PER_STREAM_DEPTH);
+    let msg_path = paths.msg_stats.clone();
+    let msg_join = thread::spawn(move || run_msg_stats(msg_path, percentiles, msg_rx));
+
+    let (counters_tx, counters_rx) = bounded::<NodeCountersRow>(PER_STREAM_DEPTH);
+    let counters_path = paths.node_counters.clone();
+    let counters_join = thread::spawn(move || {
+        run_stream::<NodeCountersRow>(&counters_path, zstd_fast, counters_rx, "node_counters")
+    });
+
+    let (reservoirs_tx, reservoirs_rx) = bounded::<NodeReservoirRow>(PER_STREAM_DEPTH);
+    let reservoirs_path = paths.node_reservoirs.clone();
+    let reservoirs_join = thread::spawn(move || {
+        run_stream::<NodeReservoirRow>(
+            &reservoirs_path,
+            zstd_default,
+            reservoirs_rx,
+            "node_reservoirs",
+        )
+    });
+
+    let (overflow_tx, overflow_rx) = bounded::<OverflowEventRow>(PER_STREAM_DEPTH);
+    let overflow_path = paths.overflow_events.clone();
+    let overflow_join = thread::spawn(move || {
+        run_stream::<OverflowEventRow>(&overflow_path, zstd_fast, overflow_rx, "overflow_events")
+    });
+
+    let (run_meta_tx, run_meta_rx) = bounded::<RunMetaRow>(PER_STREAM_DEPTH);
+    let run_meta_path = paths.run_meta.clone();
+    let run_meta_join = thread::spawn(move || {
+        run_stream::<RunMetaRow>(&run_meta_path, zstd_default, run_meta_rx, "run_meta")
+    });
+
+    let (pubkey_tx, pubkey_rx) = bounded::<NodePubkeyRow>(PER_STREAM_DEPTH);
+    let pubkey_path = paths.node_pubkey.clone();
+    let pubkey_join = thread::spawn(move || {
+        run_stream::<NodePubkeyRow>(&pubkey_path, zstd_default, pubkey_rx, "node_pubkey")
+    });
+
+    Writer {
+        tx: RowSender {
+            msg_stats: msg_tx,
+            node_counters: counters_tx,
+            node_reservoirs: reservoirs_tx,
+            overflow_events: overflow_tx,
+            run_meta: run_meta_tx,
+            node_pubkey: pubkey_tx,
+        },
+        joins: vec![
+            msg_join,
+            counters_join,
+            reservoirs_join,
+            overflow_join,
+            run_meta_join,
+            pubkey_join,
+        ],
+    }
 }
 
 /// Per-stream state: an open writer + a typed in-memory buffer.
-/// `flush_now` flushes the buffer to Parquet via `R::to_batch`.
+/// `flush` encodes the buffer to Parquet via `R::to_batch`.
 struct Stream<R: WriteRow> {
     writer: ArrowWriter<File>,
     buf: Vec<R>,
 }
 
 impl<R: WriteRow> Stream<R> {
-    fn open(path: &Path) -> Self {
+    fn open_with_compression(path: &Path, compression: Compression) -> Self {
         let file = File::create(path)
             .unwrap_or_else(|e| panic!("create parquet file {}: {e}", path.display()));
         let props = WriterProperties::builder()
-            .set_compression(Compression::ZSTD(ZstdLevel::default()))
+            .set_compression(compression)
             .build();
         let writer = ArrowWriter::try_new(file, R::schema(), Some(props))
             .expect("init parquet ArrowWriter");
@@ -725,56 +835,53 @@ impl<R: WriteRow> Stream<R> {
     }
 }
 
-fn run(paths: OutputPaths, percentiles: Vec<f64>, rx: Receiver<WriterRow>) {
-    // msg_stats is bespoke (schema depends on `percentiles`).
-    let msg_schema = build_msg_schema(&percentiles);
-    let msg_props = WriterProperties::builder()
-        .set_compression(Compression::ZSTD(ZstdLevel::default()))
+/// Generic per-file worker: drains its channel into one `Stream<R>`,
+/// closing on disconnect. One per non-msg_stats Parquet file.
+fn run_stream<R: WriteRow + Send + 'static>(
+    path: &Path,
+    compression: Compression,
+    rx: Receiver<R>,
+    label: &'static str,
+) {
+    let mut stream = Stream::<R>::open_with_compression(path, compression);
+    for row in rx {
+        stream.push(row);
+    }
+    stream.close(label);
+}
+
+/// Bespoke writer for `msg_stats` — its schema depends on the
+/// runtime-configured percentile list, so it doesn't fit the
+/// parameterless `WriteRow` trait. Same buffering shape as
+/// `Stream<R>`, just inlined here.
+fn run_msg_stats(path: PathBuf, percentiles: Vec<f64>, rx: Receiver<MsgStats>) {
+    let schema = build_msg_schema(&percentiles);
+    let props = WriterProperties::builder()
+        .set_compression(Compression::ZSTD(ZstdLevel::try_new(1).expect("ZstdLevel(1)")))
         .build();
-    let msg_file = File::create(&paths.msg_stats)
-        .unwrap_or_else(|e| panic!("create msg_stats parquet: {e}"));
-    let mut msg_writer = ArrowWriter::try_new(msg_file, msg_schema.clone(), Some(msg_props))
+    let file = File::create(&path)
+        .unwrap_or_else(|e| panic!("create msg_stats parquet {}: {e}", path.display()));
+    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props))
         .expect("init msg_stats ArrowWriter");
-    let mut msg_buf: Vec<MsgStats> = Vec::with_capacity(FLUSH_EVERY);
+    let mut buf: Vec<MsgStats> = Vec::with_capacity(FLUSH_EVERY);
 
-    let mut counters: Stream<NodeCountersRow> = Stream::open(&paths.node_counters);
-    let mut reservoirs: Stream<NodeReservoirRow> = Stream::open(&paths.node_reservoirs);
-    let mut overflow: Stream<OverflowEventRow> = Stream::open(&paths.overflow_events);
-    let mut run_meta: Stream<RunMetaRow> = Stream::open(&paths.run_meta);
-    let mut pubkey: Stream<NodePubkeyRow> = Stream::open(&paths.node_pubkey);
-
-    let flush_msg = |w: &mut ArrowWriter<File>, buf: &mut Vec<MsgStats>| {
+    let flush = |w: &mut ArrowWriter<File>, buf: &mut Vec<MsgStats>| {
         if buf.is_empty() {
             return;
         }
-        let rb = msg_to_batch(&msg_schema, &percentiles, buf);
+        let rb = msg_to_batch(&schema, &percentiles, buf);
         w.write(&rb).expect("write msg_stats batch");
         buf.clear();
     };
 
     for row in rx {
-        match row {
-            WriterRow::MsgStats(s) => {
-                msg_buf.push(s);
-                if msg_buf.len() >= FLUSH_EVERY {
-                    flush_msg(&mut msg_writer, &mut msg_buf);
-                }
-            }
-            WriterRow::NodeCounters(r) => counters.push(r),
-            WriterRow::NodeReservoir(r) => reservoirs.push(r),
-            WriterRow::OverflowEvent(r) => overflow.push(r),
-            WriterRow::RunMeta(r) => run_meta.push(r),
-            WriterRow::NodePubkey(r) => pubkey.push(r),
+        buf.push(row);
+        if buf.len() >= FLUSH_EVERY {
+            flush(&mut writer, &mut buf);
         }
     }
-
-    flush_msg(&mut msg_writer, &mut msg_buf);
-    msg_writer.close().expect("close msg_stats parquet");
-    counters.close("node_counters");
-    reservoirs.close("node_reservoirs");
-    overflow.close("overflow_events");
-    run_meta.close("run_meta");
-    pubkey.close("node_pubkey");
+    flush(&mut writer, &mut buf);
+    writer.close().expect("close msg_stats parquet");
 }
 
 // ---- helpers --------------------------------------------------------

@@ -134,13 +134,11 @@ impl AggregatorState {
             None => return,
         };
         for ev in &drained_overflow {
-            tx.send(WriterRow::OverflowEvent(OverflowEventRow::from_event(ev)))
-                .expect("stats writer channel closed while sending OverflowEvent");
+            tx.send(WriterRow::OverflowEvent(OverflowEventRow::from_event(ev)));
         }
         tx.send(WriterRow::NodeCounters(NodeCountersRow::from_counters(
             idx, time_ns, &counters,
-        )))
-        .expect("stats writer channel closed while sending NodeCounters");
+        )));
     }
 
     fn handle_reservoir_dump(
@@ -169,8 +167,7 @@ impl AggregatorState {
                     b_only: s.b_only[i],
                     total_seen: s.total_seen,
                 };
-                tx.send(WriterRow::NodeReservoir(row))
-                    .expect("stats writer channel closed while sending NodeReservoir");
+                tx.send(WriterRow::NodeReservoir(row));
             }
         }
     }
@@ -284,7 +281,7 @@ impl AggregatorState {
     fn push_finalized(&mut self, stats: MsgStats) {
         self.mirror.push(stats.clone());
         if let Some(tx) = &self.writer_tx {
-            let _ = tx.send(WriterRow::MsgStats(stats));
+            tx.send(WriterRow::MsgStats(stats));
         }
     }
 }
