@@ -21,6 +21,8 @@ pub mod message;
 pub mod metrics;
 pub mod metrics_aggregator;
 pub mod node;
+pub mod reservoir;
+pub mod duckdb_report;
 pub mod sim;
 pub mod spread_model;
 pub mod state;

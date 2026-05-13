@@ -242,6 +242,16 @@ pub struct RunCfg {
     /// overrides this when set.
     #[serde(default)]
     pub threads: Option<usize>,
+    /// Periodic per-node metrics flush interval in simulated seconds.
+    /// Drains delta counters + accumulated overflow events into Parquet
+    /// so per-node memory stays bounded for long runs.
+    #[serde(default = "default_flush_interval")]
+    pub flush_interval_seconds: u64,
+    /// Per-(node, kind) reservoir size for sketch-round samples. Memory
+    /// cost ~= n_nodes * 3 kinds * 3 vecs * cap * 4 bytes (~440 MB at
+    /// cap=1024 on the LN snapshot). Higher cap = tighter p99 estimates.
+    #[serde(default = "default_reservoir_capacity_rounds")]
+    pub reservoir_capacity_rounds: u32,
 }
 
 fn default_mailbox_capacity() -> usize {
@@ -250,6 +260,14 @@ fn default_mailbox_capacity() -> usize {
 
 fn default_progress_interval() -> u64 {
     10
+}
+
+fn default_flush_interval() -> u64 {
+    3600
+}
+
+fn default_reservoir_capacity_rounds() -> u32 {
+    1024
 }
 
 impl SimConfig {

@@ -25,3 +25,5 @@ arrow-array.workspace = true
 arrow-schema.workspace = true
 glob.workspace = true
 chrono.workspace = true
+duckdb.workspace = true
+crossbeam-channel.workspace = true

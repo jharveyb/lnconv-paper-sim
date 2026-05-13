@@ -116,6 +116,37 @@ pub fn predict_coverage(
 /// predicted-vs-observed comparison stays in sync.
 pub const COVERAGE_TIERS: &[f64] = &[0.05, 0.25, 0.50, 0.75, 0.95, 0.99, 1.00];
 
+/// Pre-computed coverage predictions for the three percentiles the
+/// `run_meta` Parquet row carries. Returned by [`SketchPredictions::new`]
+/// for sketch runs; absence (`None`) encodes "non-sketch run, no
+/// predictions" structurally — no magic 0.0 sentinel.
+#[derive(Copy, Clone, Debug)]
+pub struct SketchPredictions {
+    pub stagger_secs: f64,
+    pub p50_secs: f64,
+    pub p99_secs: f64,
+    pub p100_secs: f64,
+}
+
+impl SketchPredictions {
+    /// Compute all three percentile predictions from one parameter set.
+    pub fn new(
+        stagger_secs: f64,
+        d_mean: f64,
+        n: usize,
+        diameter: f64,
+        mean_path_length: f64,
+    ) -> Self {
+        let pred = |f: f64| predict_coverage(f, stagger_secs, d_mean, n, diameter, mean_path_length);
+        Self {
+            stagger_secs,
+            p50_secs: pred(0.50),
+            p99_secs: pred(0.99),
+            p100_secs: pred(1.00),
+        }
+    }
+}
+
 /// Format the predictor's output for one parameter set. Used by
 /// `sim::run` to print a table after the topology summary; the table
 /// rows mirror the CLI's later per-tier observed-time table.

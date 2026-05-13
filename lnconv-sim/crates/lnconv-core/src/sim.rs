@@ -118,6 +118,7 @@ pub fn run(cfg: &SimConfig, percentiles: Vec<f64>) -> Result<RunResult> {
     }
 
     // Step 3: channels + peer graph (FromCsv only — KRegular finished in step 1).
+    let mut pubkey_of: Option<std::collections::HashMap<NodeId, String>> = None;
     let registry = match &cfg.topology {
         TopologyCfg::KRegular { .. } => {
             let num_scids = cfg
@@ -136,6 +137,10 @@ pub fn run(cfg: &SimConfig, percentiles: Vec<f64>) -> Result<RunResult> {
             ..
         } => {
             let snap = snap_for_csv.expect("snap is Some for FromCsv");
+            // Keep the pubkey reverse-lookup for the run_meta /
+            // node_pubkey Parquet writes that happen after the
+            // MetricsHandle is built.
+            pubkey_of = Some(snap.pubkey_of.clone());
             let registry = ChannelRegistry::from_iter(&mut topology, snap.channels.iter().copied());
             let k_cln = k.cln;
             let k_lnd = k.lnd;
@@ -196,13 +201,18 @@ pub fn run(cfg: &SimConfig, percentiles: Vec<f64>) -> Result<RunResult> {
         registry.mean_per_node()
     );
 
-    let stats_path = crate::stats_writer::auto_path(
+    let stats_tag = crate::stats_writer::auto_tag(
         topology_kind_name(&cfg.topology),
         algo_kind_name(&cfg.algo),
         event_kind_name(&cfg.event),
     );
-    println!("stats: streaming finalised MsgStats to {}", stats_path.display());
-    let metrics = MetricsHandle::new(n, percentiles, Some(stats_path));
+    println!(
+        "stats: streaming Parquet output with tag prefix `{}` \
+         (six files: msg_stats, node_counters, node_reservoirs, \
+         overflow_events, run_meta, node_pubkey)",
+        stats_tag.display()
+    );
+    let metrics = MetricsHandle::new(n, percentiles, Some(stats_tag.clone()));
     let run_duration = Duration::from_secs(cfg.run.duration_seconds);
 
     // Snapshot the topology's NodeIds in NodeIdx order so event
@@ -214,7 +224,17 @@ pub fn run(cfg: &SimConfig, percentiles: Vec<f64>) -> Result<RunResult> {
         "events: scheduled {} message(s) over the run window",
         event_tuples.len()
     );
-    log_event_kind_breakdown(&event_tuples, run_duration);
+    let event_counts = count_event_kinds(&event_tuples);
+    log_event_kind_breakdown(event_counts, run_duration);
+
+    // Write the single-row run_meta + node_pubkey rows to Parquet
+    // before any sim activity. DuckDB picks them up alongside the
+    // streamed rows from the aggregator.
+    write_run_meta(&metrics, cfg, &topo_stats.peers, event_counts);
+    if let Some(pk_map) = &pubkey_of {
+        write_node_pubkey_rows(&metrics, &topology, pk_map);
+    }
+
     let deadline = MonotonicTime::EPOCH + run_duration;
 
     match &cfg.algo {
@@ -421,33 +441,125 @@ fn log_mix_summary(assignments: &[NodeAlgoKind]) {
 }
 
 
-/// Break down the scheduled event-tuples by `GossipKind` and print
-/// counts + rates. Works for any event source — parquet replay sees a
-/// mix of all three kinds, Poisson/OneShot are pure `ChannelUpdate`.
-/// Rate is averaged over the full run window (`duration_seconds`),
-/// which matches what the user reads off `[run]`.
-fn log_event_kind_breakdown(tuples: &[(Duration, NodeId, Gossip)], window: Duration) {
-    if tuples.is_empty() {
-        return;
-    }
-    let mut chan_upd: u64 = 0;
-    let mut node_ann: u64 = 0;
-    let mut chan_ann: u64 = 0;
+/// Per-`GossipKind` tally of scheduled events. Returned by
+/// `count_event_kinds` so the same numbers can feed both the CLI
+/// printout (`log_event_kind_breakdown`) and the `run_meta` Parquet
+/// row (`write_run_meta`).
+#[derive(Copy, Clone, Debug, Default)]
+struct EventKindCounts {
+    chan_update: u64,
+    node_ann: u64,
+    chan_ann: u64,
+}
+
+fn count_event_kinds(tuples: &[(Duration, NodeId, Gossip)]) -> EventKindCounts {
+    let mut c = EventKindCounts::default();
     for (_, _, g) in tuples {
         match g.kind {
-            GossipKind::ChannelUpdate => chan_upd += 1,
-            GossipKind::NodeAnnouncement => node_ann += 1,
-            GossipKind::ChannelAnnouncement => chan_ann += 1,
+            GossipKind::ChannelUpdate => c.chan_update += 1,
+            GossipKind::NodeAnnouncement => c.node_ann += 1,
+            GossipKind::ChannelAnnouncement => c.chan_ann += 1,
         }
     }
+    c
+}
+
+/// Write the single-row `run_meta-<tag>.parquet`. Captures the
+/// inputs that would otherwise have to be re-derived from the
+/// (potentially-unsaved) config file.
+fn write_run_meta(
+    metrics: &MetricsHandle,
+    cfg: &SimConfig,
+    peers: &crate::topology::metrics::GraphMetrics,
+    event_counts: EventKindCounts,
+) {
+    let (cap_cu, cap_na, cap_ca) = match &cfg.algo {
+        AlgoCfg::Sketch {
+            capacity_chan_updates,
+            capacity_node_anns,
+            capacity_chan_anns,
+            ..
+        } => (
+            *capacity_chan_updates as u64,
+            *capacity_node_anns as u64,
+            *capacity_chan_anns as u64,
+        ),
+        _ => (0, 0, 0),
+    };
+    let predictions = sketch_stagger_secs(&cfg.algo).map(|stagger_secs| {
+        crate::spread_model::SketchPredictions::new(
+            stagger_secs,
+            peers.mean_degree,
+            peers.n,
+            peers.diameter as f64,
+            peers.mean_path_length,
+        )
+    });
+    let row = crate::stats_writer::RunMetaRow::new(
+        crate::stats_writer::RunMetaInputs {
+            seed: cfg.seed,
+            duration_seconds: cfg.run.duration_seconds,
+            algo: algo_kind_name(&cfg.algo),
+            topology_kind: topology_kind_name(&cfg.topology),
+            event_kind: event_kind_name(&cfg.event),
+            n_nodes: peers.n as u64,
+            mean_degree: peers.mean_degree,
+            min_degree: peers.min_degree as u64,
+            max_degree: peers.max_degree as u64,
+            diameter: peers.diameter as u64,
+            mean_path_length: peers.mean_path_length,
+            capacity_chan_updates: cap_cu,
+            capacity_node_anns: cap_na,
+            capacity_chan_anns: cap_ca,
+            events_chan_update: event_counts.chan_update,
+            events_node_ann: event_counts.node_ann,
+            events_chan_ann: event_counts.chan_ann,
+        },
+        predictions,
+    );
+    metrics.write_run_meta(row);
+}
+
+/// Write `node_pubkey-<tag>.parquet` for FromCsv runs. Joins
+/// `topology.peers` NodeIdx → NodeId against the
+/// `pubkey_of: HashMap<NodeId, String>` captured from the
+/// `LnSnapshot` loader.
+fn write_node_pubkey_rows(
+    metrics: &MetricsHandle,
+    topology: &Topology,
+    pubkey_of: &HashMap<NodeId, String>,
+) {
+    let mut rows: Vec<crate::stats_writer::NodePubkeyRow> = Vec::with_capacity(topology.len());
+    for nx in topology.peers.node_indices() {
+        let meta = &topology.peers[nx];
+        if let Some(pk) = pubkey_of.get(&meta.id) {
+            rows.push(crate::stats_writer::NodePubkeyRow {
+                node_idx: meta.idx,
+                node_id: meta.id,
+                pubkey: pk.clone(),
+            });
+        }
+    }
+    metrics.write_node_pubkey_rows(rows);
+}
+
+fn log_event_kind_breakdown(counts: EventKindCounts, window: Duration) {
+    let EventKindCounts {
+        chan_update,
+        node_ann,
+        chan_ann,
+    } = counts;
+    let total = chan_update + node_ann + chan_ann;
+    if total == 0 {
+        return;
+    }
     let secs = window.as_secs_f64().max(1e-9);
-    let total = chan_upd + node_ann + chan_ann;
     let pct = |x: u64| -> f64 { 100.0 * x as f64 / total as f64 };
     println!(
         "  by kind: chan_update={} ({:.1}%, {:.2}/s), \
                   node_ann={} ({:.1}%, {:.2}/s), \
                   chan_ann={} ({:.1}%, {:.2}/s)",
-        chan_upd, pct(chan_upd), chan_upd as f64 / secs,
+        chan_update, pct(chan_update), chan_update as f64 / secs,
         node_ann, pct(node_ann), node_ann as f64 / secs,
         chan_ann, pct(chan_ann), chan_ann as f64 / secs,
     );
@@ -596,6 +708,7 @@ fn run_flooding(
     deadline: MonotonicTime,
 ) -> Result<()> {
     let n = topology.len();
+    let flush_interval = Duration::from_secs(cfg.run.flush_interval_seconds);
     // One Arc<NodeState> per node, shared with the model that owns
     // it AND with each of that node's peers (for sketch-style diffs).
     // The local `registry` is dropped at the end of this function;
@@ -615,11 +728,14 @@ fn run_flooding(
                 .neighbors(nx)
                 .map(|ny| registry[topology.peers[ny].idx as usize].clone())
                 .collect();
+            let flush_phase = compute_flush_phase(cfg.seed, meta.id, flush_interval);
             FloodingNode::new(
                 meta.id,
                 meta.idx,
                 forward_delay,
                 run_duration,
+                flush_interval,
+                flush_phase,
                 state,
                 peer_states,
                 metrics.clone(),
@@ -694,6 +810,7 @@ fn run_stagger_population(
     deadline: MonotonicTime,
 ) -> Result<()> {
     let n = topology.len();
+    let flush_interval = Duration::from_secs(cfg.run.flush_interval_seconds);
 
     let registry = state::build_registry(n);
 
@@ -724,6 +841,7 @@ fn run_stagger_population(
             .neighbors(nx)
             .map(|ny| registry[topology.peers[ny].idx as usize].clone())
             .collect();
+        let flush_phase = compute_flush_phase(cfg.seed, id, flush_interval);
         match algo {
             NodeAlgo::Cln { stagger_ms } => {
                 cln_local[nx.index()] = Some(cln_nodes.len());
@@ -733,6 +851,8 @@ fn run_stagger_population(
                     Duration::from_millis(*stagger_ms),
                     phase,
                     run_duration,
+                    flush_interval,
+                    flush_phase,
                     state,
                     peer_states,
                     metrics.clone(),
@@ -753,6 +873,8 @@ fn run_stagger_population(
                     Duration::from_millis(*trickle_ms),
                     *min_batch_size,
                     run_duration,
+                    flush_interval,
+                    flush_phase,
                     state,
                     peer_states,
                     metrics.clone(),
@@ -766,6 +888,8 @@ fn run_stagger_population(
                 capacity_chan_anns,
             } => {
                 sketch_local[nx.index()] = Some(sketch_nodes.len());
+                let reservoir_cap = cfg.run.reservoir_capacity_rounds;
+                let reservoir_seed = cfg.seed ^ 0xA5C0 ^ id;
                 sketch_nodes.push(SketchNode::new(
                     id,
                     idx,
@@ -773,7 +897,11 @@ fn run_stagger_population(
                     *capacity_chan_updates,
                     *capacity_node_anns,
                     *capacity_chan_anns,
+                    reservoir_cap,
+                    reservoir_seed,
                     run_duration,
+                    flush_interval,
+                    flush_phase,
                     state,
                     peer_states,
                     metrics.clone(),
@@ -991,6 +1119,19 @@ fn wire_connection(
 /// in one time step (the tick-vs-recv ordering in NeXosim isn't
 /// guaranteed at coincident times, so synchronous phases produce wildly
 /// faster propagation than the stagger algorithm should permit).
+/// Deterministic per-node phase offset within `(0, flush_interval]` for
+/// the first periodic `flush_summary` firing. Seeded from
+/// `cfg.seed ^ 0xF1u5 ^ node_id` so all 11 875 nodes don't collide on
+/// the same sim instant. Returns `Duration::ZERO` when periodic
+/// flushing is disabled (`flush_interval = 0`).
+fn compute_flush_phase(seed: u64, node_id: NodeId, flush_interval: Duration) -> Duration {
+    if flush_interval.is_zero() {
+        return Duration::ZERO;
+    }
+    let mut rng = ChaCha8Rng::seed_from_u64(seed ^ 0xF105 ^ node_id);
+    sample_phase(&mut rng, flush_interval)
+}
+
 fn sample_phase(rng: &mut ChaCha8Rng, stagger: Duration) -> Duration {
     use statrs::distribution::{ContinuousCDF, Uniform};
     let stagger_secs = stagger.as_secs_f64();

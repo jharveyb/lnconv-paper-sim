@@ -32,3 +32,5 @@ arrow-array = "55"
 arrow-schema = "55"
 glob = "0.3"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+duckdb = { version = "1", features = ["bundled", "parquet"] }
+crossbeam-channel = "0.5"
