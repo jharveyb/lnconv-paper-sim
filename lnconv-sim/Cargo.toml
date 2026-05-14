@@ -23,9 +23,9 @@ petgraph = "0.8"
 statrs = "0.18"
 ahash = "0.8"
 nohash-hasher = "0.2"
-parking_lot = "0.12"
+parking_lot = { version = "0.12", features = ["hardware-lock-elision"] }
 csv = "1"
-twox-hash = { version = "2", features = ["xxhash3_64"] }
+twox-hash = { version = "2", features = ["xxhash3_64", "std", "alloc"] }
 thiserror = "2"
 parquet = { version = "55", features = ["zstd"] }
 arrow-array = "55"
