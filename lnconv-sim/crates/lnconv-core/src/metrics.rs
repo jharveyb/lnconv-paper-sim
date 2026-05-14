@@ -60,6 +60,13 @@ pub struct Metrics {
     /// the aggregator on every supersession finalisation; read by the
     /// CLI summary.
     superseded_count: Arc<AtomicUsize>,
+    /// Live counter shared with the aggregator thread. Bumped on every
+    /// `push_finalized` (full-coverage, supersession, end-of-run drain).
+    /// Equivalent to what `mirror.len()` used to report and read by
+    /// [`MetricsHandle::completed_count`]; replaces the per-msg
+    /// `MsgStats` clone-and-keep in production where Parquet output is
+    /// configured.
+    finalized_count: Arc<AtomicUsize>,
     /// Live counter incremented by `record_first_seen` on the worker
     /// thread BEFORE the event is enqueued.
     total_first_seen: AtomicUsize,
@@ -69,7 +76,11 @@ pub struct Metrics {
     /// Aggregator thread join handle.
     aggregator_join: Mutex<Option<JoinHandle<AggregatorOutput>>>,
     /// In-memory `MsgStats` mirror returned by the aggregator after
-    /// shutdown. Populated by `finalize_remaining`.
+    /// shutdown. Empty in production (the aggregator skips the mirror
+    /// push when its `writer_tx` is `Some` — output streams straight to
+    /// Parquet); populated only for tests/no-output handles built with
+    /// `tag_prefix=None`. Read via `completed_stats()`; for the
+    /// distinct-message count use [`MetricsHandle::completed_count`].
     finalized_stats: Mutex<Option<Vec<MsgStats>>>,
     /// Sender into the multi-Parquet writer. Cloned from the `Writer`
     /// owned in `writer_holder` and used directly for sim-init-time
@@ -78,10 +89,10 @@ pub struct Metrics {
     /// before joining the writer thread (otherwise the join blocks
     /// forever waiting for this sender to drop — there's an Arc cycle
     /// via MetricsHandle that would only break on full handle drop,
-    /// which happens AFTER `completed_stats()` returns).
+    /// which happens AFTER `completed_count()` returns).
     writer_tx: Mutex<Option<RowSender>>,
-    /// Writer handle. Stashed so `completed_stats` can close it after
-    /// the aggregator finishes and recover the mirror.
+    /// Writer handle. Stashed so `finalize_remaining` can close it
+    /// after the aggregator finishes and recover the mirror.
     writer_holder: Mutex<Option<Writer>>,
     /// Tag prefix used to derive all six Parquet filenames. None when
     /// no output was configured.
@@ -365,22 +376,18 @@ impl Default for MetricsHandle {
 }
 
 impl MetricsHandle {
-    /// Build a handle bound to a tag prefix. The writer thread opens
-    /// six Parquet files keyed off `tag_prefix` and routes rows from
-    /// both the aggregator (msg_stats, node_counters, node_reservoirs,
-    /// overflow_events) and direct sends from `sim::run`
-    /// (run_meta, node_pubkey). `tag_prefix=None` disables Parquet
-    /// output entirely (used by the no-op `Default` handle).
     pub fn new(
         n_nodes: usize,
         percentiles: Vec<f64>,
         tag_prefix: Option<PathBuf>,
     ) -> Self {
         let superseded_count = Arc::new(AtomicUsize::new(0));
+        let finalized_count = Arc::new(AtomicUsize::new(0));
         // Skip aggregator + writer spawn for the no-op Default handle.
         if n_nodes == 0 {
             return Self(Arc::new(Metrics {
                 superseded_count,
+                finalized_count,
                 total_first_seen: AtomicUsize::new(0),
                 events_tx: None,
                 aggregator_join: Mutex::new(None),
@@ -404,12 +411,14 @@ impl MetricsHandle {
                 n_nodes,
                 percentiles,
                 superseded_count.clone(),
+                finalized_count.clone(),
                 writer_tx.clone(),
             );
             (Some(tx), Some(h))
         };
         Self(Arc::new(Metrics {
             superseded_count,
+            finalized_count,
             total_first_seen: AtomicUsize::new(0),
             events_tx,
             aggregator_join: Mutex::new(aggregator_join),
@@ -544,9 +553,14 @@ impl MetricsHandle {
         }
     }
 
-    /// Returns the sorted `Vec<MsgStats>` accumulated by the
-    /// aggregator. First call also performs `finalize_remaining` if
-    /// the runner hasn't already.
+    /// Test/debug-only: return the in-memory mirror of every finalized
+    /// `MsgStats`. **Empty in production** because the aggregator
+    /// skips the mirror push whenever Parquet output is configured —
+    /// finalized rows stream straight to `msg_stats-*.parquet` and the
+    /// authoritative count is exposed via [`Self::completed_count`].
+    /// Useful from tests built with `MetricsHandle::new(n, _, None)`
+    /// where no writer is attached. First call also performs
+    /// `finalize_remaining` if the runner hasn't already.
     pub fn completed_stats(&self) -> Vec<MsgStats> {
         self.finalize_remaining();
         let mut v = self
@@ -557,6 +571,18 @@ impl MetricsHandle {
             .unwrap_or_default();
         v.sort_by_key(|s| s.id);
         v
+    }
+
+    /// Number of distinct messages that ever reached `push_finalized`
+    /// inside the aggregator (full-coverage convergence, supersession,
+    /// or end-of-run drain). Production replacement for the old
+    /// `completed_stats().len()` pattern — reads a single atomic
+    /// instead of materialising a `Vec<MsgStats>`. First call also
+    /// drives `finalize_remaining` so the count reflects end-of-run
+    /// drains.
+    pub fn completed_count(&self) -> usize {
+        self.finalize_remaining();
+        self.0.finalized_count.load(Ordering::Relaxed)
     }
 }
 

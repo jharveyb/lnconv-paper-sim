@@ -93,12 +93,23 @@ struct AggregatorState {
     latest_version: IntMap<u64, u32>,
     finalized: IntSet<MsgId>,
     superseded_count: Arc<AtomicUsize>,
+    /// Live count of every message that has reached `push_finalized`
+    /// (full-coverage, supersession, or end-of-run drain). Mirrors
+    /// what `mirror.len()` used to mean; read by
+    /// `MetricsHandle::completed_count`. Bumped instead of pushing to
+    /// `mirror` in production so RAM doesn't grow with run length.
+    finalized_count: Arc<AtomicUsize>,
     /// Sender into the multi-Parquet writer thread. Cloned from the
     /// `Writer` held by the runner; the writer thread doesn't exit
     /// until ALL senders drop, so the runner's clone keeps it open
     /// until `MetricsHandle::completed_stats` is called.
     writer_tx: Option<RowSender>,
-    /// In-memory mirror returned via the join handle.
+    /// Test-only in-memory accumulator. Production runs always pass a
+    /// `writer_tx=Some(_)` (Parquet output is configured by the CLI),
+    /// so `push_finalized` skips the mirror push and the Vec stays
+    /// empty. Tests construct `MetricsHandle::new(n, _, None)` with no
+    /// writer, in which case the mirror is the only access path to
+    /// finalized `MsgStats` and `completed_stats()` returns its content.
     mirror: Vec<MsgStats>,
 }
 
@@ -107,6 +118,7 @@ impl AggregatorState {
         n_nodes: usize,
         percentiles: Vec<f64>,
         superseded_count: Arc<AtomicUsize>,
+        finalized_count: Arc<AtomicUsize>,
         writer_tx: Option<RowSender>,
     ) -> Self {
         Self {
@@ -117,6 +129,7 @@ impl AggregatorState {
             latest_version: IntMap::default(),
             finalized: IntSet::default(),
             superseded_count,
+            finalized_count,
             writer_tx,
             mirror: Vec::new(),
         }
@@ -279,23 +292,26 @@ impl AggregatorState {
     }
 
     fn push_finalized(&mut self, stats: MsgStats) {
-        self.mirror.push(stats.clone());
+        self.finalized_count.fetch_add(1, Ordering::Relaxed);
         if let Some(tx) = &self.writer_tx {
             tx.send(WriterRow::MsgStats(stats));
+        } else {
+            self.mirror.push(stats);
         }
     }
 }
 
-/// Spawn the aggregator thread.
 pub fn spawn(
     n_nodes: usize,
     percentiles: Vec<f64>,
     superseded_count: Arc<AtomicUsize>,
+    finalized_count: Arc<AtomicUsize>,
     writer_tx: Option<RowSender>,
 ) -> (EventQueueWriter<MetricsEvent>, JoinHandle<AggregatorOutput>) {
     let (writer, reader) = event_queue::<MetricsEvent>(SinkState::Enabled);
     let handle = thread::spawn(move || {
-        let mut state = AggregatorState::new(n_nodes, percentiles, superseded_count, writer_tx);
+        let mut state =
+            AggregatorState::new(n_nodes, percentiles, superseded_count, finalized_count, writer_tx);
         let mut reader = reader;
         loop {
             match reader.read() {

@@ -40,7 +40,7 @@ fn main() -> Result<()> {
     let tag = result.metrics.tag_prefix();
     println!(
         "simulation finished: {} distinct messages",
-        result.metrics.completed_stats().len()
+        result.metrics.completed_count()
     );
     println!(
         "total first-seen events: {}",
