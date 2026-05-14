@@ -134,6 +134,13 @@ impl ChannelRegistry {
         (scid, direction, owner)
     }
 
+    /// All SCIDs in insertion order. Used by reshape passes (e.g.
+    /// `parquet_replay`) that need to enumerate every channel for
+    /// capacity tracking.
+    pub fn scids(&self) -> &[Scid] {
+        &self.scids
+    }
+
     /// Mean number of `(scid, direction)` pairs owned by each node in
     /// the topology. Equals `2 * num_scids / num_nodes` (each scid has
     /// two directions, each owned by one node).

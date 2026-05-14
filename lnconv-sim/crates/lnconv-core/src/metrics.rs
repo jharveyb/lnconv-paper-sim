@@ -228,7 +228,7 @@ pub struct FirstSeenEntry {
 /// regardless of flush interval. ~4096 × ~48 B ≈ 200 KB per node at
 /// the cap; ~2.4 GB across 11 875 LN-snapshot nodes during a brief
 /// spike (well within budget).
-pub const FIRST_SEEN_FORCE_FLUSH: usize = 4096;
+pub const FIRST_SEEN_FORCE_FLUSH: usize = 2048;
 
 /// Single overflow event recorded by the receiver of a `Sketch` whose
 /// symmetric-diff size exceeded the sketch capacity. Accumulated in a
