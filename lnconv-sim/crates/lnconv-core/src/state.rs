@@ -106,11 +106,17 @@ pub type SharedNodeState = Arc<NodeState>;
 
 impl NodeState {
     pub fn new(idx: NodeIdx) -> Arc<Self> {
+        let mut cu = IntMap::default();
+        let mut na = IntMap::default();
+        let mut ca = IntMap::default();
+        cu.reserve(1024);
+        na.reserve(1024);
+        ca.reserve(64);
         Arc::new(Self {
             idx,
-            chan_updates: RwLock::new(IntMap::default()),
-            node_anns: RwLock::new(IntMap::default()),
-            chan_anns: RwLock::new(IntMap::default()),
+            chan_updates: RwLock::new(cu),
+            node_anns: RwLock::new(na),
+            chan_anns: RwLock::new(ca),
         })
     }
 }

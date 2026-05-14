@@ -19,6 +19,7 @@ pub struct SimConfig {
     /// `topology.kind = "k_regular"`.
     #[serde(default)]
     pub channels: Option<ChannelsCfg>,
+    #[serde(default = "default_latency")]
     pub latency: LatencyCfg,
     pub algo: AlgoCfg,
     pub event: EventCfg,
@@ -73,8 +74,11 @@ pub enum TopologyCfg {
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct KByAlgo {
+    #[serde(default = "default_k")]
     pub flooding: usize,
+    #[serde(default = "default_k")]
     pub cln: usize,
+    #[serde(default = "default_k")]
     pub lnd: usize,
     /// Default `cln`'s value if omitted — sketch nodes broadly behave
     /// like CLN at the topology level (similar peer-degree targets).
@@ -115,6 +119,14 @@ impl Default for MaxPeerByAlgo {
 
 fn default_max_peer_stagger() -> usize {
     100
+}
+
+fn default_k() -> usize {
+    5
+}
+
+fn default_latency() -> LatencyCfg {
+    LatencyCfg::Constant { ms: 100 }
 }
 
 /// Default hub-cap for sketch when `MaxPeerByAlgo::sketch` is `None`.
