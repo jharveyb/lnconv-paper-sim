@@ -7,14 +7,7 @@ channels_csv = "init_data/channel_list.csv"
 enforce_hub_cap = true
 
 [topology.k]
-flooding = 5
-cln = 10
-lnd = 3
 sketch = 4
-
-[latency]
-dist = "constant"
-ms = 100
 
 [algo]
 kind = "sketch"
@@ -32,3 +25,5 @@ path = "init_data/compact_traffic_2026-02-11_2026-02-13.parquet"
 duration_seconds = 600
 mailbox_capacity = 64
 progress_interval_seconds = 60
+flush_interval_seconds = 600
+reservoir_capacity_rounds = 1024

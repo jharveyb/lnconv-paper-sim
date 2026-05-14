@@ -7,13 +7,12 @@ channels_csv = "init_data/channel_list.csv"
 enforce_hub_cap = true
 
 [topology.k]
-flooding = 5
 cln = 10
-lnd = 3
+lnd = 4
 
-[latency]
-dist = "constant"
-ms = 100
+[topology.max_peer]
+cln = 125
+lnd = 100
 
 # Match the (old) estimates of implementation diversity on mainnet.
 [algo]
@@ -38,6 +37,8 @@ kind = "parquet_replay"
 path = "init_data/compact_traffic_2026-02-11_2026-02-13.parquet"
 
 [run]
-duration_seconds = 600
+duration_seconds = 1800
 mailbox_capacity = 1024
 progress_interval_seconds = 60
+flush_interval_seconds = 600
+reservoir_capacity_rounds = 1024

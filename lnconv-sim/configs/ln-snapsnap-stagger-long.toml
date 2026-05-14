@@ -1,4 +1,4 @@
-seed = 42
+seed = 21
 
 [topology]
 kind = "from_csv"
@@ -7,17 +7,29 @@ channels_csv = "init_data/channel_list.csv"
 enforce_hub_cap = true
 
 [topology.k]
-sketch = 5
+cln = 10
+lnd = 4
 
 [topology.max_peer]
-sketch = 8
+cln = 125
+lnd = 100
 
+# Match the (old) estimates of implementation diversity on mainnet.
 [algo]
-kind = "sketch"
-stagger_ms = 30000
-capacity_chan_updates = 512
-capacity_node_anns = 512
-capacity_chan_anns = 64
+kind = "mix"
+[[algo.population]]
+fraction = 0.85
+[algo.population.algo]
+kind = "lnd"
+stagger_ms = 90000
+trickle_ms = 5000
+min_batch_size = 10
+
+[[algo.population]]
+fraction = 0.15
+[algo.population.algo]
+kind = "cln"
+stagger_ms = 60000
 
 [event]
 kind = "parquet_replay"
@@ -25,8 +37,8 @@ kind = "parquet_replay"
 path = "init_data/compact_traffic_2026-02-11_2026-02-13.parquet"
 
 [run]
-duration_seconds = 7200
-mailbox_capacity = 64
+duration_seconds = 21600
+mailbox_capacity = 1024
 progress_interval_seconds = 60
 flush_interval_seconds = 600
 reservoir_capacity_rounds = 1024

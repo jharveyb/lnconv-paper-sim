@@ -7,14 +7,10 @@ channels_csv = "init_data/channel_list.csv"
 enforce_hub_cap = true
 
 [topology.k]
-flooding = 5
-cln = 10
-lnd = 3
 sketch = 4
 
-[latency]
-dist = "constant"
-ms = 100
+[topology.max_peer]
+sketch = 8
 
 [algo]
 kind = "sketch"
@@ -27,9 +23,11 @@ capacity_chan_anns = 64
 kind = "parquet_replay"
 path = "init_data/compact_traffic_2026-02-11_2026-02-13.parquet"
 
-# 40 minutes of sim time should make our expected sketch diffs big enough
+# 30 minutes of sim time should make our expected sketch diffs big enough
 # to overtake any nexosim overhead in our samply profile recordings.
 [run]
-duration_seconds = 2400
+duration_seconds = 1800
 mailbox_capacity = 64
 progress_interval_seconds = 60
+flush_interval_seconds = 600
+reservoir_capacity_rounds = 1024

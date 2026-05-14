@@ -21,7 +21,6 @@ rustworkx-core = "0.17"
 # workspace and rustworkx-core agree on petgraph types.
 petgraph = "0.8"
 statrs = "0.18"
-ahash = "0.8"
 nohash-hasher = "0.2"
 parking_lot = { version = "0.12", features = ["hardware-lock-elision"] }
 csv = "1"
