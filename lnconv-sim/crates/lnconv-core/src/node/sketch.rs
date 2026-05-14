@@ -399,6 +399,7 @@ impl SketchNode {
                     fresh_count += 1;
                 } else {
                     self.metrics_local.duplicates += 1;
+                    self.metrics_local.duplicates_bytes += g.size_bytes as u64;
                 }
             }
         }
@@ -431,6 +432,7 @@ impl SketchNode {
                     fresh_count += 1;
                 } else {
                     self.metrics_local.duplicates += 1;
+                    self.metrics_local.duplicates_bytes += g.size_bytes as u64;
                 }
             }
         }
@@ -458,6 +460,7 @@ impl SketchNode {
                     fresh_count += 1;
                 } else {
                     self.metrics_local.duplicates += 1;
+                    self.metrics_local.duplicates_bytes += g.size_bytes as u64;
                 }
             }
         }

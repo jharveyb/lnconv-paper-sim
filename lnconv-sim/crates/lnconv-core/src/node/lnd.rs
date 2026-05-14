@@ -208,15 +208,13 @@ impl LndNode {
             self.min_batch_size,
             drained.len(),
         );
-        let chunks: Vec<Arc<GossipBatch>> = drained
+        let mut chunks = drained
             .chunks(sub)
-            .map(|c| Arc::new(GossipBatch::from_mixed(c)))
-            .collect();
-        let mut iter = chunks.into_iter();
-        if let Some(first) = iter.next() {
+            .map(|c| Arc::new(GossipBatch::from_mixed(c)));
+        if let Some(first) = chunks.next() {
             self.broadcast_arc(first).await;
         }
-        for (i, chunk) in iter.enumerate() {
+        for (i, chunk) in chunks.enumerate() {
             let offset = self.trickle * (i as u32 + 1);
             cx.schedule_event(offset, schedulable!(Self::send_batch), chunk)
                 .expect("schedule trickle batch");
@@ -274,6 +272,7 @@ impl LndNode {
                     fresh_count += 1;
                 } else {
                     self.metrics_local.duplicates += 1;
+                    self.metrics_local.duplicates_bytes += g.size_bytes as u64;
                 }
             }
         }
@@ -307,6 +306,7 @@ impl LndNode {
                     fresh_count += 1;
                 } else {
                     self.metrics_local.duplicates += 1;
+                    self.metrics_local.duplicates_bytes += g.size_bytes as u64;
                 }
             }
         }
@@ -335,6 +335,7 @@ impl LndNode {
                     fresh_count += 1;
                 } else {
                     self.metrics_local.duplicates += 1;
+                    self.metrics_local.duplicates_bytes += g.size_bytes as u64;
                 }
             }
         }

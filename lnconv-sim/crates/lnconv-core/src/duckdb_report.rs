@@ -88,11 +88,11 @@ fn fmt_dur_ns(ns: u64) -> String {
     }
 }
 
-/// Render one `(label, min, p50, p95, max, total)` row using the
+/// Render one `(label, min, p50, mean, p95, max, total)` row using the
 /// canonical column widths shared across every bandwidth-style table.
-fn print_minmaxtotal(label: &str, min: u64, p50: u64, p95: u64, max: u64, total: u64) {
+fn print_minmaxtotal(label: &str, min: u64, p50: u64, mean: u64, p95: u64, max: u64, total: u64) {
     println!(
-        "  {label:<22}min={min:>10}  p50={p50:>10}  p95={p95:>10}  max={max:>10}  total={total}"
+        "  {label:<22}min={min:>10}  p50={p50:>10}  mean={mean:>10}  p95={p95:>10}  max={max:>10}  total={total}"
     );
 }
 
@@ -243,6 +243,7 @@ struct PerNodeBandwidth {
     bytes_in_sketch: MmStats,
     bytes_out_sketch: MmStats,
     duplicates: MmStats,
+    duplicates_bytes: MmStats,
     any_sketch: bool,
 }
 
@@ -257,7 +258,8 @@ impl<'a> TryFrom<&Row<'a>> for PerNodeBandwidth {
             bytes_in_sketch: MmStats::read(row, 11),
             bytes_out_sketch: MmStats::read(row, 16),
             duplicates: MmStats::read(row, 21),
-            any_sketch: row.get::<usize, f64>(26).unwrap_or(0.0) > 0.0,
+            duplicates_bytes: MmStats::read(row, 26),
+            any_sketch: row.get::<usize, f64>(31).unwrap_or(0.0) > 0.0,
         })
     }
 }
@@ -281,6 +283,8 @@ fn print_per_node_bandwidth(conn: &Connection) -> Result<()> {
               quantile_cont(bytes_out_sketch, 0.95), MAX(bytes_out_sketch), SUM(bytes_out_sketch),
             MIN(duplicates),       quantile_cont(duplicates, 0.50),
               quantile_cont(duplicates, 0.95), MAX(duplicates), SUM(duplicates),
+            MIN(duplicates_bytes), quantile_cont(duplicates_bytes, 0.50),
+              quantile_cont(duplicates_bytes, 0.95), MAX(duplicates_bytes), SUM(duplicates_bytes),
             SUM(bytes_in_sketch) + SUM(bytes_out_sketch)
         FROM finals";
     let mut stmt = conn.prepare(sql)?;
@@ -290,18 +294,22 @@ fn print_per_node_bandwidth(conn: &Connection) -> Result<()> {
             None => return Ok(()),
         };
     println!("\nper-node bandwidth + duplicates (n={}):", b.n);
+    let n = (b.n.max(1)) as u64;
+    let mean = |total: u64| -> u64 { total / n };
     let g = &b.bytes_in_gossip;
-    print_minmaxtotal("bytes_in  (gossip):", g.min, g.p50, g.p95, g.max, g.total);
+    print_minmaxtotal("bytes_in  (gossip):", g.min, g.p50, mean(g.total), g.p95, g.max, g.total);
     let g = &b.bytes_out_gossip;
-    print_minmaxtotal("bytes_out (gossip):", g.min, g.p50, g.p95, g.max, g.total);
+    print_minmaxtotal("bytes_out (gossip):", g.min, g.p50, mean(g.total), g.p95, g.max, g.total);
     if b.any_sketch {
         let s = &b.bytes_in_sketch;
-        print_minmaxtotal("bytes_in  (sketch):", s.min, s.p50, s.p95, s.max, s.total);
+        print_minmaxtotal("bytes_in  (sketch):", s.min, s.p50, mean(s.total), s.p95, s.max, s.total);
         let s = &b.bytes_out_sketch;
-        print_minmaxtotal("bytes_out (sketch):", s.min, s.p50, s.p95, s.max, s.total);
+        print_minmaxtotal("bytes_out (sketch):", s.min, s.p50, mean(s.total), s.p95, s.max, s.total);
     }
     let d = &b.duplicates;
-    print_minmaxtotal("duplicates:", d.min, d.p50, d.p95, d.max, d.total);
+    print_minmaxtotal("duplicates (msgs):", d.min, d.p50, mean(d.total), d.p95, d.max, d.total);
+    let db = &b.duplicates_bytes;
+    print_minmaxtotal("duplicates (bytes):", db.min, db.p50, mean(db.total), db.p95, db.max, db.total);
     Ok(())
 }
 
