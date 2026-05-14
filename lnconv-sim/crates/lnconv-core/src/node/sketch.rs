@@ -23,6 +23,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use std::slice::from_ref;
 
 use nexosim::model::{Context, Model, schedulable};
 use nexosim::ports::Output;
@@ -365,9 +366,9 @@ impl SketchNode {
 impl SketchNode {
     fn absorb_one(&mut self, g: Gossip, cx: &Context<Self>) {
         match g.kind {
-            GossipKind::ChannelUpdate => self.absorb_chan_updates(std::slice::from_ref(&g), cx),
-            GossipKind::NodeAnnouncement => self.absorb_node_anns(std::slice::from_ref(&g), cx),
-            GossipKind::ChannelAnnouncement => self.absorb_chan_anns(std::slice::from_ref(&g), cx),
+            GossipKind::ChannelUpdate => self.absorb_chan_updates(from_ref(&g), cx),
+            GossipKind::NodeAnnouncement => self.absorb_node_anns(from_ref(&g), cx),
+            GossipKind::ChannelAnnouncement => self.absorb_chan_anns(from_ref(&g), cx),
         }
     }
 

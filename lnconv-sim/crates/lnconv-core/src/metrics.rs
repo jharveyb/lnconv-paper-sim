@@ -601,6 +601,9 @@ pub struct MsgStats {
     pub n_nodes: usize,
     pub origin_ns: u64,
     pub last_ns: u64,
+    /// Wire size of this message, copied from `Gossip::size_bytes` on
+    /// the first observation. Invariant for a given msg_id.
+    pub size_bytes: u32,
     /// `(percentile_fraction, time_to_reach_percentile_from_origin)`.
     /// Each percentile `p` is interpreted *absolute* — the time at which
     /// at least `ceil(p * n_nodes)` nodes had received the message. If

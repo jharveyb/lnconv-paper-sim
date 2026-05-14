@@ -73,14 +73,19 @@ struct MsgInflight {
     times: Vec<u64>,
     coverage: usize,
     origin_ns: u64,
+    /// Wire size from `Gossip::size_bytes` on the first observation.
+    /// Invariant for a given msg_id, so we don't update it on
+    /// subsequent observations.
+    size_bytes: u16,
 }
 
 impl MsgInflight {
-    fn new(n_nodes: usize, first_ns: u64) -> Self {
+    fn new(n_nodes: usize, first_ns: u64, size_bytes: u16) -> Self {
         Self {
             times: vec![NOT_SEEN; n_nodes],
             coverage: 0,
             origin_ns: first_ns,
+            size_bytes,
         }
     }
 }
@@ -244,7 +249,7 @@ impl AggregatorState {
         let inflight = self
             .in_flight
             .entry(gossip.id)
-            .or_insert_with(|| MsgInflight::new(self.n_nodes, ns));
+            .or_insert_with(|| MsgInflight::new(self.n_nodes, ns, gossip.size_bytes));
 
         let slot = &mut inflight.times[node as usize];
         if *slot != NOT_SEEN {
@@ -359,6 +364,7 @@ fn finalize_msg(
         times,
         coverage,
         origin_ns,
+        size_bytes,
     } = inflight;
     let mut sorted: Vec<u64> = times.into_iter().filter(|&t| t != NOT_SEEN).collect();
     sorted.sort_unstable();
@@ -381,6 +387,7 @@ fn finalize_msg(
         n_nodes,
         origin_ns,
         last_ns,
+        size_bytes: size_bytes as u32,
         percentiles: pcts,
     }
 }

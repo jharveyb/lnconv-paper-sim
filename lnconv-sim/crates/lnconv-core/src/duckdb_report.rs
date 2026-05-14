@@ -205,6 +205,69 @@ fn print_run_meta(conn: &Connection) -> Result<()> {
             m.ev_ca, pct(m.ev_ca), rate(m.ev_ca),
         );
     }
+    print_unique_data_block(conn, m.n_nodes, secs)?;
+    Ok(())
+}
+
+/// Returns a human-readable byte count using SI prefixes (kB, MB, GB).
+/// Matches the level of precision shown in the rest of `run summary`.
+fn fmt_bytes(b: f64) -> String {
+    const K: f64 = 1_000.0;
+    if b < K {
+        format!("{b:.0} B")
+    } else if b < K * K {
+        format!("{:.2} kB", b / K)
+    } else if b < K * K * K {
+        format!("{:.2} MB", b / (K * K))
+    } else {
+        format!("{:.2} GB", b / (K * K * K))
+    }
+}
+
+/// One extra line under `run summary` with average msg size, total
+/// unique data emitted, the unique-data rate, and the per-node
+/// redundancy factor (mean dup bytes per node ÷ total unique bytes).
+fn print_unique_data_block(conn: &Connection, n_nodes: u64, secs: f64) -> Result<()> {
+    let sql = "
+        WITH latest AS (
+            SELECT *, ROW_NUMBER() OVER (PARTITION BY node_idx ORDER BY time_ns DESC) AS rn
+            FROM counters
+        ),
+        finals AS (SELECT * FROM latest WHERE rn = 1),
+        msg_agg AS (SELECT SUM(size_bytes) AS unique_bytes, COUNT(*) AS msg_count FROM msgs),
+        dup_agg AS (SELECT SUM(duplicates_bytes) AS total_dup_bytes FROM finals)
+        SELECT unique_bytes, msg_count, total_dup_bytes
+        FROM msg_agg, dup_agg";
+    let mut stmt = conn.prepare(sql)?;
+    let (unique_bytes, msg_count, total_dup_bytes): (f64, u64, f64) = match stmt
+        .query_and_then([], |r| -> Result<_, duckdb::Error> {
+            Ok((
+                r.get::<usize, f64>(0).unwrap_or(0.0),
+                r.get::<usize, u64>(1).unwrap_or(0),
+                r.get::<usize, f64>(2).unwrap_or(0.0),
+            ))
+        })?
+        .next()
+    {
+        Some(r) => r?,
+        None => return Ok(()),
+    };
+    if msg_count == 0 || unique_bytes <= 0.0 {
+        return Ok(());
+    }
+    let avg_size = unique_bytes / msg_count as f64;
+    let rate = unique_bytes / secs;
+    let redundancy = (total_dup_bytes / n_nodes.max(1) as f64) / unique_bytes;
+    println!("  avg msg size: {avg_size:.1} bytes  ({} msgs)", msg_count);
+    println!(
+        "  total unique data: {}  ({}/s over {:.0}s)",
+        fmt_bytes(unique_bytes),
+        fmt_bytes(rate),
+        secs
+    );
+    println!(
+        "  redundant bandwidth factor: {redundancy:.2}  (per-node mean dup bytes / total unique bytes)"
+    );
     Ok(())
 }
 

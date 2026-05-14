@@ -26,7 +26,7 @@ path = "init_data/compact_traffic_2026-02-11_2026-02-13.parquet"
 # 30 minutes of sim time should make our expected sketch diffs big enough
 # to overtake any nexosim overhead in our samply profile recordings.
 [run]
-duration_seconds = 1800
+duration_seconds = 2400
 mailbox_capacity = 64
 progress_interval_seconds = 60
 flush_interval_seconds = 600

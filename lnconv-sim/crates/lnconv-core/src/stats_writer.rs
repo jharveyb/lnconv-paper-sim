@@ -639,6 +639,7 @@ fn build_msg_schema(percentiles: &[f64]) -> Arc<Schema> {
         Field::new("n_nodes", DataType::UInt64, false),
         Field::new("origin_ns", DataType::UInt64, false),
         Field::new("last_ns", DataType::UInt64, false),
+        Field::new("size_bytes", DataType::UInt32, false),
     ];
     for &p in percentiles {
         fields.push(Field::new(pct_col(p), DataType::UInt64, true));
@@ -653,6 +654,7 @@ fn msg_to_batch(schema: &Arc<Schema>, percentiles: &[f64], rows: &[MsgStats]) ->
     let mut n_nodes = UInt64Builder::with_capacity(n);
     let mut origin_ns = UInt64Builder::with_capacity(n);
     let mut last_ns = UInt64Builder::with_capacity(n);
+    let mut size_bytes = UInt32Builder::with_capacity(n);
     let mut pct_builders: Vec<UInt64Builder> = (0..percentiles.len())
         .map(|_| UInt64Builder::with_capacity(n))
         .collect();
@@ -662,6 +664,7 @@ fn msg_to_batch(schema: &Arc<Schema>, percentiles: &[f64], rows: &[MsgStats]) ->
         n_nodes.append_value(r.n_nodes as u64);
         origin_ns.append_value(r.origin_ns);
         last_ns.append_value(r.last_ns);
+        size_bytes.append_value(r.size_bytes);
         for (i, _p) in percentiles.iter().enumerate() {
             let v = r.percentiles.get(i).and_then(|(_, d)| *d).map(|d| d.as_nanos() as u64);
             pct_builders[i].append_option(v);
@@ -673,6 +676,7 @@ fn msg_to_batch(schema: &Arc<Schema>, percentiles: &[f64], rows: &[MsgStats]) ->
         Arc::new(n_nodes.finish()),
         Arc::new(origin_ns.finish()),
         Arc::new(last_ns.finish()),
+        Arc::new(size_bytes.finish()),
     ];
     for mut b in pct_builders {
         columns.push(Arc::new(b.finish()));

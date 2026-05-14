@@ -27,7 +27,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use nexosim::ports::{EventSource, Output};
 use nexosim::simulation::{EventId, Mailbox, SimInit, Simulation};
 use nexosim::time::MonotonicTime;
@@ -63,7 +63,7 @@ pub struct RunResult {
 /// per-message convergence stats should be reported for; baked into the
 /// metrics handle now so finalized summaries can be computed
 /// incrementally as messages reach 100% coverage.
-pub fn run(cfg: &SimConfig, percentiles: Vec<f64>) -> Result<RunResult> {
+pub fn run(cfg: &SimConfig, percentiles: Vec<f64>, data_dir: &std::path::Path) -> Result<RunResult> {
     // Topology build is split into three phases so per-vertex algo
     // can drive the per-vertex peer-build `k`:
     //   1. Vertices are added with `default_algo`.
@@ -201,11 +201,13 @@ pub fn run(cfg: &SimConfig, percentiles: Vec<f64>) -> Result<RunResult> {
         registry.mean_per_node()
     );
 
-    let stats_tag = crate::stats_writer::auto_tag(
+    std::fs::create_dir_all(data_dir)
+        .with_context(|| format!("create data dir {}", data_dir.display()))?;
+    let stats_tag = data_dir.join(crate::stats_writer::auto_tag(
         topology_kind_name(&cfg.topology),
         algo_kind_name(&cfg.algo),
         event_kind_name(&cfg.event),
-    );
+    ));
     println!(
         "stats: streaming Parquet output with tag prefix `{}` \
          (six files: msg_stats, node_counters, node_reservoirs, \
