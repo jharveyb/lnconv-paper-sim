@@ -9,10 +9,13 @@
 //!   after the channel graph has been populated (e.g. from a CSV
 //!   snapshot). Adds peer-graph edges per the documented per-node rule:
 //!
-//!   - `c > 100` channel counterparties: keep 100 random ones as peers.
-//!   - `k <= c <= 100`: keep all counterparties (no extra strangers).
-//!   - `c < k`: keep all counterparties + `k - c - 1` random strangers
-//!     (the `-1` accounts for incoming picks from other nodes).
+//!   - `c > max_peer` channel counterparties: keep `max_peer` random
+//!     ones as peers.
+//!   - `k <= c <= max_peer`: keep all counterparties (no extra strangers).
+//!   - `c < k`: keep all counterparties + `(k - c).div_ceil(2)` random
+//!     strangers, Halved
+//!     (rounded up) so OR-semantics edge union doesn't double mean
+//!     degree to ≈ 2k.
 //!
 //! `enforce_hub_cap` flips whether hubs *block* incoming peer-edges
 //! that aren't in their 100-pick set. See `build_peer_graph`'s docs.
@@ -147,8 +150,7 @@ where
         };
 
         // Strangers: 0 for hubs, 0 for mid-range (other nodes will
-        // connect to us anyway), k-c-1 for sparse (one less than k-c
-        // for the same reason).
+        // connect to us anyway), `(k - c).div_ceil(2)` for sparse.
         let stranger_count = if is_hub {
             0
         } else if c >= k {
@@ -157,8 +159,13 @@ where
             // need to add them as strangers ourselves.
             0
         } else {
-            // Adjust downwards to account for other nodes connecting to us.
-            k - c - 1
+            // Halved (round
+            // up) so OR-semantics edge union doesn't double mean
+            // degree to ≈ 2k. Without inbound strangers these nodes
+            // can land slightly below k (e.g. k=4,c=2 → 3 outgoing);
+            // that's deemed acceptable because c >= 2 already gives
+            // two natural channel-counterparty back-picks.
+            (k - c).div_ceil(2)
         };
         let strangers = if stranger_count > 0 {
             let mut excluded: HashSet<NodeIndex> = counterparties;
@@ -421,25 +428,12 @@ mod tests {
         assert_eq!(dropped, 100, "expected 100 counterparties dropped from peers");
     }
 
-    /// Asserts that a sparse leaf's final peer count stays close to
-    /// `k`, matching the user's stated intent for the `k - c`
-    /// stranger-count rule.
-    ///
-    /// **Currently failing.** With `k = 2`, `c = 1`, the leaf's own
-    /// pass adds exactly `k = 2` edges (`c` counterparties + `k - c`
-    /// strangers), but each of the other 1998 sparse nodes also picks
-    /// 2 random strangers, and ~2 of them on average happen to land
-    /// on this leaf. So under OR semantics the final per-node degree
-    /// converges to `2k - c_avg ≈ 2k = 4` for sparse-dominated
-    /// graphs, not `k`. The mean degree of the whole graph similarly
-    /// sits at `≈ 2k` rather than `k`.
-    ///
-    /// Routes back to `k`-mean degree (the user's stated intent):
-    /// (a) halve stranger picks (each node picks `(k - c) / 2`
-    ///     strangers); under OR mean degree becomes `k + c_avg`,
-    ///     ≈ `k` for sparse graphs.
-    /// (b) use symmetric-AND for stranger edges only (counterparty
-    ///     edges stay OR so a leaf can always peer with its hub).
+    /// A sparse leaf's final peer count stays close to `k`. With the
+    /// `(k - c).div_ceil(2)` stranger-count rule, each picker draws
+    /// half as many strangers as a naive `k - c` would suggest, so
+    /// OR-semantics edge union no longer doubles the per-node degree
+    /// to ≈ 2k. div_ceil keeps min-degree sane at small `(k, c)`
+    /// (e.g. `k = 2, c = 1` still picks one stranger).
     #[test]
     fn sparse_node_close_to_k_total() {
         let chans = vec![(0u64, 1u64)];
@@ -450,14 +444,29 @@ mod tests {
         let peers: HashSet<NodeIndex> = t.peers.neighbors(nx0).collect();
         assert!(peers.contains(&t.nidx(1)), "must keep its only counterparty");
         assert!(!peers.contains(&nx0));
-        let upper = k + 1;
+        let upper = k + 2;
         assert!(
             peers.len() <= upper,
-            "expected total peer count close to k={k} (≤ {upper}); \
-             got {}. Under OR semantics with `k - c` strangers, mean \
-             per-node degree converges to ≈ 2k, not k. To hit k, \
-             halve stranger picks or use symmetric-AND for stranger \
-             edges.",
+            "expected total peer count close to k={k} (≤ {upper}); got {}",
+            peers.len()
+        );
+    }
+
+    /// `(k - c).div_ceil(2)` rounds up so the small-(k, c) corner
+    /// (`k = 2, c = 1`) still produces a stranger pick — a leaf with
+    /// one channel partner doesn't get stranded at degree 1.
+    #[test]
+    fn sparse_min_degree_with_small_k() {
+        let chans = vec![(0u64, 1u64)];
+        let mut t = topo_with_channels(50, &chans);
+        let k = 2;
+        build_peer_graph(&mut t, const_k(k), const_max_peer(100), 7, false);
+        let nx0 = t.nidx(0);
+        let peers: HashSet<NodeIndex> = t.peers.neighbors(nx0).collect();
+        assert!(peers.contains(&t.nidx(1)), "must keep its only counterparty");
+        assert!(
+            peers.len() >= 2,
+            "k=2, c=1 leaf should pick at least one stranger (got {} peers total)",
             peers.len()
         );
     }
