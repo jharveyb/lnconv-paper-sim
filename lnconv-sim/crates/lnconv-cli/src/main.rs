@@ -41,6 +41,13 @@ struct Cli {
     /// `sim_output/from_csv-sketch-parquet_replay-2026-05-13-1430`.
     #[arg(long, value_name = "TAG")]
     report: Option<PathBuf>,
+    /// Short human-readable label prepended to every output Parquet's
+    /// shared filename stem (before the topology/algo/event/timestamp
+    /// portion). Lets you distinguish runs at a glance instead of
+    /// having to read timestamps. Free-form; pick something short
+    /// like `flood-baseline` or `fullrecon-cap128`.
+    #[arg(long, value_name = "NAME")]
+    name: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -64,7 +71,12 @@ fn main() -> Result<()> {
     }
     println!("config: {cfg:#?}");
 
-    let result = sim::run(&cfg, PERCENTILES.to_vec(), &cli.datadir)?;
+    let result = sim::run(
+        &cfg,
+        PERCENTILES.to_vec(),
+        &cli.datadir,
+        cli.name.as_deref(),
+    )?;
     let tag = result.metrics.tag_prefix();
     println!(
         "simulation finished: {} distinct messages",

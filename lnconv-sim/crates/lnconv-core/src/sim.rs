@@ -63,7 +63,12 @@ pub struct RunResult {
 /// per-message convergence stats should be reported for; baked into the
 /// metrics handle now so finalized summaries can be computed
 /// incrementally as messages reach 100% coverage.
-pub fn run(cfg: &SimConfig, percentiles: Vec<f64>, data_dir: &std::path::Path) -> Result<RunResult> {
+pub fn run(
+    cfg: &SimConfig,
+    percentiles: Vec<f64>,
+    data_dir: &std::path::Path,
+    name: Option<&str>,
+) -> Result<RunResult> {
     // Topology build is split into three phases so per-vertex algo
     // can drive the per-vertex peer-build `k`:
     //   1. Vertices are added with `default_algo`.
@@ -207,6 +212,7 @@ pub fn run(cfg: &SimConfig, percentiles: Vec<f64>, data_dir: &std::path::Path) -
         topology_kind_name(&cfg.topology),
         algo_kind_name(&cfg.algo),
         event_kind_name(&cfg.event),
+        name,
     ));
     println!(
         "stats: streaming Parquet output with tag prefix `{}` \
@@ -229,15 +235,14 @@ pub fn run(cfg: &SimConfig, percentiles: Vec<f64>, data_dir: &std::path::Path) -
     let event_counts = count_event_kinds(&event_tuples);
     log_event_kind_breakdown(event_counts, run_duration);
 
-    // Write the single-row run_meta + node_pubkey rows to Parquet
-    // before any sim activity. DuckDB picks them up alongside the
-    // streamed rows from the aggregator.
-    write_run_meta(&metrics, cfg, &topo_stats.peers, event_counts);
+    // node_pubkey rows are static (built from the FromCsv loader)
+    // and safe to write before any sim activity.
     if let Some(pk_map) = &pubkey_of {
         write_node_pubkey_rows(&metrics, &topology, pk_map);
     }
 
     let deadline = MonotonicTime::EPOCH + run_duration;
+    let wall_start = std::time::Instant::now();
 
     match &cfg.algo {
         AlgoCfg::Flooding {} => run_flooding(
@@ -263,6 +268,12 @@ pub fn run(cfg: &SimConfig, percentiles: Vec<f64>, data_dir: &std::path::Path) -
             )?;
         }
     }
+
+    let wall_time_secs = wall_start.elapsed().as_secs_f64();
+    // Write the single-row run_meta NOW so it includes the actual
+    // wall-clock runtime. DuckDB picks it up alongside the streamed
+    // rows from the aggregator.
+    write_run_meta(&metrics, cfg, &topo_stats.peers, event_counts, wall_time_secs);
 
     // Convert any messages still in-flight at the deadline into final
     // stats with whatever partial coverage they reached.
@@ -470,14 +481,12 @@ fn count_event_kinds(tuples: &[(Duration, NodeId, Gossip)]) -> EventKindCounts {
     c
 }
 
-/// Write the single-row `run_meta-<tag>.parquet`. Captures the
-/// inputs that would otherwise have to be re-derived from the
-/// (potentially-unsaved) config file.
 fn write_run_meta(
     metrics: &MetricsHandle,
     cfg: &SimConfig,
     peers: &crate::topology::metrics::GraphMetrics,
     event_counts: EventKindCounts,
+    wall_time_secs: f64,
 ) {
     let (cap_cu, cap_na, cap_ca) = match &cfg.algo {
         AlgoCfg::Sketch {
@@ -505,6 +514,7 @@ fn write_run_meta(
         crate::stats_writer::RunMetaInputs {
             seed: cfg.seed,
             duration_seconds: cfg.run.duration_seconds,
+            wall_time_secs,
             algo: algo_kind_name(&cfg.algo),
             topology_kind: topology_kind_name(&cfg.topology),
             event_kind: event_kind_name(&cfg.event),

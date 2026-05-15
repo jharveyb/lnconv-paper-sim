@@ -98,7 +98,6 @@ fn print_minmaxtotal(label: &str, min: u64, p50: u64, mean: u64, p95: u64, max: 
 
 // ---- run_meta -------------------------------------------------------
 
-#[derive(Debug)]
 struct RunMetaSnapshot {
     seed: u64,
     n_nodes: u64,
@@ -115,6 +114,7 @@ struct RunMetaSnapshot {
     ev_na: u64,
     ev_ca: u64,
     duration_seconds: u64,
+    wall_time_secs: f64,
     p50_secs: f64,
     p99_secs: f64,
     p100_secs: f64,
@@ -142,12 +142,13 @@ impl<'a> TryFrom<&Row<'a>> for RunMetaSnapshot {
             ev_na: row.get(12)?,
             ev_ca: row.get(13)?,
             duration_seconds: row.get(14)?,
-            p50_secs: row.get(15)?,
-            p99_secs: row.get(16)?,
-            p100_secs: row.get(17)?,
-            algo: row.get(18)?,
-            topology_kind: row.get(19)?,
-            event_kind: row.get(20)?,
+            wall_time_secs: row.get(15)?,
+            p50_secs: row.get(16)?,
+            p99_secs: row.get(17)?,
+            p100_secs: row.get(18)?,
+            algo: row.get(19)?,
+            topology_kind: row.get(20)?,
+            event_kind: row.get(21)?,
         })
     }
 }
@@ -158,7 +159,7 @@ fn print_run_meta(conn: &Connection) -> Result<()> {
                 mean_path_length, stagger_secs,
                 capacity_chan_updates, capacity_node_anns, capacity_chan_anns,
                 events_chan_update, events_node_ann, events_chan_ann,
-                duration_seconds,
+                duration_seconds, wall_time_secs,
                 predicted_p50_secs, predicted_p99_secs, predicted_p100_secs,
                 algo, topology_kind, event_kind
          FROM run_meta",
@@ -175,8 +176,13 @@ fn print_run_meta(conn: &Connection) -> Result<()> {
         "  seed={}  algo={}  topology={}  event={}",
         m.seed, m.algo, m.topology_kind, m.event_kind
     );
+    let wall_pretty = if m.wall_time_secs > 0.0 {
+        format!("  wall_time={:.2}s", m.wall_time_secs)
+    } else {
+        String::new()
+    };
     println!(
-        "  duration={}s  n_nodes={}  mean_degree={:.2} min={} max={}  diameter={}  L̄={:.2}",
+        "  duration={}s{wall_pretty}  n_nodes={}  mean_degree={:.2} min={} max={}  diameter={}  L̄={:.2}",
         m.duration_seconds,
         m.n_nodes,
         m.mean_degree,
@@ -434,6 +440,7 @@ struct SketchTotals {
     o_cu: u64,
     o_na: u64,
     o_ca: u64,
+    n_nodes: u64,
     ss_min: u64,
     ss_p50: u64,
     ss_p95: u64,
@@ -463,22 +470,23 @@ impl<'a> TryFrom<&Row<'a>> for SketchTotals {
             o_cu: u64_from_f64(row, 4),
             o_na: u64_from_f64(row, 5),
             o_ca: u64_from_f64(row, 6),
-            ss_min: u64_from_f64(row, 7),
-            ss_p50: u64_from_f64(row, 8),
-            ss_p95: u64_from_f64(row, 9),
-            ss_max: u64_from_f64(row, 10),
-            sr_min: u64_from_f64(row, 11),
-            sr_p50: u64_from_f64(row, 12),
-            sr_p95: u64_from_f64(row, 13),
-            sr_max: u64_from_f64(row, 14),
-            is_min: u64_from_f64(row, 15),
-            is_p50: u64_from_f64(row, 16),
-            is_p95: u64_from_f64(row, 17),
-            is_max: u64_from_f64(row, 18),
-            ir_min: u64_from_f64(row, 19),
-            ir_p50: u64_from_f64(row, 20),
-            ir_p95: u64_from_f64(row, 21),
-            ir_max: u64_from_f64(row, 22),
+            n_nodes: u64_from_f64(row, 7),
+            ss_min: u64_from_f64(row, 8),
+            ss_p50: u64_from_f64(row, 9),
+            ss_p95: u64_from_f64(row, 10),
+            ss_max: u64_from_f64(row, 11),
+            sr_min: u64_from_f64(row, 12),
+            sr_p50: u64_from_f64(row, 13),
+            sr_p95: u64_from_f64(row, 14),
+            sr_max: u64_from_f64(row, 15),
+            is_min: u64_from_f64(row, 16),
+            is_p50: u64_from_f64(row, 17),
+            is_p95: u64_from_f64(row, 18),
+            is_max: u64_from_f64(row, 19),
+            ir_min: u64_from_f64(row, 20),
+            ir_p50: u64_from_f64(row, 21),
+            ir_p95: u64_from_f64(row, 22),
+            ir_max: u64_from_f64(row, 23),
         })
     }
 }
@@ -494,6 +502,7 @@ fn print_sketch_totals(conn: &Connection) -> Result<()> {
             SUM(sketches_sent), SUM(sketches_received),
             SUM(inventories_sent), SUM(inventories_received),
             SUM(overflowed_chan_updates), SUM(overflowed_node_anns), SUM(overflowed_chan_anns),
+            COUNT(*),
             MIN(sketches_sent), quantile_cont(sketches_sent, 0.5),
               quantile_cont(sketches_sent, 0.95), MAX(sketches_sent),
             MIN(sketches_received), quantile_cont(sketches_received, 0.5),
@@ -517,6 +526,11 @@ fn print_sketch_totals(conn: &Connection) -> Result<()> {
     } else {
         0.0
     };
+    let n = t.n_nodes.max(1);
+    let ss_mean = t.sent / n;
+    let sr_mean = t.received / n;
+    let is_mean = t.inv_sent / n;
+    let ir_mean = t.inv_received / n;
     println!("\nsketch protocol:");
     println!("  sketches sent / received:    {} / {}", t.sent, t.received);
     if t.inv_sent > 0 || t.inv_received > 0 {
@@ -531,21 +545,21 @@ fn print_sketch_totals(conn: &Connection) -> Result<()> {
         t.o_cu, t.o_na, t.o_ca
     );
     println!(
-        "  per-node sketches_sent:        min={:>6} p50={:>6} p95={:>6} max={:>6}",
-        t.ss_min, t.ss_p50, t.ss_p95, t.ss_max
+        "  per-node sketches_sent:        min={:>6} p50={:>6} mean={:>6} p95={:>6} max={:>6}",
+        t.ss_min, t.ss_p50, ss_mean, t.ss_p95, t.ss_max
     );
     println!(
-        "  per-node sketches_received:    min={:>6} p50={:>6} p95={:>6} max={:>6}",
-        t.sr_min, t.sr_p50, t.sr_p95, t.sr_max
+        "  per-node sketches_received:    min={:>6} p50={:>6} mean={:>6} p95={:>6} max={:>6}",
+        t.sr_min, t.sr_p50, sr_mean, t.sr_p95, t.sr_max
     );
     if t.inv_sent > 0 || t.inv_received > 0 {
         println!(
-            "  per-node inventories_sent:     min={:>6} p50={:>6} p95={:>6} max={:>6}",
-            t.is_min, t.is_p50, t.is_p95, t.is_max
+            "  per-node inventories_sent:     min={:>6} p50={:>6} mean={:>6} p95={:>6} max={:>6}",
+            t.is_min, t.is_p50, is_mean, t.is_p95, t.is_max
         );
         println!(
-            "  per-node inventories_received: min={:>6} p50={:>6} p95={:>6} max={:>6}",
-            t.ir_min, t.ir_p50, t.ir_p95, t.ir_max
+            "  per-node inventories_received: min={:>6} p50={:>6} mean={:>6} p95={:>6} max={:>6}",
+            t.ir_min, t.ir_p50, ir_mean, t.ir_p95, t.ir_max
         );
     }
     Ok(())

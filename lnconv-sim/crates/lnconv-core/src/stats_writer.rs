@@ -229,6 +229,10 @@ pub struct RunMetaRow {
     pub events_node_ann: u64,
     pub events_chan_ann: u64,
     pub duration_seconds: u64,
+    /// Wall-clock seconds spent inside the simulator's drive loop.
+    /// Populated AFTER the sim completes; the run_meta row is written
+    /// at end-of-sim so this is always meaningful.
+    pub wall_time_secs: f64,
     pub predicted_p50_secs: f64,
     pub predicted_p99_secs: f64,
     pub predicted_p100_secs: f64,
@@ -237,11 +241,10 @@ pub struct RunMetaRow {
     pub event_kind: String,
 }
 
-/// Inputs to [`RunMetaRow::new`]. Groups the integer config fields so
-/// the constructor signature stays under control.
 pub struct RunMetaInputs<'a> {
     pub seed: u64,
     pub duration_seconds: u64,
+    pub wall_time_secs: f64,
     pub algo: &'a str,
     pub topology_kind: &'a str,
     pub event_kind: &'a str,
@@ -289,6 +292,7 @@ impl RunMetaRow {
             events_node_ann: inputs.events_node_ann,
             events_chan_ann: inputs.events_chan_ann,
             duration_seconds: inputs.duration_seconds,
+            wall_time_secs: inputs.wall_time_secs,
             predicted_p50_secs: p50,
             predicted_p99_secs: p99,
             predicted_p100_secs: p100,
@@ -542,6 +546,7 @@ impl WriteRow for RunMetaRow {
             Field::new("events_node_ann", DataType::UInt64, false),
             Field::new("events_chan_ann", DataType::UInt64, false),
             Field::new("duration_seconds", DataType::UInt64, false),
+            Field::new("wall_time_secs", DataType::Float64, false),
             Field::new("predicted_p50_secs", DataType::Float64, false),
             Field::new("predicted_p99_secs", DataType::Float64, false),
             Field::new("predicted_p100_secs", DataType::Float64, false),
@@ -568,6 +573,7 @@ impl WriteRow for RunMetaRow {
         let mut ev_na = UInt64Builder::with_capacity(n);
         let mut ev_ca = UInt64Builder::with_capacity(n);
         let mut duration = UInt64Builder::with_capacity(n);
+        let mut wall_time = Float64Builder::with_capacity(n);
         let mut p50 = Float64Builder::with_capacity(n);
         let mut p99 = Float64Builder::with_capacity(n);
         let mut p100 = Float64Builder::with_capacity(n);
@@ -590,6 +596,7 @@ impl WriteRow for RunMetaRow {
             ev_na.append_value(r.events_node_ann);
             ev_ca.append_value(r.events_chan_ann);
             duration.append_value(r.duration_seconds);
+            wall_time.append_value(r.wall_time_secs);
             p50.append_value(r.predicted_p50_secs);
             p99.append_value(r.predicted_p99_secs);
             p100.append_value(r.predicted_p100_secs);
@@ -613,6 +620,7 @@ impl WriteRow for RunMetaRow {
             Arc::new(ev_na.finish()),
             Arc::new(ev_ca.finish()),
             Arc::new(duration.finish()),
+            Arc::new(wall_time.finish()),
             Arc::new(p50.finish()),
             Arc::new(p99.finish()),
             Arc::new(p100.finish()),
@@ -931,11 +939,13 @@ fn pct_col(p: f64) -> String {
     }
 }
 
-/// `{topology}-{algo}-{event}-{YYYY-MM-DD-HHMM}` — shared filename
-/// stem all six Parquet files derive from.
-pub fn auto_tag(topology: &str, algo: &str, event: &str) -> PathBuf {
+pub fn auto_tag(topology: &str, algo: &str, event: &str, name: Option<&str>) -> PathBuf {
     let stamp = chrono::Local::now().format("%Y-%m-%d-%H%M").to_string();
-    PathBuf::from(format!("{topology}-{algo}-{event}-{stamp}"))
+    let stem = match name {
+        Some(n) if !n.is_empty() => format!("{n}-{topology}-{algo}-{event}-{stamp}"),
+        _ => format!("{topology}-{algo}-{event}-{stamp}"),
+    };
+    PathBuf::from(stem)
 }
 
 /// Convenience used by tests to assert all 6 output files were produced.
