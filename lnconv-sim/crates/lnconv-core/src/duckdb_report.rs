@@ -457,6 +457,16 @@ struct SketchTotals {
     ir_p50: u64,
     ir_p95: u64,
     ir_max: u64,
+    /// True per-message min/max key count (the smallest / largest
+    /// any node ever sent in one inventory). Mean is computed from
+    /// `inv_keys_total / inv_sent`. p50/p95 come from the cross-node
+    /// distribution of per-node averages — an approximation since we
+    /// don't carry per-message samples.
+    keys_per_msg_min: u64,
+    keys_per_msg_max: u64,
+    inv_keys_total: u64,
+    keys_per_node_avg_p50: u64,
+    keys_per_node_avg_p95: u64,
 }
 
 impl<'a> TryFrom<&Row<'a>> for SketchTotals {
@@ -487,6 +497,11 @@ impl<'a> TryFrom<&Row<'a>> for SketchTotals {
             ir_p50: u64_from_f64(row, 21),
             ir_p95: u64_from_f64(row, 22),
             ir_max: u64_from_f64(row, 23),
+            keys_per_msg_min: u64_from_f64(row, 24),
+            keys_per_msg_max: u64_from_f64(row, 25),
+            inv_keys_total: u64_from_f64(row, 26),
+            keys_per_node_avg_p50: u64_from_f64(row, 27),
+            keys_per_node_avg_p95: u64_from_f64(row, 28),
         })
     }
 }
@@ -497,7 +512,12 @@ fn print_sketch_totals(conn: &Connection) -> Result<()> {
             SELECT *, ROW_NUMBER() OVER (PARTITION BY node_idx ORDER BY time_ns DESC) AS rn
             FROM counters
         ),
-        finals AS (SELECT * FROM latest WHERE rn = 1)
+        finals AS (SELECT * FROM latest WHERE rn = 1),
+        per_node_keys AS (
+            SELECT inv_keys_sent_sum / inventories_sent AS avg_keys
+            FROM finals
+            WHERE inventories_sent > 0
+        )
         SELECT
             SUM(sketches_sent), SUM(sketches_received),
             SUM(inventories_sent), SUM(inventories_received),
@@ -510,7 +530,12 @@ fn print_sketch_totals(conn: &Connection) -> Result<()> {
             MIN(inventories_sent), quantile_cont(inventories_sent, 0.5),
               quantile_cont(inventories_sent, 0.95), MAX(inventories_sent),
             MIN(inventories_received), quantile_cont(inventories_received, 0.5),
-              quantile_cont(inventories_received, 0.95), MAX(inventories_received)
+              quantile_cont(inventories_received, 0.95), MAX(inventories_received),
+            MIN(inv_keys_sent_min) FILTER (WHERE inventories_sent > 0),
+            MAX(inv_keys_sent_max),
+            SUM(inv_keys_sent_sum),
+            (SELECT quantile_cont(avg_keys, 0.5) FROM per_node_keys),
+            (SELECT quantile_cont(avg_keys, 0.95) FROM per_node_keys)
         FROM finals";
     let mut stmt = conn.prepare(sql)?;
     let t: SketchTotals = match stmt.query_and_then([], |r| SketchTotals::try_from(r))?.next() {
@@ -561,6 +586,22 @@ fn print_sketch_totals(conn: &Connection) -> Result<()> {
             "  per-node inventories_received: min={:>6} p50={:>6} mean={:>6} p95={:>6} max={:>6}",
             t.ir_min, t.ir_p50, ir_mean, t.ir_p95, t.ir_max
         );
+        if t.inv_sent > 0 {
+            // True per-message stats: min and max are the smallest/
+            // largest single inventory message ever sent; mean is
+            // total_keys / total_messages. p50/p95 are approximated
+            // from cross-node averages (we don't carry per-message
+            // samples, so an outlier-heavy node's tail is hidden).
+            let mean_keys = t.inv_keys_total / t.inv_sent;
+            println!(
+                "  inventory keys per message:    min={:>6} p50={:>6} mean={:>6} p95={:>6} max={:>6} (p50/p95 over per-node averages)",
+                t.keys_per_msg_min,
+                t.keys_per_node_avg_p50,
+                mean_keys,
+                t.keys_per_node_avg_p95,
+                t.keys_per_msg_max,
+            );
+        }
     }
     Ok(())
 }

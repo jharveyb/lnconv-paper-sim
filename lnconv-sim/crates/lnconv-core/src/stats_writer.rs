@@ -131,6 +131,9 @@ pub struct NodeCountersRow {
     pub sketches_received: u64,
     pub inventories_sent: u64,
     pub inventories_received: u64,
+    pub inv_keys_sent_sum: u64,
+    pub inv_keys_sent_min: u64,
+    pub inv_keys_sent_max: u64,
     pub overflowed_chan_updates: u64,
     pub overflowed_node_anns: u64,
     pub overflowed_chan_anns: u64,
@@ -162,6 +165,9 @@ impl NodeCountersRow {
             sketches_received: c.sketches_received,
             inventories_sent: c.inventories_sent,
             inventories_received: c.inventories_received,
+            inv_keys_sent_sum: c.inv_keys_sent_sum,
+            inv_keys_sent_min: c.inv_keys_sent_min,
+            inv_keys_sent_max: c.inv_keys_sent_max,
             overflowed_chan_updates: c.overflowed_chan_updates,
             overflowed_node_anns: c.overflowed_node_anns,
             overflowed_chan_anns: c.overflowed_chan_anns,
@@ -343,6 +349,9 @@ impl WriteRow for NodeCountersRow {
             Field::new("sketches_received", DataType::UInt64, false),
             Field::new("inventories_sent", DataType::UInt64, false),
             Field::new("inventories_received", DataType::UInt64, false),
+            Field::new("inv_keys_sent_sum", DataType::UInt64, false),
+            Field::new("inv_keys_sent_min", DataType::UInt64, false),
+            Field::new("inv_keys_sent_max", DataType::UInt64, false),
             Field::new("overflowed_chan_updates", DataType::UInt64, false),
             Field::new("overflowed_node_anns", DataType::UInt64, false),
             Field::new("overflowed_chan_anns", DataType::UInt64, false),
@@ -376,6 +385,9 @@ impl WriteRow for NodeCountersRow {
         let mut sketches_received = UInt64Builder::with_capacity(n);
         let mut inventories_sent = UInt64Builder::with_capacity(n);
         let mut inventories_received = UInt64Builder::with_capacity(n);
+        let mut inv_keys_sum = UInt64Builder::with_capacity(n);
+        let mut inv_keys_min = UInt64Builder::with_capacity(n);
+        let mut inv_keys_max = UInt64Builder::with_capacity(n);
         let mut o_cu = UInt64Builder::with_capacity(n);
         let mut o_na = UInt64Builder::with_capacity(n);
         let mut o_ca = UInt64Builder::with_capacity(n);
@@ -403,6 +415,9 @@ impl WriteRow for NodeCountersRow {
             sketches_received.append_value(r.sketches_received);
             inventories_sent.append_value(r.inventories_sent);
             inventories_received.append_value(r.inventories_received);
+            inv_keys_sum.append_value(r.inv_keys_sent_sum);
+            inv_keys_min.append_value(r.inv_keys_sent_min);
+            inv_keys_max.append_value(r.inv_keys_sent_max);
             o_cu.append_value(r.overflowed_chan_updates);
             o_na.append_value(r.overflowed_node_anns);
             o_ca.append_value(r.overflowed_chan_anns);
@@ -431,6 +446,9 @@ impl WriteRow for NodeCountersRow {
             Arc::new(sketches_received.finish()),
             Arc::new(inventories_sent.finish()),
             Arc::new(inventories_received.finish()),
+            Arc::new(inv_keys_sum.finish()),
+            Arc::new(inv_keys_min.finish()),
+            Arc::new(inv_keys_max.finish()),
             Arc::new(o_cu.finish()),
             Arc::new(o_na.finish()),
             Arc::new(o_ca.finish()),

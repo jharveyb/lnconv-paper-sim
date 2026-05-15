@@ -119,6 +119,12 @@ pub struct NodeCounters {
     pub sketches_received: u64,
     pub inventories_sent: u64,
     pub inventories_received: u64,
+    /// Sum of `keys.len()` over every `Inventory` this node SENT.
+    /// Paired with `inventories_sent` to give a true per-message
+    /// mean; min/max bracket the per-node range.
+    pub inv_keys_sent_sum: u64,
+    pub inv_keys_sent_min: u64,
+    pub inv_keys_sent_max: u64,
     pub overflowed_chan_updates: u64,
     pub overflowed_node_anns: u64,
     pub overflowed_chan_anns: u64,
@@ -286,6 +292,13 @@ pub struct PerNodeMetrics {
     pub inventories_sent: u64,
     /// Count of `WireMessage::Inventory` requests this node received.
     pub inventories_received: u64,
+    /// Sum of keys carried across all outbound inventory messages
+    /// from this node — paired with `inventories_sent` to compute
+    /// the true mean keys-per-message. Per-node min and max bracket
+    /// the per-message distribution (see report's `inv_keys` line).
+    pub inv_keys_sent_sum: u64,
+    pub inv_keys_sent_min: u64,
+    pub inv_keys_sent_max: u64,
     pub overflowed_chan_updates: u64,
     pub overflowed_node_anns: u64,
     pub overflowed_chan_anns: u64,
@@ -346,6 +359,9 @@ impl PerNodeMetrics {
             sketches_received: self.sketches_received,
             inventories_sent: self.inventories_sent,
             inventories_received: self.inventories_received,
+            inv_keys_sent_sum: self.inv_keys_sent_sum,
+            inv_keys_sent_min: self.inv_keys_sent_min,
+            inv_keys_sent_max: self.inv_keys_sent_max,
             overflowed_chan_updates: self.overflowed_chan_updates,
             overflowed_node_anns: self.overflowed_node_anns,
             overflowed_chan_anns: self.overflowed_chan_anns,

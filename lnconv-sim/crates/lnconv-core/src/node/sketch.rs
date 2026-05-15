@@ -430,8 +430,21 @@ impl SketchNode {
         if self.full_reconciliation && !diff.a_newer.is_empty() {
             let keys: Vec<u64> = diff.a_newer.iter().map(|g| g.state_key()).collect();
             let inv = InventoryMsg::new(self.id, sketch.kind.to_gossip(), keys);
+            let key_count = inv.keys.len() as u64;
             self.metrics_local.bytes_out_inventory += inv.size_bytes;
             self.metrics_local.inventories_sent += 1;
+            self.metrics_local.inv_keys_sent_sum =
+                self.metrics_local.inv_keys_sent_sum.saturating_add(key_count);
+            // 0 means "no inventory sent yet" — since we early-return
+            // on empty diff above, key_count >= 1 whenever this runs.
+            if self.metrics_local.inv_keys_sent_min == 0
+                || key_count < self.metrics_local.inv_keys_sent_min
+            {
+                self.metrics_local.inv_keys_sent_min = key_count;
+            }
+            if key_count > self.metrics_local.inv_keys_sent_max {
+                self.metrics_local.inv_keys_sent_max = key_count;
+            }
             if let Some(out) = self.outputs.get_mut(local) {
                 out.send(WireMessage::Inventory(inv)).await;
             }
