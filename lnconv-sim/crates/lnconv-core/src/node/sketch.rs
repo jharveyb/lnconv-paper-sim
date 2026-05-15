@@ -31,12 +31,16 @@ use nexosim::time::MonotonicTime;
 use serde::{Deserialize, Serialize};
 
 use crate::message::{
-    Gossip, GossipBatch, GossipKind, MsgId, NodeId, NodeIdx, Sketch, SketchKind, WireMessage,
+    Gossip, GossipBatch, GossipKind, InventoryMsg, MsgId, NodeId, NodeIdx, Sketch, SketchKind,
+    WireMessage,
 };
 use crate::metrics::{
     FIRST_SEEN_FORCE_FLUSH, FirstSeenEntry, MetricsHandle, PerNodeMetrics, ns_since_epoch,
 };
-use crate::state::{SharedNodeState, WhichSide, compute_diff, originate_stamp};
+use crate::state::{
+    SharedNodeState, WhichSide, compute_diff, originate_stamp, synth_chan_ann,
+    synth_chan_update, synth_node_ann, unpack_cu_key,
+};
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct SketchNode {
@@ -60,6 +64,16 @@ pub struct SketchNode {
     cap_chan_updates: u32,
     cap_node_anns: u32,
     cap_chan_anns: u32,
+    /// When `true`, `originate` ALSO broadcasts the freshly-stamped
+    /// gossip as `WireMessage::Single` to every connected peer
+    /// (sketch + flooding hybrid). Defaults to `false`.
+    flood_on_originate: bool,
+    /// When `true`, on receiving a sketch this node computes the
+    /// diff with `WhichSide::Both` and additionally sends a
+    /// `WireMessage::Inventory` asking the sketch's sender for items
+    /// present on its side that this node is missing. Defaults to
+    /// `false`.
+    full_reconciliation: bool,
     next_sketch_id: u32,
     /// How long until end of run; used to schedule the final
     /// `flush_summary` event.
@@ -92,6 +106,8 @@ impl SketchNode {
         cap_chan_updates: u32,
         cap_node_anns: u32,
         cap_chan_anns: u32,
+        flood_on_originate: bool,
+        full_reconciliation: bool,
         reservoir_cap: u32,
         reservoir_seed: u64,
         run_duration: Duration,
@@ -113,6 +129,8 @@ impl SketchNode {
             cap_chan_updates,
             cap_node_anns,
             cap_chan_anns,
+            flood_on_originate,
+            full_reconciliation,
             next_sketch_id: 0,
             run_duration,
             flush_interval,
@@ -211,15 +229,18 @@ impl SketchNode {
         }
     }
 
-    /// Inbound port. Three message kinds:
+    /// Inbound port. Four message kinds:
     ///
-    /// * `Single` / `Batch` — Gossips arriving as a sketch reply
-    ///   (or from a non-sketch peer in a mixed population). Run
-    ///   per-kind dedup against our state; record duplicates.
-    ///   Sketch nodes never re-broadcast — propagation happens
-    ///   exclusively via reconciliation.
+    /// * `Single` / `Batch` — Gossips arriving as a sketch reply, an
+    ///   inventory response, a flood-on-originate broadcast from a
+    ///   peer sketch node, or from a non-sketch peer in a mixed
+    ///   population. Run per-kind dedup against our state; record
+    ///   duplicates. Sketch nodes never re-broadcast — propagation
+    ///   happens via reconciliation (and optionally flood-on-originate).
     /// * `Sketch` — schedule the diff/reply via a schedulable
     ///   helper because `recv` is sync and can't `.await` on Outputs.
+    /// * `Inventory` — schedule a handler that synthesises the
+    ///   requested Gossips and replies with a `Batch`.
     pub fn recv(&mut self, wire: WireMessage, cx: &Context<Self>) {
         let wire_size = wire.wire_size();
         match wire {
@@ -236,20 +257,30 @@ impl SketchNode {
             WireMessage::Sketch(sketch) => {
                 self.metrics_local.bytes_in_sketch += wire_size;
                 cx.schedule_event(
-                    // 1 ms delay should give some breathing room.
-                    Duration::from_nanos(1000000),
+                    Duration::from_millis(1),
                     schedulable!(Self::handle_sketch),
                     sketch,
                 )
                 .expect("schedule handle_sketch");
             }
+            WireMessage::Inventory(inv) => {
+                self.metrics_local.bytes_in_inventory += wire_size;
+                cx.schedule_event(
+                    Duration::from_millis(1),
+                    schedulable!(Self::handle_inventory),
+                    inv,
+                )
+                .expect("schedule handle_inventory");
+            }
         }
     }
 
     /// Originated messages: stamp the timestamp via the per-kind
-    /// state lock, then *only* mark our own state. No fan-out — the
-    /// gossip will propagate to peers via the next round of sketches.
-    pub fn originate(&mut self, mut msg: Gossip, cx: &Context<Self>) {
+    /// state lock, then mark our own state. If `flood_on_originate`
+    /// is set, ALSO broadcast to every peer as `WireMessage::Single`
+    /// (sketch + flooding hybrid). Otherwise, no fan-out — the gossip
+    /// propagates only via the next round of sketches.
+    pub async fn originate(&mut self, mut msg: Gossip, cx: &Context<Self>) {
         if !originate_stamp(&self.state, self.id, &mut msg, cx.time()) {
             return;
         }
@@ -258,6 +289,21 @@ impl SketchNode {
             time_ns: ns_since_epoch(cx.time()),
         });
         self.metrics.bump_first_seen_count(1);
+
+        if self.flood_on_originate && !self.outputs.is_empty() {
+            // Gossip is Copy, so cloning the wire message is the only
+            // real cost per peer. Receivers absorb via the existing
+            // WireMessage::Single → absorb_one path.
+            let wire = WireMessage::Single(msg);
+            let per_peer = wire.wire_size();
+            for out in self.outputs.iter_mut() {
+                out.send(wire.clone()).await;
+            }
+            self.metrics_local.bytes_out_gossip = self
+                .metrics_local
+                .bytes_out_gossip
+                .saturating_add(per_peer.saturating_mul(self.outputs.len() as u64));
+        }
     }
 
     /// Per-peer ticker handler. Builds three sketches (one per kind)
@@ -293,6 +339,11 @@ impl SketchNode {
     /// superseded versions. Capacity overflow uses the **strict**
     /// counts (which include both stale and newer sides), matching
     /// how a real minisketch decode would fail.
+    ///
+    /// If `full_reconciliation` is set, this ALSO sends an
+    /// [`InventoryMsg`] asking the sender for items present on the
+    /// sender's side that we're missing (the `a_newer` half of the
+    /// diff). The sender responds with a `WireMessage::Batch`.
     #[nexosim(schedulable)]
     async fn handle_sketch(&mut self, sketch: Sketch, _cx: &Context<Self>) {
         let local = match self.peer_id_to_local.get(&sketch.from).copied() {
@@ -302,7 +353,17 @@ impl SketchNode {
             }
         };
         let peer_state = &self.peer_states[local];
-        let diff = compute_diff(peer_state, &self.state, sketch.kind, WhichSide::B);
+        // With full_reconciliation we materialise BOTH sides so we
+        // can send b_newer as the reply AND build an Inventory from
+        // a_newer's keys. Lock order is min-NodeIdx-first inside
+        // compute_diff (CLAUDE.md invariant 24) — no caller-side
+        // change needed.
+        let which = if self.full_reconciliation {
+            WhichSide::Both
+        } else {
+            WhichSide::B
+        };
+        let diff = compute_diff(peer_state, &self.state, sketch.kind, which);
         let total_diff = diff.a_only_count + diff.b_only_count;
         let overflow = total_diff > sketch.capacity as usize;
         self.metrics_local.sketches_received += 1;
@@ -351,12 +412,77 @@ impl SketchNode {
         // strictly newer on our side. From compute_diff(peer, self):
         // a_newer = peer's strictly newer; b_newer = self's strictly
         // newer. We send b_newer back.
-        if diff.b_newer.is_empty() {
+        if !diff.b_newer.is_empty() {
+            let bytes: u64 = diff.b_newer.iter().map(|g| g.size_bytes as u64).sum();
+            self.metrics_local.bytes_out_gossip += bytes;
+            let batch = Arc::new(GossipBatch::from_mixed_for_kind(
+                diff.b_newer,
+                sketch.kind.to_gossip(),
+            ));
+            if let Some(out) = self.outputs.get_mut(local) {
+                out.send(WireMessage::Batch(batch)).await;
+            }
+        }
+        // Full-reconciliation follow-up: ask the peer for items it
+        // has that we don't. a_newer is only populated when
+        // WhichSide::Both was requested.
+        if self.full_reconciliation && !diff.a_newer.is_empty() {
+            let keys: Vec<u64> = diff.a_newer.iter().map(|g| g.state_key()).collect();
+            let inv = InventoryMsg::new(self.id, sketch.kind.to_gossip(), keys);
+            self.metrics_local.bytes_out_inventory += inv.size_bytes;
+            if let Some(out) = self.outputs.get_mut(local) {
+                out.send(WireMessage::Inventory(inv)).await;
+            }
+        }
+    }
+
+
+    /// Inventory request from a peer running full-reconciliation:
+    /// look up each requested state-map key in our own state, then
+    /// reply with a `Batch` of the corresponding synthesised
+    /// [`Gossip`]s. Missing keys are silently dropped.
+    #[nexosim(schedulable)]
+    async fn handle_inventory(&mut self, inv: InventoryMsg, _cx: &Context<Self>) {
+        let Some(local) = self.peer_id_to_local.get(&inv.from).copied() else {
+            return;
+        };
+        let gossips: Vec<Gossip> = match inv.kind {
+            GossipKind::ChannelUpdate => {
+                let map = self.state.chan_updates.read();
+                inv.keys
+                    .iter()
+                    .filter_map(|k| {
+                        map.get(k).map(|(ts, size)| {
+                            let (scid, direction) = unpack_cu_key(*k);
+                            synth_chan_update(scid, direction, *ts, *size)
+                        })
+                    })
+                    .collect()
+            }
+            GossipKind::NodeAnnouncement => {
+                let map = self.state.node_anns.read();
+                inv.keys
+                    .iter()
+                    .filter_map(|k| {
+                        map.get(k)
+                            .map(|(ts, size)| synth_node_ann(*k, *ts, *size))
+                    })
+                    .collect()
+            }
+            GossipKind::ChannelAnnouncement => {
+                let map = self.state.chan_anns.read();
+                inv.keys
+                    .iter()
+                    .filter_map(|k| map.get(k).map(|size| synth_chan_ann(*k, *size)))
+                    .collect()
+            }
+        };
+        if gossips.is_empty() {
             return;
         }
-        let bytes: u64 = diff.b_newer.iter().map(|g| g.size_bytes as u64).sum();
+        let bytes: u64 = gossips.iter().map(|g| g.size_bytes as u64).sum();
         self.metrics_local.bytes_out_gossip += bytes;
-        let batch = Arc::new(GossipBatch::from_mixed_for_kind(diff.b_newer, sketch.kind.to_gossip()));
+        let batch = Arc::new(GossipBatch::from_mixed_for_kind(gossips, inv.kind));
         if let Some(out) = self.outputs.get_mut(local) {
             out.send(WireMessage::Batch(batch)).await;
         }

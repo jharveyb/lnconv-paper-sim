@@ -70,6 +70,10 @@ pub enum NodeAlgo {
         capacity_chan_updates: u32,
         capacity_node_anns: u32,
         capacity_chan_anns: u32,
+        /// See `AlgoCfg::Sketch::flood_on_originate`.
+        flood_on_originate: bool,
+        /// See `AlgoCfg::Sketch::full_reconciliation`.
+        full_reconciliation: bool,
     },
 }
 
@@ -93,11 +97,15 @@ impl From<&NodeAlgoKind> for NodeAlgo {
                 capacity_chan_updates,
                 capacity_node_anns,
                 capacity_chan_anns,
+                flood_on_originate,
+                full_reconciliation,
             } => NodeAlgo::Sketch {
                 stagger_ms: *stagger_ms,
                 capacity_chan_updates: *capacity_chan_updates,
                 capacity_node_anns: *capacity_node_anns,
                 capacity_chan_anns: *capacity_chan_anns,
+                flood_on_originate: *flood_on_originate,
+                full_reconciliation: *full_reconciliation,
             },
         }
     }

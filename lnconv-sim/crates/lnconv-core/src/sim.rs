@@ -295,11 +295,15 @@ fn default_algo_from(cfg: &AlgoCfg) -> NodeAlgo {
             capacity_chan_updates,
             capacity_node_anns,
             capacity_chan_anns,
+            flood_on_originate,
+            full_reconciliation,
         } => NodeAlgo::Sketch {
             stagger_ms: *stagger_ms,
             capacity_chan_updates: *capacity_chan_updates,
             capacity_node_anns: *capacity_node_anns,
             capacity_chan_anns: *capacity_chan_anns,
+            flood_on_originate: *flood_on_originate,
+            full_reconciliation: *full_reconciliation,
         },
     }
 }
@@ -888,6 +892,8 @@ fn run_stagger_population(
                 capacity_chan_updates,
                 capacity_node_anns,
                 capacity_chan_anns,
+                flood_on_originate,
+                full_reconciliation,
             } => {
                 sketch_local[nx.index()] = Some(sketch_nodes.len());
                 let reservoir_cap = cfg.run.reservoir_capacity_rounds;
@@ -899,6 +905,8 @@ fn run_stagger_population(
                     *capacity_chan_updates,
                     *capacity_node_anns,
                     *capacity_chan_anns,
+                    *flood_on_originate,
+                    *full_reconciliation,
                     reservoir_cap,
                     reservoir_seed,
                     run_duration,

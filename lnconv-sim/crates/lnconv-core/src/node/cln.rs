@@ -152,6 +152,7 @@ impl ClnNode {
                 self.absorb_node_anns(&batch.node_anns, cx);
             }
             WireMessage::Sketch(_) => {}
+            WireMessage::Inventory(_) => {}
         }
     }
 

@@ -90,6 +90,7 @@ impl Gossip {
     /// all-zero bytes in their slot — that's how the per-kind
     /// identity converges across nodes (origin ignored for
     /// chan_*, scid ignored for `NodeAnnouncement`).
+    #[inline]
     pub fn derive_id(
         origin: Option<NodeId>,
         kind: GossipKind,
@@ -104,6 +105,33 @@ impl Gossip {
         buf[17] = direction;
         buf[18..22].copy_from_slice(&timestamp.to_le_bytes());
         XX3::oneshot_with_seed(MSGID_SUBSEED, &buf)
+    }
+
+
+    /// Per-kind lookup key in [`crate::state::NodeState`]'s maps.
+    /// Used by inventory-request builders to identify a message in
+    /// the recipient's state without sending the full [`MsgId`] —
+    /// the recipient indexes directly by this key in the per-kind
+    /// map, avoiding any reverse-MsgId scan.
+    ///
+    /// * `ChannelUpdate`     → packed `(scid, direction)` (see
+    ///   [`crate::state::pack_cu_key`]; formula inlined here)
+    /// * `NodeAnnouncement`  → `origin` (the announcing `NodeId`)
+    /// * `ChannelAnnouncement` → `scid`
+    ///
+    /// `None`-valued slots (`scid` on a NodeAnn, `origin` on a
+    /// chan_update) substitute `0` — these slots are unused for the
+    /// kind in question by construction (see [`Gossip`] field docs).
+    #[inline]
+    pub fn state_key(&self) -> u64 {
+        match self.kind {
+            GossipKind::ChannelUpdate => {
+                let scid = self.scid.unwrap_or(0);
+                (scid << 1) | (self.direction as u64 & 1)
+            }
+            GossipKind::NodeAnnouncement => self.origin.unwrap_or(0),
+            GossipKind::ChannelAnnouncement => self.scid.unwrap_or(0),
+        }
     }
 }
 
@@ -278,6 +306,51 @@ impl GossipBatch {
     }
 }
 
+/// Reconciliation follow-up: the receiver of a sketch (running with
+/// `full_reconciliation = true`) sends this back to the original
+/// sender to ask for items present on the sender's side that this
+/// node is missing. The `keys` are per-kind state-map keys (see
+/// [`Gossip::state_key`]), not [`MsgId`]s — this lets the responder
+/// look them up by direct map index instead of scanning the state.
+///
+/// The responder replies with a [`WireMessage::Batch`] containing
+/// the synthesized [`Gossip`]s for every requested key it actually
+/// holds. Missing keys are silently dropped; the requester sees only
+/// the present ones via the normal absorb path.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InventoryMsg {
+    /// Sender — the responder uses this to look up the reply
+    /// `Output` for that peer.
+    pub from: NodeId,
+    /// All `keys` belong to this single kind. One inventory per
+    /// kind keeps the responder's lookup map fixed.
+    pub kind: GossipKind,
+    /// Requested state-map keys (see [`Gossip::state_key`]).
+    pub keys: Vec<u64>,
+    /// On-the-wire byte size for bandwidth metrics. Computed at
+    /// construct time as
+    /// `INVENTORY_HEADER_BYTES + 8 * keys.len()`.
+    pub size_bytes: u64,
+}
+
+/// Fixed-header byte budget for an [`InventoryMsg`] on the wire —
+/// covers `from`, `kind`, and a length-prefix for `keys`. The
+/// per-key cost (8 bytes per `u64`) is added on top.
+pub const INVENTORY_HEADER_BYTES: u64 = 16;
+
+impl InventoryMsg {
+    /// Build an inventory message and pre-compute its wire size.
+    pub fn new(from: NodeId, kind: GossipKind, keys: Vec<u64>) -> Self {
+        let size_bytes = INVENTORY_HEADER_BYTES + 8 * keys.len() as u64;
+        Self {
+            from,
+            kind,
+            keys,
+            size_bytes,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum WireMessage {
     Single(Gossip),
@@ -289,17 +362,24 @@ pub enum WireMessage {
     /// receivers compute the diff against their own state and send
     /// the missing-from-sender messages back as a `Batch`.
     Sketch(Sketch),
+    /// Full-reconciliation follow-up: the sketch receiver asks the
+    /// original sketch sender for items present on the sender's
+    /// side that this receiver is missing. The responder replies
+    /// with a [`WireMessage::Batch`] of the requested gossips.
+    Inventory(InventoryMsg),
 }
 
 impl WireMessage {
     /// On-the-wire byte size used for bandwidth metrics. For `Single`
     /// it's the inner gossip's `size_bytes`; for `Batch` it's the
-    /// sum of inner gossips' sizes; for `Sketch` it's `Sketch.size_bytes`.
+    /// sum of inner gossips' sizes; for `Sketch` it's `Sketch.size_bytes`;
+    /// for `Inventory` it's the pre-computed `InventoryMsg.size_bytes`.
     pub fn wire_size(&self) -> u64 {
         match self {
             WireMessage::Single(g) => g.size_bytes as u64,
             WireMessage::Batch(b) => b.wire_size(),
             WireMessage::Sketch(s) => s.size_bytes as u64,
+            WireMessage::Inventory(i) => i.size_bytes,
         }
     }
 }
@@ -382,5 +462,70 @@ mod tests {
         assert_eq!(b.chan_anns.len(), 1);
         assert_eq!(b.len(), 4);
         assert_eq!(b.wire_size(), 400);
+    }
+
+
+    #[test]
+    fn state_key_matches_per_kind_state_map_key() {
+        // ChannelUpdate → pack_cu_key(scid, direction)
+        let scid: Scid = 0x12345;
+        let cu = Gossip {
+            id: 0,
+            origin: None,
+            kind: GossipKind::ChannelUpdate,
+            size_bytes: 100,
+            scid: Some(scid),
+            direction: 1,
+            timestamp: 42,
+        };
+        assert_eq!(cu.state_key(), (scid << 1) | 1);
+
+        let cu_dir0 = Gossip {
+            direction: 0,
+            ..cu
+        };
+        assert_eq!(cu_dir0.state_key(), scid << 1);
+
+        // NodeAnnouncement → origin
+        let origin: NodeId = 0xDEAD_BEEF;
+        let na = Gossip {
+            id: 0,
+            origin: Some(origin),
+            kind: GossipKind::NodeAnnouncement,
+            size_bytes: 100,
+            scid: None,
+            direction: 0,
+            timestamp: 99,
+        };
+        assert_eq!(na.state_key(), origin);
+
+        // ChannelAnnouncement → scid
+        let ca = Gossip {
+            id: 0,
+            origin: None,
+            kind: GossipKind::ChannelAnnouncement,
+            size_bytes: 100,
+            scid: Some(scid),
+            direction: 0,
+            timestamp: 0,
+        };
+        assert_eq!(ca.state_key(), scid);
+    }
+
+    #[test]
+    fn inventory_msg_size_formula() {
+        let inv = InventoryMsg::new(7, GossipKind::ChannelUpdate, vec![1, 2, 3]);
+        assert_eq!(inv.size_bytes, INVENTORY_HEADER_BYTES + 8 * 3);
+
+        let empty = InventoryMsg::new(7, GossipKind::NodeAnnouncement, vec![]);
+        assert_eq!(empty.size_bytes, INVENTORY_HEADER_BYTES);
+    }
+
+    #[test]
+    fn wire_size_inventory_matches_struct() {
+        let inv = InventoryMsg::new(0, GossipKind::ChannelAnnouncement, vec![1, 2, 3, 4]);
+        let expected = inv.size_bytes;
+        let wire = WireMessage::Inventory(inv);
+        assert_eq!(wire.wire_size(), expected);
     }
 }

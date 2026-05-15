@@ -1,0 +1,39 @@
+# Sketch + full reconciliation: each sketch reply also triggers an
+# inventory request asking the sender for items present on its side
+# that this node is missing. Each round of sketches now drains both
+# directions of the diff in one tick, halving the number of stagger
+# rounds needed to converge.
+#
+# Comparison baseline is configs/sketch-smoke.toml (same parameters
+# minus `full_reconciliation`).
+seed = 1
+
+[topology]
+kind = "k_regular"
+n = 200
+k = 6
+
+[channels]
+count = 400
+
+[latency]
+dist = "constant"
+ms = 100
+
+[algo]
+kind = "sketch"
+stagger_ms = 5000
+capacity_chan_updates = 128
+capacity_node_anns = 64
+capacity_chan_anns = 64
+flood_on_originate = false
+full_reconciliation = true
+
+[event]
+kind = "poisson_random"
+rate_per_sec = 5.0
+
+[run]
+duration_seconds = 120
+mailbox_capacity = 1024
+progress_interval_seconds = 30

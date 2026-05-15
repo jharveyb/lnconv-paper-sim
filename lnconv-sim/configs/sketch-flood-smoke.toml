@@ -1,0 +1,38 @@
+# Sketch + flooding hybrid: each origination ALSO broadcasts the new
+# gossip to all peers immediately (as `WireMessage::Single`). The
+# periodic sketch tick still runs for late-joiners / reconciliation
+# of any drops, but most propagation now happens at flooding speed.
+#
+# Comparison baseline is configs/sketch-smoke.toml (same parameters
+# minus `flood_on_originate`).
+seed = 1
+
+[topology]
+kind = "k_regular"
+n = 200
+k = 6
+
+[channels]
+count = 400
+
+[latency]
+dist = "constant"
+ms = 100
+
+[algo]
+kind = "sketch"
+stagger_ms = 5000
+capacity_chan_updates = 128
+capacity_node_anns = 64
+capacity_chan_anns = 64
+flood_on_originate = true
+full_reconciliation = false
+
+[event]
+kind = "poisson_random"
+rate_per_sec = 5.0
+
+[run]
+duration_seconds = 120
+mailbox_capacity = 1024
+progress_interval_seconds = 30

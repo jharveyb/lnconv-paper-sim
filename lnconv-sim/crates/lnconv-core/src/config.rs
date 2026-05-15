@@ -173,6 +173,20 @@ pub enum AlgoCfg {
         capacity_node_anns: u32,
         #[serde(default = "default_ca_capacity")]
         capacity_chan_anns: u32,
+        /// When true, `SketchNode::originate` ALSO floods the new
+        /// gossip to all peers immediately (as `WireMessage::Single`).
+        /// Defaults to false → pure-sketch behaviour, propagation
+        /// only via periodic sketch ticks.
+        #[serde(default)]
+        flood_on_originate: bool,
+        /// When true, sketch-reply handlers compute the diff with
+        /// `WhichSide::Both` and ALSO send a `WireMessage::Inventory`
+        /// asking the original sketch sender for items present on
+        /// the sender's side that this node is missing. Defaults to
+        /// false → pure-sketch behaviour, only `b_newer` flows in
+        /// the reply.
+        #[serde(default)]
+        full_reconciliation: bool,
     },
 }
 
@@ -205,6 +219,10 @@ pub enum NodeAlgoKind {
         capacity_node_anns: u32,
         #[serde(default = "default_ca_capacity")]
         capacity_chan_anns: u32,
+        #[serde(default)]
+        flood_on_originate: bool,
+        #[serde(default)]
+        full_reconciliation: bool,
     },
 }
 

@@ -123,6 +123,8 @@ pub struct NodeCountersRow {
     pub bytes_out_sketch: u64,
     pub bytes_in_gossip: u64,
     pub bytes_out_gossip: u64,
+    pub bytes_in_inventory: u64,
+    pub bytes_out_inventory: u64,
     pub duplicates: u64,
     pub duplicates_bytes: u64,
     pub sketches_sent: u64,
@@ -150,6 +152,8 @@ impl NodeCountersRow {
             bytes_out_sketch: c.bytes_out_sketch,
             bytes_in_gossip: c.bytes_in_gossip,
             bytes_out_gossip: c.bytes_out_gossip,
+            bytes_in_inventory: c.bytes_in_inventory,
+            bytes_out_inventory: c.bytes_out_inventory,
             duplicates: c.duplicates,
             duplicates_bytes: c.duplicates_bytes,
             sketches_sent: c.sketches_sent,
@@ -323,6 +327,8 @@ impl WriteRow for NodeCountersRow {
             Field::new("bytes_out_sketch", DataType::UInt64, false),
             Field::new("bytes_in_gossip", DataType::UInt64, false),
             Field::new("bytes_out_gossip", DataType::UInt64, false),
+            Field::new("bytes_in_inventory", DataType::UInt64, false),
+            Field::new("bytes_out_inventory", DataType::UInt64, false),
             Field::new("duplicates", DataType::UInt64, false),
             Field::new("duplicates_bytes", DataType::UInt64, false),
             Field::new("sketches_sent", DataType::UInt64, false),
@@ -352,6 +358,8 @@ impl WriteRow for NodeCountersRow {
         let mut bytes_out_sketch = UInt64Builder::with_capacity(n);
         let mut bytes_in_gossip = UInt64Builder::with_capacity(n);
         let mut bytes_out_gossip = UInt64Builder::with_capacity(n);
+        let mut bytes_in_inventory = UInt64Builder::with_capacity(n);
+        let mut bytes_out_inventory = UInt64Builder::with_capacity(n);
         let mut duplicates = UInt64Builder::with_capacity(n);
         let mut duplicates_bytes = UInt64Builder::with_capacity(n);
         let mut sketches_sent = UInt64Builder::with_capacity(n);
@@ -375,6 +383,8 @@ impl WriteRow for NodeCountersRow {
             bytes_out_sketch.append_value(r.bytes_out_sketch);
             bytes_in_gossip.append_value(r.bytes_in_gossip);
             bytes_out_gossip.append_value(r.bytes_out_gossip);
+            bytes_in_inventory.append_value(r.bytes_in_inventory);
+            bytes_out_inventory.append_value(r.bytes_out_inventory);
             duplicates.append_value(r.duplicates);
             duplicates_bytes.append_value(r.duplicates_bytes);
             sketches_sent.append_value(r.sketches_sent);
@@ -399,6 +409,8 @@ impl WriteRow for NodeCountersRow {
             Arc::new(bytes_out_sketch.finish()),
             Arc::new(bytes_in_gossip.finish()),
             Arc::new(bytes_out_gossip.finish()),
+            Arc::new(bytes_in_inventory.finish()),
+            Arc::new(bytes_out_inventory.finish()),
             Arc::new(duplicates.finish()),
             Arc::new(duplicates_bytes.finish()),
             Arc::new(sketches_sent.finish()),

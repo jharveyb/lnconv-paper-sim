@@ -419,7 +419,7 @@ pub fn originate_stamp(
     true
 }
 
-fn synth_chan_update(scid: Scid, direction: Direction, timestamp: u32, size_bytes: u16) -> Gossip {
+pub fn synth_chan_update(scid: Scid, direction: Direction, timestamp: u32, size_bytes: u16) -> Gossip {
     let origin = None;
     let scid_o = Some(scid);
     Gossip {
@@ -433,7 +433,7 @@ fn synth_chan_update(scid: Scid, direction: Direction, timestamp: u32, size_byte
     }
 }
 
-fn synth_node_ann(origin_id: NodeId, timestamp: u32, size_bytes: u16) -> Gossip {
+pub fn synth_node_ann(origin_id: NodeId, timestamp: u32, size_bytes: u16) -> Gossip {
     let origin = Some(origin_id);
     let scid_o = None;
     Gossip {
@@ -447,7 +447,7 @@ fn synth_node_ann(origin_id: NodeId, timestamp: u32, size_bytes: u16) -> Gossip 
     }
 }
 
-fn synth_chan_ann(scid: Scid, size_bytes: u16) -> Gossip {
+pub fn synth_chan_ann(scid: Scid, size_bytes: u16) -> Gossip {
     let origin = None;
     let scid_o = Some(scid);
     Gossip {
@@ -670,5 +670,135 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
+    }
+
+
+    // ---------------------------------------------------------------
+    // Side-coverage tests: each kind exercises `WhichSide::Both` and
+    // `WhichSide::A` on a scenario rich enough to populate non-trivial
+    // counts AND verify the Vec materialisation matches the requested
+    // side. Complements the minimal `which_side_a_yields_empty_b_newer`
+    // / `which_side_b_*` tests above, which only cover chan_updates.
+    // ---------------------------------------------------------------
+
+    /// 3 shared entries (same key + same ts on both sides) + 1 A-only
+    /// (scid 100) + 1 B-only (scid 200). Used by both `_which_both`
+    /// and `_which_a` chan_updates tests.
+    fn diff_pair_chan_updates() -> (SharedNodeState, SharedNodeState) {
+        let a = st(0);
+        let b = st(1);
+        for k in 0..3u64 {
+            let ts = (k + 1) as u32;
+            write_cu(&a, k, 0, ts, 64);
+            write_cu(&b, k, 0, ts, 64);
+        }
+        write_cu(&a, 100, 0, 50, 64);
+        write_cu(&b, 200, 0, 60, 64);
+        (a, b)
+    }
+
+    #[test]
+    fn diff_chan_updates_which_both_full() {
+        let (a, b) = diff_pair_chan_updates();
+        let d = compute_diff(&a, &b, SketchKind::ChanUpdates, WhichSide::Both);
+        assert_eq!(d.intersection, 3);
+        assert_eq!(d.a_only_count, 1);
+        assert_eq!(d.b_only_count, 1);
+        assert_eq!(d.a_newer.len(), 1);
+        assert_eq!(d.b_newer.len(), 1);
+        assert_eq!(d.a_newer[0].scid, Some(100));
+        assert_eq!(d.b_newer[0].scid, Some(200));
+    }
+
+    #[test]
+    fn diff_chan_updates_which_a_full() {
+        let (a, b) = diff_pair_chan_updates();
+        let d = compute_diff(&a, &b, SketchKind::ChanUpdates, WhichSide::A);
+        assert_eq!(d.intersection, 3);
+        assert_eq!(d.a_only_count, 1);
+        assert_eq!(d.b_only_count, 1);
+        assert_eq!(d.a_newer.len(), 1, "a_newer materialised");
+        assert!(d.b_newer.is_empty(), "b_newer suppressed");
+        assert_eq!(d.a_newer[0].scid, Some(100));
+    }
+
+    /// 3 shared origins on both sides at the same ts + 1 A-only
+    /// (origin 100) + 1 B-only (origin 200).
+    fn diff_pair_node_anns() -> (SharedNodeState, SharedNodeState) {
+        let a = st(0);
+        let b = st(1);
+        for origin in 0..3u64 {
+            let ts = (origin + 1) as u32;
+            write_na(&a, origin, ts, 64);
+            write_na(&b, origin, ts, 64);
+        }
+        write_na(&a, 100, 50, 64);
+        write_na(&b, 200, 60, 64);
+        (a, b)
+    }
+
+    #[test]
+    fn diff_node_anns_which_both_full() {
+        let (a, b) = diff_pair_node_anns();
+        let d = compute_diff(&a, &b, SketchKind::NodeAnns, WhichSide::Both);
+        assert_eq!(d.intersection, 3);
+        assert_eq!(d.a_only_count, 1);
+        assert_eq!(d.b_only_count, 1);
+        assert_eq!(d.a_newer.len(), 1);
+        assert_eq!(d.b_newer.len(), 1);
+        assert_eq!(d.a_newer[0].origin, Some(100));
+        assert_eq!(d.b_newer[0].origin, Some(200));
+    }
+
+    #[test]
+    fn diff_node_anns_which_a_full() {
+        let (a, b) = diff_pair_node_anns();
+        let d = compute_diff(&a, &b, SketchKind::NodeAnns, WhichSide::A);
+        assert_eq!(d.intersection, 3);
+        assert_eq!(d.a_only_count, 1);
+        assert_eq!(d.b_only_count, 1);
+        assert_eq!(d.a_newer.len(), 1);
+        assert!(d.b_newer.is_empty());
+        assert_eq!(d.a_newer[0].origin, Some(100));
+    }
+
+    /// 3 shared scids on both sides + 1 A-only (scid 100) + 1 B-only
+    /// (scid 200). chan_anns has no per-entry ts so the diff is pure
+    /// presence/absence.
+    fn diff_pair_chan_anns() -> (SharedNodeState, SharedNodeState) {
+        let a = st(0);
+        let b = st(1);
+        for scid in 0..3u64 {
+            write_ca(&a, scid, 64);
+            write_ca(&b, scid, 64);
+        }
+        write_ca(&a, 100, 64);
+        write_ca(&b, 200, 64);
+        (a, b)
+    }
+
+    #[test]
+    fn diff_chan_anns_which_both_full() {
+        let (a, b) = diff_pair_chan_anns();
+        let d = compute_diff(&a, &b, SketchKind::ChanAnns, WhichSide::Both);
+        assert_eq!(d.intersection, 3);
+        assert_eq!(d.a_only_count, 1);
+        assert_eq!(d.b_only_count, 1);
+        assert_eq!(d.a_newer.len(), 1);
+        assert_eq!(d.b_newer.len(), 1);
+        assert_eq!(d.a_newer[0].scid, Some(100));
+        assert_eq!(d.b_newer[0].scid, Some(200));
+    }
+
+    #[test]
+    fn diff_chan_anns_which_a_full() {
+        let (a, b) = diff_pair_chan_anns();
+        let d = compute_diff(&a, &b, SketchKind::ChanAnns, WhichSide::A);
+        assert_eq!(d.intersection, 3);
+        assert_eq!(d.a_only_count, 1);
+        assert_eq!(d.b_only_count, 1);
+        assert_eq!(d.a_newer.len(), 1);
+        assert!(d.b_newer.is_empty());
+        assert_eq!(d.a_newer[0].scid, Some(100));
     }
 }

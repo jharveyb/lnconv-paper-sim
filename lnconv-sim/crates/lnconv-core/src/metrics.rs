@@ -105,16 +105,14 @@ pub struct Metrics {
 /// per-node Vec.
 pub type AggregatorOutput = Vec<MsgStats>;
 
-/// Lightweight per-(node, flush) counter snapshot. Used as the
-/// payload of [`MetricsEvent::NodeCountersDelta`]; just plain integer
-/// fields — no `Vec` / `Reservoir`. About ~120 B; cheap to clone +
-/// send over the metrics event queue.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct NodeCounters {
     pub bytes_in_sketch: u64,
     pub bytes_out_sketch: u64,
     pub bytes_in_gossip: u64,
     pub bytes_out_gossip: u64,
+    pub bytes_in_inventory: u64,
+    pub bytes_out_inventory: u64,
     pub duplicates: u64,
     pub duplicates_bytes: u64,
     pub sketches_sent: u64,
@@ -264,26 +262,19 @@ pub struct OverflowEvent {
     pub total_diff: u32,
 }
 
-/// Per-node accounting recorded directly on the node model. Plain
-/// `u64` fields — the NeXosim mailbox guarantees single-threaded
-/// access per node, so no atomics are needed. Each periodic flush
-/// snapshots the counters into a [`NodeCounters`] (~120 B) via
-/// [`Self::snapshot_counters`]; the reservoir buffers and pending
-/// overflow events ride separately via dedicated events so the
-/// hot-path send is allocation-free.
-///
-/// Bandwidth is split into two buckets: `*_sketch` for
-/// `WireMessage::Sketch` (reconciliation overhead) and `*_gossip` for
-/// `WireMessage::Single` + `WireMessage::Batch` (gossip payload).
-/// Sketch stats are broken down per `SketchKind` via
-/// [`SketchKindStats`]; overflows likewise have per-kind counters
-/// plus a detailed event log in `overflow_events`.
 #[derive(Clone, Debug, Default)]
 pub struct PerNodeMetrics {
     pub bytes_in_sketch: u64,
     pub bytes_out_sketch: u64,
     pub bytes_in_gossip: u64,
     pub bytes_out_gossip: u64,
+    /// Bytes carried by `WireMessage::Inventory` — split from
+    /// `*_sketch` and `*_gossip` so the cost of the full-reconciliation
+    /// "pull missing items" exchange is visible on its own. Note that
+    /// the responder's reply to an inventory is a `WireMessage::Batch`,
+    /// which lands in `*_gossip`, not here.
+    pub bytes_in_inventory: u64,
+    pub bytes_out_inventory: u64,
     pub duplicates: u64,
     pub duplicates_bytes: u64,
     pub sketches_sent: u64,
@@ -334,15 +325,14 @@ impl PerNodeMetrics {
         }
     }
 
-    /// Cheap counter-only snapshot used by each periodic flush. Touches
-    /// only the integer fields — no `Vec` / `Reservoir` clone. ~120 B
-    /// per call vs ~36 KB for a full `PerNodeMetrics::clone()`.
     pub fn snapshot_counters(&self) -> NodeCounters {
         NodeCounters {
             bytes_in_sketch: self.bytes_in_sketch,
             bytes_out_sketch: self.bytes_out_sketch,
             bytes_in_gossip: self.bytes_in_gossip,
             bytes_out_gossip: self.bytes_out_gossip,
+            bytes_in_inventory: self.bytes_in_inventory,
+            bytes_out_inventory: self.bytes_out_inventory,
             duplicates: self.duplicates,
             duplicates_bytes: self.duplicates_bytes,
             sketches_sent: self.sketches_sent,

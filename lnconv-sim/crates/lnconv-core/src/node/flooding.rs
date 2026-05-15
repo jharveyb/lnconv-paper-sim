@@ -177,6 +177,11 @@ impl FloodingNode {
             WireMessage::Sketch(_) => {
                 // Flooding doesn't speak sketch protocol — silently ignore.
             }
+            WireMessage::Inventory(_) => {
+                // Inventory belongs to the sketch+full-reconciliation
+                // flow, which never targets a flooding node. Silently
+                // ignore for exhaustiveness.
+            }
         }
     }
 
