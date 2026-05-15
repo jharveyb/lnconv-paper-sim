@@ -37,8 +37,16 @@ usage() {
   cat <<EOF
 Usage:
   $0 bootstrap <user@host>
-  $0 run       <user@host> <config.toml> [<config.toml> ...]
+  $0 run [-p|--parallel] <user@host> <config.toml> [<config.toml> ...]
   $0 status    <user@host>
+
+Use 'localhost' (or 'local') as the host to run on this machine -- no
+SSH, no rsync. 'bootstrap localhost' is a no-op.
+
+run flags:
+  -p, --parallel   launch all configs at once instead of sequentially
+                   (each config still uses all cores by default -- set
+                   [run].threads in the TOML to divide a box N ways)
 
 Build the binary locally first:
   cd lnconv-sim && cargo build --release
@@ -136,8 +144,18 @@ EOF
 }
 
 cmd_run() {
-  local host="$1"; shift
+  local parallel=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -p|--parallel) parallel=1; shift ;;
+      --)            shift; break ;;
+      -*)            echo "unknown flag: $1" >&2; usage; exit 1 ;;
+      *)             break ;;
+    esac
+  done
+  local host="${1:-}"; [ $# -gt 0 ] && shift
   local configs=("$@")
+  [ -z "$host" ] && { usage; exit 1; }
   [ ${#configs[@]} -eq 0 ] && { usage; exit 1; }
   require_binary
 
@@ -153,6 +171,8 @@ cmd_run() {
   configs=("${resolved[@]}")
 
   local qts; qts=$(date -u +%Y%m%dT%H%M%SZ)
+  local mode="sequential"
+  [ "$parallel" -eq 1 ] && mode="parallel"
 
   # Local vs remote: choose binary + sysmon paths used inside the queue
   # script. Local mode skips the rsync step entirely.
@@ -169,7 +189,14 @@ cmd_run() {
 
   # Build the per-config queue body. Each line is fully expanded locally;
   # no $ remains, so it drops verbatim into the outer heredoc below.
-  local queue_body=""
+  #   sequential: each config runs after the previous, `tee`d so live
+  #               output shows in the tmux session; `set -e` aborts on
+  #               first failure.
+  #   parallel:   all configs are backgrounded at once (output -> per-config
+  #               log files only), then a final `wait` blocks until they
+  #               all finish. One config failing does not stop the others.
+  local queue_body="" queue_wait=""
+  [ "$parallel" -eq 1 ] && queue_body="echo '=== launching ${#configs[@]} config(s) in parallel ==='"
   for cfg in "${configs[@]}"; do
     # Configs resolve to lnconv-sim/configs/foo.toml. The queue script's
     # CWD is lnconv-sim/ (local) or its flattened equivalent (remote), so
@@ -177,10 +204,16 @@ cmd_run() {
     local rel="${cfg#lnconv-sim/}"
     local base; base=$(basename "$cfg" .toml)
     local label="${qts}-${base}"
-    queue_body+="
+    if [ "$parallel" -eq 1 ]; then
+      queue_body+="
+${binary_path} -c '${rel}' --name '${label}' > 'logs/${label}.log' 2>&1 &"
+    else
+      queue_body+="
 echo '=== ${label} ==='
 ${binary_path} -c '${rel}' --name '${label}' 2>&1 | tee 'logs/${label}.log'"
+    fi
   done
+  [ "$parallel" -eq 1 ] && queue_wait="wait"
 
   local queue_script
   queue_script=$(cat <<EOF
@@ -195,6 +228,7 @@ trap "kill \$SYSMON_PID 2>/dev/null || true" EXIT
 
 # queue
 ${queue_body}
+${queue_wait}
 
 echo "=== queue complete: ${qts} ==="
 date -u +%Y-%m-%dT%H:%M:%SZ > "logs/queue-${qts}.done"
@@ -210,7 +244,7 @@ EOF
 
     cat <<EOF
 
-Queue started locally: lnconv-${qts} (${#configs[@]} config(s))
+Queue started locally: lnconv-${qts} (${#configs[@]} config(s), ${mode})
 
   Attach:  tmux attach -t lnconv-${qts}
   Tail:    tail -F lnconv-sim/logs/${qts}-*.log
@@ -232,7 +266,7 @@ EOF
 
     cat <<EOF
 
-Queue started: lnconv-${qts} (${#configs[@]} config(s))
+Queue started: lnconv-${qts} (${#configs[@]} config(s), ${mode})
 
   Attach:  ssh -t $host 'tmux attach -t lnconv-${qts}'
   Tail:    ssh $host 'tail -F $REMOTE_DIR_PATH/logs/${qts}-*.log'
