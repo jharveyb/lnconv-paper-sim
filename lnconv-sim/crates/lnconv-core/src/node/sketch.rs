@@ -265,6 +265,7 @@ impl SketchNode {
             }
             WireMessage::Inventory(inv) => {
                 self.metrics_local.bytes_in_inventory += wire_size;
+                self.metrics_local.inventories_received += 1;
                 cx.schedule_event(
                     Duration::from_millis(1),
                     schedulable!(Self::handle_inventory),
@@ -430,6 +431,7 @@ impl SketchNode {
             let keys: Vec<u64> = diff.a_newer.iter().map(|g| g.state_key()).collect();
             let inv = InventoryMsg::new(self.id, sketch.kind.to_gossip(), keys);
             self.metrics_local.bytes_out_inventory += inv.size_bytes;
+            self.metrics_local.inventories_sent += 1;
             if let Some(out) = self.outputs.get_mut(local) {
                 out.send(WireMessage::Inventory(inv)).await;
             }

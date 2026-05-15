@@ -117,6 +117,8 @@ pub struct NodeCounters {
     pub duplicates_bytes: u64,
     pub sketches_sent: u64,
     pub sketches_received: u64,
+    pub inventories_sent: u64,
+    pub inventories_received: u64,
     pub overflowed_chan_updates: u64,
     pub overflowed_node_anns: u64,
     pub overflowed_chan_anns: u64,
@@ -279,6 +281,11 @@ pub struct PerNodeMetrics {
     pub duplicates_bytes: u64,
     pub sketches_sent: u64,
     pub sketches_received: u64,
+    /// Count of `WireMessage::Inventory` requests this node sent
+    /// (one per outbound inventory request).
+    pub inventories_sent: u64,
+    /// Count of `WireMessage::Inventory` requests this node received.
+    pub inventories_received: u64,
     pub overflowed_chan_updates: u64,
     pub overflowed_node_anns: u64,
     pub overflowed_chan_anns: u64,
@@ -337,6 +344,8 @@ impl PerNodeMetrics {
             duplicates_bytes: self.duplicates_bytes,
             sketches_sent: self.sketches_sent,
             sketches_received: self.sketches_received,
+            inventories_sent: self.inventories_sent,
+            inventories_received: self.inventories_received,
             overflowed_chan_updates: self.overflowed_chan_updates,
             overflowed_node_anns: self.overflowed_node_anns,
             overflowed_chan_anns: self.overflowed_chan_anns,

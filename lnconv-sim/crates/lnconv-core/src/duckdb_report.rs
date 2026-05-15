@@ -224,9 +224,6 @@ fn fmt_bytes(b: f64) -> String {
     }
 }
 
-/// One extra line under `run summary` with average msg size, total
-/// unique data emitted, the unique-data rate, and the per-node
-/// redundancy factor (mean dup bytes per node ÷ total unique bytes).
 fn print_unique_data_block(conn: &Connection, n_nodes: u64, secs: f64) -> Result<()> {
     let sql = "
         WITH latest AS (
@@ -235,29 +232,48 @@ fn print_unique_data_block(conn: &Connection, n_nodes: u64, secs: f64) -> Result
         ),
         finals AS (SELECT * FROM latest WHERE rn = 1),
         msg_agg AS (SELECT SUM(size_bytes) AS unique_bytes, COUNT(*) AS msg_count FROM msgs),
-        dup_agg AS (SELECT SUM(duplicates_bytes) AS total_dup_bytes FROM finals)
-        SELECT unique_bytes, msg_count, total_dup_bytes
-        FROM msg_agg, dup_agg";
+        in_agg AS (
+            SELECT SUM(bytes_in_gossip) AS in_gossip,
+                   SUM(bytes_in_sketch) AS in_sketch,
+                   SUM(bytes_in_inventory) AS in_invent
+            FROM finals
+        )
+        SELECT unique_bytes, msg_count, in_gossip, in_sketch, in_invent
+        FROM msg_agg, in_agg";
     let mut stmt = conn.prepare(sql)?;
-    let (unique_bytes, msg_count, total_dup_bytes): (f64, u64, f64) = match stmt
-        .query_and_then([], |r| -> Result<_, duckdb::Error> {
-            Ok((
-                r.get::<usize, f64>(0).unwrap_or(0.0),
-                r.get::<usize, u64>(1).unwrap_or(0),
-                r.get::<usize, f64>(2).unwrap_or(0.0),
-            ))
-        })?
-        .next()
-    {
-        Some(r) => r?,
-        None => return Ok(()),
-    };
+    let (unique_bytes, msg_count, in_gossip, in_sketch, in_invent): (f64, u64, f64, f64, f64) =
+        match stmt
+            .query_and_then([], |r| -> Result<_, duckdb::Error> {
+                Ok((
+                    r.get::<usize, f64>(0).unwrap_or(0.0),
+                    r.get::<usize, u64>(1).unwrap_or(0),
+                    r.get::<usize, f64>(2).unwrap_or(0.0),
+                    r.get::<usize, f64>(3).unwrap_or(0.0),
+                    r.get::<usize, f64>(4).unwrap_or(0.0),
+                ))
+            })?
+            .next()
+        {
+            Some(r) => r?,
+            None => return Ok(()),
+        };
     if msg_count == 0 || unique_bytes <= 0.0 {
         return Ok(());
     }
     let avg_size = unique_bytes / msg_count as f64;
     let rate = unique_bytes / secs;
-    let redundancy = (total_dup_bytes / n_nodes.max(1) as f64) / unique_bytes;
+    // Protocol-overhead factor: how much total inbound traffic each
+    // node receives relative to the gossip-only inbound. Values
+    // > 1.0 mean sketch + inventory overhead dominates the
+    // gossip payload; 1.0 means no reconciliation overhead. Computed
+    // over network sums (in_gossip is the per-link cost summed across
+    // all receivers, same shape as in_sketch and in_invent).
+    let overhead = if in_gossip > 0.0 {
+        (in_gossip + in_sketch + in_invent) / in_gossip
+    } else {
+        0.0
+    };
+    let _ = n_nodes;
     println!("  avg msg size: {avg_size:.1} bytes  ({} msgs)", msg_count);
     println!(
         "  total unique data: {}  ({}/s over {:.0}s)",
@@ -266,7 +282,7 @@ fn print_unique_data_block(conn: &Connection, n_nodes: u64, secs: f64) -> Result
         secs
     );
     println!(
-        "  redundant bandwidth factor: {redundancy:.2}  (per-node mean dup bytes / total unique bytes)"
+        "  bandwidth overhead factor: {overhead:.2}  (total received bytes / gossip received bytes)"
     );
     Ok(())
 }
@@ -298,16 +314,18 @@ impl MmStats {
     }
 }
 
-#[derive(Debug, Default)]
 struct PerNodeBandwidth {
     n: i64,
     bytes_in_gossip: MmStats,
     bytes_out_gossip: MmStats,
     bytes_in_sketch: MmStats,
     bytes_out_sketch: MmStats,
+    bytes_in_inventory: MmStats,
+    bytes_out_inventory: MmStats,
     duplicates: MmStats,
     duplicates_bytes: MmStats,
     any_sketch: bool,
+    any_inventory: bool,
 }
 
 impl<'a> TryFrom<&Row<'a>> for PerNodeBandwidth {
@@ -320,9 +338,12 @@ impl<'a> TryFrom<&Row<'a>> for PerNodeBandwidth {
             bytes_out_gossip: MmStats::read(row, 6),
             bytes_in_sketch: MmStats::read(row, 11),
             bytes_out_sketch: MmStats::read(row, 16),
-            duplicates: MmStats::read(row, 21),
-            duplicates_bytes: MmStats::read(row, 26),
-            any_sketch: row.get::<usize, f64>(31).unwrap_or(0.0) > 0.0,
+            bytes_in_inventory: MmStats::read(row, 21),
+            bytes_out_inventory: MmStats::read(row, 26),
+            duplicates: MmStats::read(row, 31),
+            duplicates_bytes: MmStats::read(row, 36),
+            any_sketch: row.get::<usize, f64>(41).unwrap_or(0.0) > 0.0,
+            any_inventory: row.get::<usize, f64>(42).unwrap_or(0.0) > 0.0,
         })
     }
 }
@@ -344,11 +365,16 @@ fn print_per_node_bandwidth(conn: &Connection) -> Result<()> {
               quantile_cont(bytes_in_sketch, 0.95), MAX(bytes_in_sketch), SUM(bytes_in_sketch),
             MIN(bytes_out_sketch), quantile_cont(bytes_out_sketch, 0.50),
               quantile_cont(bytes_out_sketch, 0.95), MAX(bytes_out_sketch), SUM(bytes_out_sketch),
+            MIN(bytes_in_inventory),  quantile_cont(bytes_in_inventory, 0.50),
+              quantile_cont(bytes_in_inventory, 0.95), MAX(bytes_in_inventory), SUM(bytes_in_inventory),
+            MIN(bytes_out_inventory), quantile_cont(bytes_out_inventory, 0.50),
+              quantile_cont(bytes_out_inventory, 0.95), MAX(bytes_out_inventory), SUM(bytes_out_inventory),
             MIN(duplicates),       quantile_cont(duplicates, 0.50),
               quantile_cont(duplicates, 0.95), MAX(duplicates), SUM(duplicates),
             MIN(duplicates_bytes), quantile_cont(duplicates_bytes, 0.50),
               quantile_cont(duplicates_bytes, 0.95), MAX(duplicates_bytes), SUM(duplicates_bytes),
-            SUM(bytes_in_sketch) + SUM(bytes_out_sketch)
+            SUM(bytes_in_sketch) + SUM(bytes_out_sketch),
+            SUM(bytes_in_inventory) + SUM(bytes_out_inventory)
         FROM finals";
     let mut stmt = conn.prepare(sql)?;
     let b: PerNodeBandwidth =
@@ -369,6 +395,28 @@ fn print_per_node_bandwidth(conn: &Connection) -> Result<()> {
         let s = &b.bytes_out_sketch;
         print_minmaxtotal("bytes_out (sketch):", s.min, s.p50, mean(s.total), s.p95, s.max, s.total);
     }
+    if b.any_inventory {
+        let i = &b.bytes_in_inventory;
+        print_minmaxtotal(
+            "bytes_in  (invent):",
+            i.min,
+            i.p50,
+            mean(i.total),
+            i.p95,
+            i.max,
+            i.total,
+        );
+        let i = &b.bytes_out_inventory;
+        print_minmaxtotal(
+            "bytes_out (invent):",
+            i.min,
+            i.p50,
+            mean(i.total),
+            i.p95,
+            i.max,
+            i.total,
+        );
+    }
     let d = &b.duplicates;
     print_minmaxtotal("duplicates (msgs):", d.min, d.p50, mean(d.total), d.p95, d.max, d.total);
     let db = &b.duplicates_bytes;
@@ -378,10 +426,11 @@ fn print_per_node_bandwidth(conn: &Connection) -> Result<()> {
 
 // ---- sketch protocol totals ----------------------------------------
 
-#[derive(Debug, Default)]
 struct SketchTotals {
     sent: u64,
     received: u64,
+    inv_sent: u64,
+    inv_received: u64,
     o_cu: u64,
     o_na: u64,
     o_ca: u64,
@@ -393,6 +442,14 @@ struct SketchTotals {
     sr_p50: u64,
     sr_p95: u64,
     sr_max: u64,
+    is_min: u64,
+    is_p50: u64,
+    is_p95: u64,
+    is_max: u64,
+    ir_min: u64,
+    ir_p50: u64,
+    ir_p95: u64,
+    ir_max: u64,
 }
 
 impl<'a> TryFrom<&Row<'a>> for SketchTotals {
@@ -401,17 +458,27 @@ impl<'a> TryFrom<&Row<'a>> for SketchTotals {
         Ok(Self {
             sent: u64_from_f64(row, 0),
             received: u64_from_f64(row, 1),
-            o_cu: u64_from_f64(row, 2),
-            o_na: u64_from_f64(row, 3),
-            o_ca: u64_from_f64(row, 4),
-            ss_min: u64_from_f64(row, 5),
-            ss_p50: u64_from_f64(row, 6),
-            ss_p95: u64_from_f64(row, 7),
-            ss_max: u64_from_f64(row, 8),
-            sr_min: u64_from_f64(row, 9),
-            sr_p50: u64_from_f64(row, 10),
-            sr_p95: u64_from_f64(row, 11),
-            sr_max: u64_from_f64(row, 12),
+            inv_sent: u64_from_f64(row, 2),
+            inv_received: u64_from_f64(row, 3),
+            o_cu: u64_from_f64(row, 4),
+            o_na: u64_from_f64(row, 5),
+            o_ca: u64_from_f64(row, 6),
+            ss_min: u64_from_f64(row, 7),
+            ss_p50: u64_from_f64(row, 8),
+            ss_p95: u64_from_f64(row, 9),
+            ss_max: u64_from_f64(row, 10),
+            sr_min: u64_from_f64(row, 11),
+            sr_p50: u64_from_f64(row, 12),
+            sr_p95: u64_from_f64(row, 13),
+            sr_max: u64_from_f64(row, 14),
+            is_min: u64_from_f64(row, 15),
+            is_p50: u64_from_f64(row, 16),
+            is_p95: u64_from_f64(row, 17),
+            is_max: u64_from_f64(row, 18),
+            ir_min: u64_from_f64(row, 19),
+            ir_p50: u64_from_f64(row, 20),
+            ir_p95: u64_from_f64(row, 21),
+            ir_max: u64_from_f64(row, 22),
         })
     }
 }
@@ -425,11 +492,16 @@ fn print_sketch_totals(conn: &Connection) -> Result<()> {
         finals AS (SELECT * FROM latest WHERE rn = 1)
         SELECT
             SUM(sketches_sent), SUM(sketches_received),
+            SUM(inventories_sent), SUM(inventories_received),
             SUM(overflowed_chan_updates), SUM(overflowed_node_anns), SUM(overflowed_chan_anns),
             MIN(sketches_sent), quantile_cont(sketches_sent, 0.5),
               quantile_cont(sketches_sent, 0.95), MAX(sketches_sent),
             MIN(sketches_received), quantile_cont(sketches_received, 0.5),
-              quantile_cont(sketches_received, 0.95), MAX(sketches_received)
+              quantile_cont(sketches_received, 0.95), MAX(sketches_received),
+            MIN(inventories_sent), quantile_cont(inventories_sent, 0.5),
+              quantile_cont(inventories_sent, 0.95), MAX(inventories_sent),
+            MIN(inventories_received), quantile_cont(inventories_received, 0.5),
+              quantile_cont(inventories_received, 0.95), MAX(inventories_received)
         FROM finals";
     let mut stmt = conn.prepare(sql)?;
     let t: SketchTotals = match stmt.query_and_then([], |r| SketchTotals::try_from(r))?.next() {
@@ -446,20 +518,36 @@ fn print_sketch_totals(conn: &Connection) -> Result<()> {
         0.0
     };
     println!("\nsketch protocol:");
-    println!("  sent / received: {} / {}", t.sent, t.received);
+    println!("  sketches sent / received:    {} / {}", t.sent, t.received);
+    if t.inv_sent > 0 || t.inv_received > 0 {
+        println!(
+            "  inventories sent / received: {} / {}",
+            t.inv_sent, t.inv_received
+        );
+    }
     println!(
         "  overflows (diff > capacity): {total_overflows} ({overflow_pct:.1}%) — \
          chan_updates={}, node_anns={}, chan_anns={}",
         t.o_cu, t.o_na, t.o_ca
     );
     println!(
-        "  per-node sketches_sent:     min={:>6} p50={:>6} p95={:>6} max={:>6}",
+        "  per-node sketches_sent:        min={:>6} p50={:>6} p95={:>6} max={:>6}",
         t.ss_min, t.ss_p50, t.ss_p95, t.ss_max
     );
     println!(
-        "  per-node sketches_received: min={:>6} p50={:>6} p95={:>6} max={:>6}",
+        "  per-node sketches_received:    min={:>6} p50={:>6} p95={:>6} max={:>6}",
         t.sr_min, t.sr_p50, t.sr_p95, t.sr_max
     );
+    if t.inv_sent > 0 || t.inv_received > 0 {
+        println!(
+            "  per-node inventories_sent:     min={:>6} p50={:>6} p95={:>6} max={:>6}",
+            t.is_min, t.is_p50, t.is_p95, t.is_max
+        );
+        println!(
+            "  per-node inventories_received: min={:>6} p50={:>6} p95={:>6} max={:>6}",
+            t.ir_min, t.ir_p50, t.ir_p95, t.ir_max
+        );
+    }
     Ok(())
 }
 

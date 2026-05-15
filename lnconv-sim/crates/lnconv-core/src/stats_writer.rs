@@ -129,6 +129,8 @@ pub struct NodeCountersRow {
     pub duplicates_bytes: u64,
     pub sketches_sent: u64,
     pub sketches_received: u64,
+    pub inventories_sent: u64,
+    pub inventories_received: u64,
     pub overflowed_chan_updates: u64,
     pub overflowed_node_anns: u64,
     pub overflowed_chan_anns: u64,
@@ -158,6 +160,8 @@ impl NodeCountersRow {
             duplicates_bytes: c.duplicates_bytes,
             sketches_sent: c.sketches_sent,
             sketches_received: c.sketches_received,
+            inventories_sent: c.inventories_sent,
+            inventories_received: c.inventories_received,
             overflowed_chan_updates: c.overflowed_chan_updates,
             overflowed_node_anns: c.overflowed_node_anns,
             overflowed_chan_anns: c.overflowed_chan_anns,
@@ -333,6 +337,8 @@ impl WriteRow for NodeCountersRow {
             Field::new("duplicates_bytes", DataType::UInt64, false),
             Field::new("sketches_sent", DataType::UInt64, false),
             Field::new("sketches_received", DataType::UInt64, false),
+            Field::new("inventories_sent", DataType::UInt64, false),
+            Field::new("inventories_received", DataType::UInt64, false),
             Field::new("overflowed_chan_updates", DataType::UInt64, false),
             Field::new("overflowed_node_anns", DataType::UInt64, false),
             Field::new("overflowed_chan_anns", DataType::UInt64, false),
@@ -364,6 +370,8 @@ impl WriteRow for NodeCountersRow {
         let mut duplicates_bytes = UInt64Builder::with_capacity(n);
         let mut sketches_sent = UInt64Builder::with_capacity(n);
         let mut sketches_received = UInt64Builder::with_capacity(n);
+        let mut inventories_sent = UInt64Builder::with_capacity(n);
+        let mut inventories_received = UInt64Builder::with_capacity(n);
         let mut o_cu = UInt64Builder::with_capacity(n);
         let mut o_na = UInt64Builder::with_capacity(n);
         let mut o_ca = UInt64Builder::with_capacity(n);
@@ -389,6 +397,8 @@ impl WriteRow for NodeCountersRow {
             duplicates_bytes.append_value(r.duplicates_bytes);
             sketches_sent.append_value(r.sketches_sent);
             sketches_received.append_value(r.sketches_received);
+            inventories_sent.append_value(r.inventories_sent);
+            inventories_received.append_value(r.inventories_received);
             o_cu.append_value(r.overflowed_chan_updates);
             o_na.append_value(r.overflowed_node_anns);
             o_ca.append_value(r.overflowed_chan_anns);
@@ -415,6 +425,8 @@ impl WriteRow for NodeCountersRow {
             Arc::new(duplicates_bytes.finish()),
             Arc::new(sketches_sent.finish()),
             Arc::new(sketches_received.finish()),
+            Arc::new(inventories_sent.finish()),
+            Arc::new(inventories_received.finish()),
             Arc::new(o_cu.finish()),
             Arc::new(o_na.finish()),
             Arc::new(o_ca.finish()),
