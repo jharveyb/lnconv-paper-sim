@@ -1,13 +1,17 @@
-build-all:
-    cargo build
-    cargo build --release
-    cargo build --profile bench-release
+build-release:
+        cargo build --release
 
-sample-stagger:
+build-release-debug:
+        cargo build --profile bench-release
+
+build-all: build-release build-release-debug
+        cargo-build
+
+sample-stagger: build-release-debug
         rm -f perf/snapsnap-stagger-short.json.gz
         samply record -o perf/snapsnap-stagger-short.json.gz ./target/bench-release/lnconv -c configs/ln-snapsnap-stagger-short.toml
 
-sample-sketch:
+sample-sketch: build-release-debug
         rm -f perf/snapsnap-sketch-bench.json.gz
         samply record -o perf/snapsnap-sketch-bench.json.gz ./target/bench-release/lnconv -c configs/ln-snapsnap-sketch-bench.toml
 
@@ -17,8 +21,8 @@ short-stagger:
 short-sketch:
         ./target/release/lnconv -c configs/ln-snapsnap-sketch-bench.toml
 
-full-run-stagger:
+full-run-stagger: build-release
         ./target/release/lnconv -c configs/ln-snapsnap-stagger-long.toml
 
-full-run-sketch:
+full-run-sketch: build-release
         ./target/release/lnconv -c configs/ln-snapsnap-sketch-long.toml

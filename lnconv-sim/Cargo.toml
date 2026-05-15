@@ -39,7 +39,7 @@ divan = "0.1"
 [profile.release]
 # defaults
 opt-level = 3
-strip = "none"
+strip = "debuginfo"
 debug-assertions = false
 overflow-checks = false
 
@@ -58,3 +58,4 @@ debug = "line-tables-only"
 [profile.bench-release]
 inherits = "release"
 debug = "full"
+strip = "none"
