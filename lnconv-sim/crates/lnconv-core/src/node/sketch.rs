@@ -466,10 +466,10 @@ impl SketchNode {
                 let map = self.state.chan_updates.read();
                 inv.keys
                     .iter()
-                    .filter_map(|k| {
+                    .filter_map(|&k| {
                         map.get(k).map(|(ts, size)| {
-                            let (scid, direction) = unpack_cu_key(*k);
-                            synth_chan_update(scid, direction, *ts, *size)
+                            let (scid, direction) = unpack_cu_key(k);
+                            synth_chan_update(scid, direction, ts, size)
                         })
                     })
                     .collect()
@@ -478,9 +478,9 @@ impl SketchNode {
                 let map = self.state.node_anns.read();
                 inv.keys
                     .iter()
-                    .filter_map(|k| {
+                    .filter_map(|&k| {
                         map.get(k)
-                            .map(|(ts, size)| synth_node_ann(*k, *ts, *size))
+                            .map(|(ts, size)| synth_node_ann(k, ts, size))
                     })
                     .collect()
             }
@@ -488,7 +488,7 @@ impl SketchNode {
                 let map = self.state.chan_anns.read();
                 inv.keys
                     .iter()
-                    .filter_map(|k| map.get(k).map(|size| synth_chan_ann(*k, *size)))
+                    .filter_map(|&k| map.get(k).map(|size| synth_chan_ann(k, size)))
                     .collect()
             }
         };
@@ -529,11 +529,11 @@ impl SketchNode {
                 let scid = g.scid.expect("ChannelUpdate must carry scid");
                 let key = crate::state::pack_cu_key(scid, g.direction);
                 let supersedes = m
-                    .get(&key)
-                    .map(|(stored, _)| g.timestamp > *stored)
+                    .get_ts(key)
+                    .map(|stored| g.timestamp > stored)
                     .unwrap_or(true);
                 if supersedes {
-                    m.insert(key, (g.timestamp, g.size_bytes));
+                    m.insert(key, g.timestamp);
                     self.metrics_local.first_seen_pending.push(FirstSeenEntry {
                         gossip: *g,
                         time_ns: now_ns,
@@ -562,11 +562,11 @@ impl SketchNode {
             for g in gs {
                 let origin = g.origin.expect("NodeAnnouncement must carry origin");
                 let supersedes = m
-                    .get(&origin)
-                    .map(|(stored, _)| g.timestamp > *stored)
+                    .get_ts(origin)
+                    .map(|stored| g.timestamp > stored)
                     .unwrap_or(true);
                 if supersedes {
-                    m.insert(origin, (g.timestamp, g.size_bytes));
+                    m.insert(origin, g.timestamp);
                     self.metrics_local.first_seen_pending.push(FirstSeenEntry {
                         gossip: *g,
                         time_ns: now_ns,
@@ -594,7 +594,7 @@ impl SketchNode {
             let mut m = self.state.chan_anns.write();
             for g in gs {
                 let scid = g.scid.expect("ChannelAnnouncement must carry scid");
-                if m.insert(scid, g.size_bytes).is_none() {
+                if m.insert_present(scid) {
                     self.metrics_local.first_seen_pending.push(FirstSeenEntry {
                         gossip: *g,
                         time_ns: now_ns,

@@ -9,6 +9,13 @@
 //! `SketchNode::handle_sketch` so the timings reflect what
 //! sketch-replies actually pay.
 //!
+//! Per-node state is now dense arrays indexed via a shared
+//! `KeyRegistry` (see `state.rs`). Each `make_pair_*` builds a
+//! registry covering exactly the keys it generates, then constructs
+//! the two `NodeState`s against it. The registry's version table is
+//! left empty — these benches don't exercise sketch-reply size
+//! recovery, only the diff walk.
+//!
 //! Divan's `AllocProfiler` is wired as the global allocator so the
 //! output table also reports allocations / iter — useful for
 //! validating that future map/cache changes don't regress the
@@ -16,7 +23,7 @@
 
 use lnconv_core::message::SketchKind;
 use lnconv_core::state::{
-    NodeState, SharedNodeState, WhichSide, compute_diff, pack_cu_key,
+    KeyRegistry, NodeState, SharedNodeState, WhichSide, compute_diff, pack_cu_key,
 };
 use rand::RngCore;
 use rand::SeedableRng;
@@ -87,6 +94,8 @@ fn diff_chan_anns(bencher: divan::Bencher, case: (u32, f64)) {
 //   * Generate `size - shared` A-only entries (keys disjoint from B).
 //   * Generate `size - shared` B-only entries (keys disjoint from A
 //     AND from A-only).
+//   * Build a `KeyRegistry` over the union of all keys, then
+//     construct both `NodeState`s against it.
 //
 // Both sides therefore hold exactly `size` entries; symmetric diff
 // is `2 * diff_frac * size`. All RNG draws come from a seeded
@@ -101,28 +110,33 @@ fn make_pair_chan_updates(
 ) -> (SharedNodeState, SharedNodeState) {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
     let shared = ((1.0 - diff_frac) * size as f64) as u32;
-    let unshared = size - shared ;
-    let a = NodeState::new(0);
-    let b = NodeState::new(1);
+    let unshared = size - shared;
 
-    // Non-overlapping indices
     let shared_entries = chan_update_entries(&mut rng, 0, shared).collect::<Vec<_>>();
-    let a_only = chan_update_entries(&mut rng, size , size+unshared).collect::<Vec<_>>();
-    let b_only = chan_update_entries(&mut rng, 2*size , (2*size)+unshared).collect::<Vec<_>>();
-    // A-only
+    let a_only = chan_update_entries(&mut rng, size, size + unshared).collect::<Vec<_>>();
+    let b_only = chan_update_entries(&mut rng, 2 * size, (2 * size) + unshared).collect::<Vec<_>>();
+
+    let cu_keys: Vec<u64> = shared_entries
+        .iter()
+        .chain(&a_only)
+        .chain(&b_only)
+        .map(|&(k, _)| k)
+        .collect();
+    let keys = KeyRegistry::from_keys(cu_keys, Vec::new(), Vec::new());
+    let a = NodeState::new(&keys, 0);
+    let b = NodeState::new(&keys, 1);
     {
         let mut m_a = a.chan_updates.write();
         let mut m_b = b.chan_updates.write();
-        // Shared keys live in the low part of the SCID space [0..size).
-        for (k, v) in shared_entries {
-            m_a.insert(k, v);
-            m_b.insert(k, v);
+        for &(k, ts) in &shared_entries {
+            m_a.insert(k, ts);
+            m_b.insert(k, ts);
         }
-        for (k, v) in a_only {
-            m_a.insert(k, v);
+        for &(k, ts) in &a_only {
+            m_a.insert(k, ts);
         }
-        for (k, v) in b_only {
-            m_b.insert(k, v);
+        for &(k, ts) in &b_only {
+            m_b.insert(k, ts);
         }
     }
     (a, b)
@@ -135,24 +149,33 @@ fn make_pair_node_anns(
 ) -> (SharedNodeState, SharedNodeState) {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
     let shared = ((1.0 - diff_frac) * size as f64) as u32;
-    let unshared = size - shared ;
-    let a = NodeState::new(0);
-    let b = NodeState::new(1);
+    let unshared = size - shared;
+
     let shared_entries = node_ann_entries(&mut rng, 0, shared).collect::<Vec<_>>();
-    let a_only = node_ann_entries(&mut rng, size , size+unshared).collect::<Vec<_>>();
-    let b_only = node_ann_entries(&mut rng, 2*size , (2*size)+unshared).collect::<Vec<_>>();
+    let a_only = node_ann_entries(&mut rng, size, size + unshared).collect::<Vec<_>>();
+    let b_only = node_ann_entries(&mut rng, 2 * size, (2 * size) + unshared).collect::<Vec<_>>();
+
+    let na_keys: Vec<u64> = shared_entries
+        .iter()
+        .chain(&a_only)
+        .chain(&b_only)
+        .map(|&(k, _)| k)
+        .collect();
+    let keys = KeyRegistry::from_keys(Vec::new(), na_keys, Vec::new());
+    let a = NodeState::new(&keys, 0);
+    let b = NodeState::new(&keys, 1);
     {
         let mut m_a = a.node_anns.write();
         let mut m_b = b.node_anns.write();
-        for (k, v) in shared_entries {
-            m_a.insert(k, v);
-            m_b.insert(k, v);
+        for &(k, ts) in &shared_entries {
+            m_a.insert(k, ts);
+            m_b.insert(k, ts);
         }
-        for (k, v) in a_only {
-            m_a.insert(k, v);
+        for &(k, ts) in &a_only {
+            m_a.insert(k, ts);
         }
-        for (k, v) in b_only {
-            m_b.insert(k, v);
+        for &(k, ts) in &b_only {
+            m_b.insert(k, ts);
         }
     }
     (a, b)
@@ -165,24 +188,33 @@ fn make_pair_chan_anns(
 ) -> (SharedNodeState, SharedNodeState) {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
     let shared = ((1.0 - diff_frac) * size as f64) as u32;
-    let unshared = size - shared ;
-    let a = NodeState::new(0);
-    let b = NodeState::new(1);
+    let unshared = size - shared;
+
     let shared_entries = chan_ann_entries(&mut rng, 0, shared).collect::<Vec<_>>();
-    let a_only = chan_ann_entries(&mut rng, size , size+unshared).collect::<Vec<_>>();
-    let b_only = chan_ann_entries(&mut rng, 2*size , (2*size)+unshared).collect::<Vec<_>>();
+    let a_only = chan_ann_entries(&mut rng, size, size + unshared).collect::<Vec<_>>();
+    let b_only = chan_ann_entries(&mut rng, 2 * size, (2 * size) + unshared).collect::<Vec<_>>();
+
+    let ca_keys: Vec<u64> = shared_entries
+        .iter()
+        .chain(&a_only)
+        .chain(&b_only)
+        .copied()
+        .collect();
+    let keys = KeyRegistry::from_keys(Vec::new(), Vec::new(), ca_keys);
+    let a = NodeState::new(&keys, 0);
+    let b = NodeState::new(&keys, 1);
     {
         let mut m_a = a.chan_anns.write();
         let mut m_b = b.chan_anns.write();
-        for (k, v) in shared_entries {
-            m_a.insert(k, v);
-            m_b.insert(k, v);
+        for &k in &shared_entries {
+            m_a.insert_present(k);
+            m_b.insert_present(k);
         }
-        for (k, v) in a_only {
-            m_a.insert(k, v);
+        for &k in &a_only {
+            m_a.insert_present(k);
         }
-        for (k, v) in b_only {
-            m_b.insert(k, v);
+        for &k in &b_only {
+            m_b.insert_present(k);
         }
     }
     (a, b)
@@ -197,41 +229,43 @@ fn rand_ts(rng: &mut ChaCha8Rng) -> u32 {
     (rng.next_u32() & 0x00ff_ffff) | 1
 }
 
-#[inline]
-fn rand_size(rng: &mut ChaCha8Rng) -> u16 {
-    (rng.next_u32() % (u16::MAX as u32)) as u16
-
-}
-
-fn chan_update_entries(rng: &mut ChaCha8Rng, start: u32, end: u32) -> impl Iterator<Item = (u64, (u32, u16))> {
+fn chan_update_entries(
+    rng: &mut ChaCha8Rng,
+    start: u32,
+    end: u32,
+) -> impl Iterator<Item = (u64, u32)> {
     let chan_update_seed = rng.next_u64();
     let scid_hash = move |i: u32| -> u64 {
         XX3Hasher::oneshot_with_seed(chan_update_seed, &i.to_le_bytes())
     };
-    let chan_map_value = || -> Option<(u32, u16)> {
-        Some((rand_ts(rng), rand_size(rng)))
-    };
-    let chan_map_values = std::iter::from_fn(chan_map_value);
-    let scids = (start..=end).map(scid_hash)
-    .enumerate().map(|(i, s)| pack_cu_key(s, (i & 1) as u8 ));
-    scids.zip(chan_map_values)
+    let ts_values = std::iter::from_fn(|| Some(rand_ts(rng)));
+    let keys = (start..=end)
+        .map(scid_hash)
+        .enumerate()
+        .map(|(i, s)| pack_cu_key(s, (i & 1) as u8));
+    keys.zip(ts_values)
 }
 
-// Exact same type hashmap as channel update
-fn node_ann_entries(rng: &mut ChaCha8Rng, start: u32, end: u32) -> impl Iterator<Item = (u64, (u32, u16))> {
+// Exact same key shape as channel update — node_anns keys are just u64.
+fn node_ann_entries(
+    rng: &mut ChaCha8Rng,
+    start: u32,
+    end: u32,
+) -> impl Iterator<Item = (u64, u32)> {
     chan_update_entries(rng, start, end)
 }
 
-fn chan_ann_entries(rng: &mut ChaCha8Rng, start: u32, end: u32) -> impl Iterator<Item = (u64, u16)> {
-    let chan_update_seed = rng.next_u64();
+fn chan_ann_entries(
+    rng: &mut ChaCha8Rng,
+    start: u32,
+    end: u32,
+) -> impl Iterator<Item = u64> {
+    let chan_ann_seed = rng.next_u64();
     let scid_hash = move |i: u32| -> u64 {
-        XX3Hasher::oneshot_with_seed(chan_update_seed, &i.to_le_bytes())
+        XX3Hasher::oneshot_with_seed(chan_ann_seed, &i.to_le_bytes())
     };
-    let chan_map_value = || -> Option<u16> {
-        Some(rand_size(rng))
-    };
-    let chan_map_values = std::iter::from_fn(chan_map_value);
-    let scids = (start..=end).map(scid_hash)
-    .enumerate().map(|(i, s)| pack_cu_key(s, (i & 1) as u8 ));
-    scids.zip(chan_map_values)
+    (start..=end)
+        .map(scid_hash)
+        .enumerate()
+        .map(|(i, s)| pack_cu_key(s, (i & 1) as u8))
 }

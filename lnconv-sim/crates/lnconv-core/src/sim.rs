@@ -235,6 +235,13 @@ pub fn run(
     let event_counts = count_event_kinds(&event_tuples);
     log_event_kind_breakdown(event_counts, run_duration);
 
+    // Build the shared, immutable key registry once: the key universe
+    // for all three per-node dedup maps is exactly the keys appearing
+    // in the event schedule (nothing else can ever be stored), and
+    // every message's exact size is recoverable from it. Shared by
+    // every NodeState — see `state::KeyRegistry`.
+    let key_registry = state::KeyRegistry::build(&event_tuples);
+
     // node_pubkey rows are static (built from the FromCsv loader)
     // and safe to write before any sim activity.
     if let Some(pk_map) = &pubkey_of {
@@ -253,6 +260,7 @@ pub fn run(
             run_duration,
             event_tuples,
             deadline,
+            &key_registry,
         )?,
         AlgoCfg::Cln { .. }
         | AlgoCfg::Lnd { .. }
@@ -265,6 +273,7 @@ pub fn run(
                 run_duration,
                 event_tuples,
                 deadline,
+                &key_registry,
             )?;
         }
     }
@@ -722,6 +731,7 @@ fn run_flooding(
     run_duration: Duration,
     events: Vec<(Duration, NodeId, Gossip)>,
     deadline: MonotonicTime,
+    key_registry: &state::KeyRegistry,
 ) -> Result<()> {
     let n = topology.len();
     let flush_interval = Duration::from_secs(cfg.run.flush_interval_seconds);
@@ -729,7 +739,7 @@ fn run_flooding(
     // it AND with each of that node's peers (for sketch-style diffs).
     // The local `registry` is dropped at the end of this function;
     // the per-node Arcs survive via the model + its peers' clones.
-    let registry = state::build_registry(n);
+    let registry = state::build_registry(key_registry, n);
     // Drive construction by NodeIndex so `idx` is dense 0..n while
     // `id` is whatever NodeMeta carries (dense for synthetic, sparse
     // u64 hash for CSV-loaded).
@@ -824,11 +834,12 @@ fn run_stagger_population(
     run_duration: Duration,
     events: Vec<(Duration, NodeId, Gossip)>,
     deadline: MonotonicTime,
+    key_registry: &state::KeyRegistry,
 ) -> Result<()> {
     let n = topology.len();
     let flush_interval = Duration::from_secs(cfg.run.flush_interval_seconds);
 
-    let registry = state::build_registry(n);
+    let registry = state::build_registry(key_registry, n);
 
     // {cln,lnd,sketch}_local[i] maps a vertex's NodeIndex (dense
     // 0..n) to its position in the per-type Vec<...>. Per-kind

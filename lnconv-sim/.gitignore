@@ -5,6 +5,10 @@ Cargo.lock
 # Per-run stats output (auto-named: {topology}-{algo}-{event}-{stamp}.parquet)
 /*.parquet
 /sim_output
+/server_sim_outputs
+/logs
+
+.queue-*
 
 # Profiler artifacts (samply JSON, flamegraph SVG, etc.) — see PERF.md.
 /perf

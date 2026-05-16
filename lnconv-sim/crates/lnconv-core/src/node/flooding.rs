@@ -205,11 +205,11 @@ impl FloodingNode {
                 let scid = g.scid.expect("ChannelUpdate must carry scid");
                 let key = crate::state::pack_cu_key(scid, g.direction);
                 let supersedes = m
-                    .get(&key)
-                    .map(|(stored, _)| g.timestamp > *stored)
+                    .get_ts(key)
+                    .map(|stored| g.timestamp > stored)
                     .unwrap_or(true);
                 if supersedes {
-                    m.insert(key, (g.timestamp, g.size_bytes));
+                    m.insert(key, g.timestamp);
                     fresh.push(*g);
                 } else {
                     self.metrics_local.duplicates += 1;
@@ -242,11 +242,11 @@ impl FloodingNode {
             for g in gs {
                 let origin = g.origin.expect("NodeAnnouncement must carry origin");
                 let supersedes = m
-                    .get(&origin)
-                    .map(|(stored, _)| g.timestamp > *stored)
+                    .get_ts(origin)
+                    .map(|stored| g.timestamp > stored)
                     .unwrap_or(true);
                 if supersedes {
-                    m.insert(origin, (g.timestamp, g.size_bytes));
+                    m.insert(origin, g.timestamp);
                     fresh.push(*g);
                 } else {
                     self.metrics_local.duplicates += 1;
@@ -278,7 +278,7 @@ impl FloodingNode {
             let mut m = self.state.chan_anns.write();
             for g in gs {
                 let scid = g.scid.expect("ChannelAnnouncement must carry scid");
-                if m.insert(scid, g.size_bytes).is_none() {
+                if m.insert_present(scid) {
                     fresh.push(*g);
                 } else {
                     self.metrics_local.duplicates += 1;

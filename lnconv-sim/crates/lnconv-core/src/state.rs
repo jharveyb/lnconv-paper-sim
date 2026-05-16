@@ -9,14 +9,40 @@
 //! state, so the storage moves out into [`NodeState`] — one per node,
 //! shared via `Arc`.
 //!
-//! ## Storage choices
+//! ## Storage choices — dense arrays over a shared key registry
 //!
-//! Each kind lives behind a [`parking_lot::RwLock`] (faster + smaller
-//! than `std::sync::RwLock`; no syscall on uncontended paths). The
-//! contained map is a [`nohash_hasher::IntMap`] (i.e. `HashMap` with a
-//! `NoHashHasher<u64>` build hasher) — every key is already a
-//! `xxhash3_64` output (NodeId, Scid) or a derived packed `u64`
-//! ([`pack_cu_key`]), so re-hashing it would just add work.
+//! The *set* of keys for all three kinds is fixed once the event
+//! schedule is built (`sim::build_events`): every gossip a node can
+//! ever store originates from a scheduled event (or a sketch-synth
+//! reply, which only reproduces an already-originated key). So the
+//! universe is exactly the keys appearing in the event stream —
+//! `chan_updates` the originated `(scid, direction)` pairs,
+//! `node_anns` the originating `NodeId`s, `chan_anns` the announced
+//! `Scid`s. Channels/nodes that never originate gossip cost nothing.
+//! Storing a per-node `HashMap` duplicates the (already-hashed) keys
+//! `n_nodes` times.
+//!
+//! Instead, a single immutable [`KeyRegistry`] is built once at sim
+//! init and shared by every node. It assigns each key a dense
+//! `0..K` index, and every node stores its per-kind state as a dense
+//! array indexed by that index:
+//!
+//! * [`DenseTsMap`] (`chan_updates`, `node_anns`) — a presence
+//!   [`FixedBitSet`] plus a `Vec<u32>` of timestamps. A separate
+//!   presence bit is required because `ts == 0` is a legitimate
+//!   stored value (sim/parquet t=0), so absence cannot be a sentinel.
+//! * [`DenseChanAnns`] (`chan_anns`) — a pure presence bitset;
+//!   `channel_announcement`s are dedup'd first-arrival-wins with no
+//!   timestamp.
+//!
+//! `size_bytes` is *not* stored per node. Every message that will
+//! ever propagate is known at sim init (`build_events`'s output), so
+//! the [`KeyRegistry`] keeps a CSR-packed version table mapping
+//! `(key, ts) -> size` and recovers the exact size on demand at
+//! sketch-reply synthesis time (see [`KeyRegistry::build`]).
+//!
+//! Each kind lives behind its own [`parking_lot::RwLock`] so a
+//! `chan_updates` write doesn't block a `node_anns` reader.
 //!
 //! `chan_updates` keys pack `(scid << 1) | direction` into a `u64`.
 //! SCIDs from the CSV loader are masked to 63 bits at load time
@@ -26,13 +52,13 @@
 //!
 //! ## Distribution at sim-init
 //!
-//! `sim::run` calls [`build_registry`] once to produce a
-//! `Vec<SharedNodeState>` indexed by `NodeIdx`. While constructing
-//! each model, the simulator hands it (a) its own `Arc<NodeState>`
-//! and (b) a `Vec<Arc<NodeState>>` of *only its direct peers'*
-//! states (aligned with the model's per-peer Output Vec). The local
-//! registry vector is dropped after wiring; the per-node Arcs
-//! survive via the model + its peers' references.
+//! `sim::run` builds the [`KeyRegistry`], then calls [`build_registry`]
+//! once to produce a `Vec<SharedNodeState>` indexed by `NodeIdx`.
+//! While constructing each model, the simulator hands it (a) its own
+//! `Arc<NodeState>` and (b) a `Vec<Arc<NodeState>>` of *only its
+//! direct peers'* states (aligned with the model's per-peer Output
+//! Vec). The local registry vector is dropped after wiring; the
+//! per-node Arcs survive via the model + its peers' references.
 //!
 //! ## Diff semantics
 //!
@@ -48,24 +74,29 @@
 //!   sent back. The caller passes [`WhichSide`] to choose which
 //!   Vec(s) to materialise; the unselected side comes back empty.
 //!
+//! Because both sides index the same shared `0..K` space, the diff
+//! is a linear walk over each side's presence bitset (`FixedBitSet`
+//! iterators) — no hashing.
+//!
 //! Lock acquisition is in `NodeIdx`-min-first order to avoid
 //! deadlock between two reconciliations on the same kind in
 //! opposite directions when a third party is waiting on a write
 //! lock.
 
 use std::sync::Arc;
+use std::time::Duration;
 
+use fixedbitset::FixedBitSet;
 use nexosim::time::MonotonicTime;
 use nohash_hasher::IntMap;
 use parking_lot::RwLock;
 
 use crate::message::{Direction, Gossip, GossipKind, NodeId, NodeIdx, Scid, SketchKind};
 
-/// Pack a `(Scid, Direction)` tuple into a single `u64` suitable for
-/// `nohash_hasher::IntMap`. Direction is stored in bit 0; SCID
-/// occupies bits 1..64. SCIDs are guaranteed `< 2^63` (CSV loader
-/// masks the top bit; synthetic SCIDs are sequential), so the shift
-/// is lossless.
+/// Pack a `(Scid, Direction)` tuple into a single `u64`. Direction is
+/// stored in bit 0; SCID occupies bits 1..64. SCIDs are guaranteed
+/// `< 2^63` (CSV loader masks the top bit; synthetic SCIDs are
+/// sequential), so the shift is lossless.
 #[inline]
 pub fn pack_cu_key(scid: Scid, direction: Direction) -> u64 {
     (scid << 1) | (direction as u64 & 1)
@@ -77,56 +108,406 @@ pub fn unpack_cu_key(packed: u64) -> (Scid, Direction) {
     (packed >> 1, (packed & 1) as Direction)
 }
 
-/// Type aliases for the three per-node dedup maps. All use
-/// `NoHashHasher<u64>` because the keys are already well-distributed
-/// hash outputs.
-pub type ChanUpdatesMap = IntMap<u64, (u32, u16)>;
-pub type NodeAnnsMap = IntMap<NodeId, (u32, u16)>;
-pub type ChanAnnsMap = IntMap<Scid, u16>;
+// ---------------------------------------------------------------------
+// Shared, immutable key registry
+// ---------------------------------------------------------------------
+
+/// CSR-packed version table for one timestamped kind. `offsets` has
+/// length `K + 1`; the versions of dense index `i` are the slice
+/// `values[offsets[i]..offsets[i+1]]`, kept ascending by `ts`. This
+/// avoids one heap allocation per key (`Vec<Vec<_>>` would need `K`)
+/// and keeps every group a cache-friendly contiguous slice.
+#[derive(Default)]
+struct VersionTable {
+    /// `(ts, size)` pairs, grouped by dense index, each group sorted
+    /// by `ts`.
+    values: Vec<(u32, u16)>,
+    /// Prefix-sum group boundaries; `len == K + 1`.
+    offsets: Vec<u32>,
+}
+
+impl VersionTable {
+    /// Build the CSR layout from per-index version groups. Each group
+    /// is sorted by `ts` and deduplicated (two events colliding on
+    /// the same second collapse to one entry).
+    fn from_groups(mut groups: Vec<Vec<(u32, u16)>>) -> Self {
+        let total: usize = groups.iter().map(Vec::len).sum();
+        let mut values: Vec<(u32, u16)> = Vec::with_capacity(total);
+        let mut offsets: Vec<u32> = Vec::with_capacity(groups.len() + 1);
+        offsets.push(0);
+        for g in &mut groups {
+            g.sort_unstable_by_key(|&(ts, _)| ts);
+            g.dedup_by_key(|&mut (ts, _)| ts);
+            values.extend_from_slice(g);
+            offsets.push(values.len() as u32);
+        }
+        Self { values, offsets }
+    }
+
+    /// Exact `size_bytes` for dense index `idx` at timestamp `ts`.
+    /// A node only ever stores a `ts` that originated from a real
+    /// message, so the search hits; the fallbacks keep it total.
+    ///
+    /// Most keys are updated 0–1 times over a run, so those two
+    /// cases are branch-only fast paths; only a genuinely
+    /// multi-version key pays the (small, ts-sorted) binary search.
+    #[inline]
+    fn size_of(&self, idx: usize, ts: u32) -> u16 {
+        let lo = self.offsets[idx] as usize;
+        let hi = self.offsets[idx + 1] as usize;
+        match &self.values[lo..hi] {
+            [] => 0,
+            [(_, size)] => *size,
+            group => match group.binary_search_by_key(&ts, |&(t, _)| t) {
+                Ok(pos) => group[pos].1,
+                Err(_) => group[0].1,
+            },
+        }
+    }
+}
+
+/// Shared key data for one timestamped kind (`chan_updates` or
+/// `node_anns`): the key→dense-index map, the reverse index→key
+/// vector, and the CSR version table for exact size recovery.
+#[derive(Default)]
+struct KindKeys {
+    index: IntMap<u64, u32>,
+    key_by_idx: Vec<u64>,
+    versions: VersionTable,
+}
+
+impl KindKeys {
+    #[inline]
+    fn idx(&self, key: u64) -> usize {
+        *self
+            .index
+            .get(&key)
+            .expect("key not in KeyRegistry — key universe not enumerated at sim init")
+            as usize
+    }
+    #[inline]
+    fn key_at(&self, idx: usize) -> u64 {
+        self.key_by_idx[idx]
+    }
+    #[inline]
+    fn size_of(&self, idx: usize, ts: u32) -> u16 {
+        self.versions.size_of(idx, ts)
+    }
+    #[inline]
+    fn len(&self) -> usize {
+        self.key_by_idx.len()
+    }
+}
+
+/// Shared key data for `chan_anns`. No timestamp dimension — a
+/// `channel_announcement` carries one size per scid — so the version
+/// table collapses to a plain `Vec<u16>` indexed by dense index.
+#[derive(Default)]
+struct ChanAnnKeys {
+    index: IntMap<u64, u32>,
+    key_by_idx: Vec<u64>,
+    sizes: Vec<u16>,
+}
+
+impl ChanAnnKeys {
+    #[inline]
+    fn idx(&self, key: u64) -> usize {
+        *self
+            .index
+            .get(&key)
+            .expect("scid not in KeyRegistry — key universe not enumerated at sim init")
+            as usize
+    }
+    #[inline]
+    fn key_at(&self, idx: usize) -> u64 {
+        self.key_by_idx[idx]
+    }
+    #[inline]
+    fn size_at(&self, idx: usize) -> u16 {
+        self.sizes[idx]
+    }
+    #[inline]
+    fn len(&self) -> usize {
+        self.key_by_idx.len()
+    }
+}
+
+/// Immutable, process-wide key registry. Built once at sim init from
+/// the full event schedule (see [`KeyRegistry::build`]); shared by
+/// every [`NodeState`] via the inner `Arc`s. Carries both the
+/// dense-index assignment and the per-kind size data so per-node
+/// state can drop `size_bytes` entirely.
+#[derive(Default)]
+pub struct KeyRegistry {
+    chan_updates: Arc<KindKeys>,
+    node_anns: Arc<KindKeys>,
+    chan_anns: Arc<ChanAnnKeys>,
+}
+
+/// Build `key -> dense index` from a key vector (index == position).
+fn index_of(keys: &[u64]) -> IntMap<u64, u32> {
+    let mut m: IntMap<u64, u32> = IntMap::default();
+    m.reserve(keys.len());
+    for (i, &k) in keys.iter().enumerate() {
+        m.insert(k, i as u32);
+    }
+    m
+}
+
+impl KeyRegistry {
+    /// Production constructor: derive the key universe **and** the CSR
+    /// version table from the full event schedule in a single pass.
+    ///
+    /// Every key any node will ever store originates from an event
+    /// (or a sketch-synth reply, which only ever reproduces an
+    /// already-originated key), so the events alone define the
+    /// universe — there is no need to enumerate the channel registry
+    /// or the topology, and channels/nodes that never originate
+    /// gossip cost no dense slots.
+    ///
+    /// Dense indices are assigned in first-appearance order over the
+    /// (delay-sorted) event list, so the assignment is deterministic.
+    /// An event's effective wire timestamp is the firing second:
+    /// `originate_stamp` stamps `ChannelUpdate`/`NodeAnnouncement`
+    /// with `cx.time().as_secs()`, and the firing time is the
+    /// scheduled `delay` from t0, so `ts = delay.as_secs()`. A
+    /// `NodeAnnouncement`'s key is the *originating* node (the event
+    /// tuple's source), since `originate_stamp` forces
+    /// `origin = self_id`. `ChannelAnnouncement` carries no timestamp.
+    pub fn build(events: &[(Duration, NodeId, Gossip)]) -> Self {
+        let mut cu_index: IntMap<u64, u32> = IntMap::default();
+        let mut cu_keys: Vec<u64> = Vec::new();
+        let mut cu_groups: Vec<Vec<(u32, u16)>> = Vec::new();
+        let mut na_index: IntMap<u64, u32> = IntMap::default();
+        let mut na_keys: Vec<u64> = Vec::new();
+        let mut na_groups: Vec<Vec<(u32, u16)>> = Vec::new();
+        let mut ca_index: IntMap<u64, u32> = IntMap::default();
+        let mut ca_keys: Vec<u64> = Vec::new();
+        let mut ca_sizes: Vec<u16> = Vec::new();
+
+        for (delay, node, g) in events {
+            let ts = delay.as_secs() as u32;
+            match g.kind {
+                GossipKind::ChannelUpdate => {
+                    let key = g.state_key();
+                    let idx = *cu_index.entry(key).or_insert_with(|| {
+                        cu_keys.push(key);
+                        cu_groups.push(Vec::new());
+                        (cu_keys.len() - 1) as u32
+                    }) as usize;
+                    cu_groups[idx].push((ts, g.size_bytes));
+                }
+                GossipKind::NodeAnnouncement => {
+                    let key = *node;
+                    let idx = *na_index.entry(key).or_insert_with(|| {
+                        na_keys.push(key);
+                        na_groups.push(Vec::new());
+                        (na_keys.len() - 1) as u32
+                    }) as usize;
+                    na_groups[idx].push((ts, g.size_bytes));
+                }
+                GossipKind::ChannelAnnouncement => {
+                    let key = g.state_key();
+                    match ca_index.get(&key) {
+                        Some(&i) => ca_sizes[i as usize] = g.size_bytes,
+                        None => {
+                            ca_index.insert(key, ca_keys.len() as u32);
+                            ca_keys.push(key);
+                            ca_sizes.push(g.size_bytes);
+                        }
+                    }
+                }
+            }
+        }
+
+        KeyRegistry {
+            chan_updates: Arc::new(KindKeys {
+                index: cu_index,
+                key_by_idx: cu_keys,
+                versions: VersionTable::from_groups(cu_groups),
+            }),
+            node_anns: Arc::new(KindKeys {
+                index: na_index,
+                key_by_idx: na_keys,
+                versions: VersionTable::from_groups(na_groups),
+            }),
+            chan_anns: Arc::new(ChanAnnKeys {
+                index: ca_index,
+                key_by_idx: ca_keys,
+                sizes: ca_sizes,
+            }),
+        }
+    }
+
+    /// Test/bench constructor: explicit key universes with empty
+    /// version tables. Callers that don't exercise sketch-reply size
+    /// recovery (`synth_*` falls back to `0`).
+    pub fn from_keys(cu_keys: Vec<u64>, na_keys: Vec<u64>, ca_keys: Vec<u64>) -> Self {
+        let cu_index = index_of(&cu_keys);
+        let na_index = index_of(&na_keys);
+        let ca_index = index_of(&ca_keys);
+        let cu_groups = vec![Vec::new(); cu_keys.len()];
+        let na_groups = vec![Vec::new(); na_keys.len()];
+        let ca_sizes = vec![0u16; ca_keys.len()];
+        KeyRegistry {
+            chan_updates: Arc::new(KindKeys {
+                index: cu_index,
+                key_by_idx: cu_keys,
+                versions: VersionTable::from_groups(cu_groups),
+            }),
+            node_anns: Arc::new(KindKeys {
+                index: na_index,
+                key_by_idx: na_keys,
+                versions: VersionTable::from_groups(na_groups),
+            }),
+            chan_anns: Arc::new(ChanAnnKeys {
+                index: ca_index,
+                key_by_idx: ca_keys,
+                sizes: ca_sizes,
+            }),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Per-node dense state
+// ---------------------------------------------------------------------
+
+/// Dense per-node state for a timestamped kind. `present[i]` records
+/// whether dense index `i` is held; `ts[i]` is its stored timestamp.
+/// `size_bytes` is recovered on demand from the shared [`KindKeys`]
+/// version table.
+#[derive(Default)]
+pub struct DenseTsMap {
+    keys: Arc<KindKeys>,
+    present: FixedBitSet,
+    ts: Vec<u32>,
+}
+
+impl DenseTsMap {
+    fn new(keys: Arc<KindKeys>) -> Self {
+        let k = keys.len();
+        Self {
+            present: FixedBitSet::with_capacity(k),
+            ts: vec![0u32; k],
+            keys,
+        }
+    }
+
+    /// Stored timestamp for `key`, or `None` if not held. The hot
+    /// dedup path — no size lookup.
+    #[inline]
+    pub fn get_ts(&self, key: u64) -> Option<u32> {
+        let i = self.keys.idx(key);
+        self.present.contains(i).then(|| self.ts[i])
+    }
+
+    /// Stored `(ts, size_bytes)` for `key`, or `None` if not held.
+    /// Used by the inventory-reply path; recovers the exact size
+    /// from the shared version table.
+    #[inline]
+    pub fn get(&self, key: u64) -> Option<(u32, u16)> {
+        let i = self.keys.idx(key);
+        if self.present.contains(i) {
+            let ts = self.ts[i];
+            Some((ts, self.keys.size_of(i, ts)))
+        } else {
+            None
+        }
+    }
+
+    /// Record `key` as held with timestamp `ts` (overwrites any
+    /// prior value — callers gate on supersession first).
+    #[inline]
+    pub fn insert(&mut self, key: u64, ts: u32) {
+        let i = self.keys.idx(key);
+        self.present.insert(i);
+        self.ts[i] = ts;
+    }
+
+    /// Whether `key` is held.
+    #[inline]
+    pub fn contains(&self, key: u64) -> bool {
+        self.present.contains(self.keys.idx(key))
+    }
+}
+
+/// Dense per-node state for `chan_anns`: a pure presence bitset.
+/// `channel_announcement`s are dedup'd first-arrival-wins, so there
+/// is nothing to store beyond "have I seen this scid".
+#[derive(Default)]
+pub struct DenseChanAnns {
+    keys: Arc<ChanAnnKeys>,
+    present: FixedBitSet,
+}
+
+impl DenseChanAnns {
+    fn new(keys: Arc<ChanAnnKeys>) -> Self {
+        let k = keys.len();
+        Self {
+            present: FixedBitSet::with_capacity(k),
+            keys,
+        }
+    }
+
+    /// Whether `scid` is held.
+    #[inline]
+    pub fn contains(&self, key: u64) -> bool {
+        self.present.contains(self.keys.idx(key))
+    }
+
+    /// Stored `size_bytes` for `scid`, or `None` if not held.
+    #[inline]
+    pub fn get(&self, key: u64) -> Option<u16> {
+        let i = self.keys.idx(key);
+        self.present.contains(i).then(|| self.keys.size_at(i))
+    }
+
+    /// Mark `scid` as held; returns `true` iff it was newly inserted
+    /// (mirrors `HashMap::insert(..).is_none()`).
+    #[inline]
+    pub fn insert_present(&mut self, key: u64) -> bool {
+        let i = self.keys.idx(key);
+        !self.present.put(i)
+    }
+}
 
 /// Per-node dedup state. Each kind lives behind its own
 /// `parking_lot::RwLock` so a `chan_updates` write doesn't block a
-/// `node_anns` reader. Each map's value embeds `size_bytes` so
-/// set-recon replies can carry realistic on-the-wire byte counts.
+/// `node_anns` reader.
 ///
 /// `Default` exists only to satisfy the `#[derive(Default)]` on the
 /// node `Model` structs (each holds a `SharedNodeState`); a default
-/// `NodeState` carries `idx = 0` and three empty maps and is never
-/// observed at runtime — sim init replaces it with a real Arc from
-/// the registry before any model spins up.
+/// `NodeState` carries `idx = 0` and three empty maps over an empty
+/// `KeyRegistry` and is never observed at runtime — sim init replaces
+/// it with a real Arc from the registry before any model spins up.
 #[derive(Default)]
 pub struct NodeState {
     pub idx: NodeIdx, // for lock-order tie-breaking in `compute_diff`
-    pub chan_updates: RwLock<ChanUpdatesMap>,
-    pub node_anns: RwLock<NodeAnnsMap>,
-    pub chan_anns: RwLock<ChanAnnsMap>,
+    pub chan_updates: RwLock<DenseTsMap>,
+    pub node_anns: RwLock<DenseTsMap>,
+    pub chan_anns: RwLock<DenseChanAnns>,
 }
 
 pub type SharedNodeState = Arc<NodeState>;
 
 impl NodeState {
-    pub fn new(idx: NodeIdx) -> Arc<Self> {
-        let mut cu = IntMap::default();
-        let mut na = IntMap::default();
-        let mut ca = IntMap::default();
-        cu.reserve(1024);
-        na.reserve(1024);
-        ca.reserve(64);
+    pub fn new(keys: &KeyRegistry, idx: NodeIdx) -> Arc<Self> {
         Arc::new(Self {
             idx,
-            chan_updates: RwLock::new(cu),
-            node_anns: RwLock::new(na),
-            chan_anns: RwLock::new(ca),
+            chan_updates: RwLock::new(DenseTsMap::new(keys.chan_updates.clone())),
+            node_anns: RwLock::new(DenseTsMap::new(keys.node_anns.clone())),
+            chan_anns: RwLock::new(DenseChanAnns::new(keys.chan_anns.clone())),
         })
     }
 }
 
-/// Build one `Arc<NodeState>` per node. The returned `Vec` is the
-/// transient construction-time index used by `sim::run` to hand each
-/// model its own state Arc plus an aligned `Vec<Arc<NodeState>>` of
-/// its peers' states.
-pub fn build_registry(n: usize) -> Vec<SharedNodeState> {
-    (0..n).map(|i| NodeState::new(i as NodeIdx)).collect()
+/// Build one `Arc<NodeState>` per node, all sharing `keys`. The
+/// returned `Vec` is the transient construction-time index used by
+/// `sim::run` to hand each model its own state Arc plus an aligned
+/// `Vec<Arc<NodeState>>` of its peers' states.
+pub fn build_registry(keys: &KeyRegistry, n: usize) -> Vec<SharedNodeState> {
+    (0..n).map(|i| NodeState::new(keys, i as NodeIdx)).collect()
 }
 
 /// Which side of a `compute_diff` should materialise its newer-only
@@ -234,48 +615,57 @@ pub fn compute_diff(
     }
 }
 
-fn diff_chan_updates(la: &ChanUpdatesMap, lb: &ChanUpdatesMap, which: WhichSide) -> DiffResult {
+fn diff_chan_updates(la: &DenseTsMap, lb: &DenseTsMap, which: WhichSide) -> DiffResult {
     let want_a = which.want_a();
     let want_b = which.want_b();
+    let keys = &la.keys;
     let mut a_only_count = 0usize;
     let mut b_only_count = 0usize;
     let mut intersection = 0usize;
     let difference_count_estimate = 512;
-    let mut a_newer = if want_a { Vec::with_capacity(difference_count_estimate) } else { Vec::new() };
-    let mut b_newer = if want_b { Vec::with_capacity(difference_count_estimate) } else { Vec::new() };
-    for (packed, (ts_a, size_a)) in la {
-        match lb.get(packed) {
-            Some((ts_b, _)) if ts_b == ts_a => intersection += 1,
-            Some((ts_b, size_b)) => {
+    let mut a_newer = if want_a {
+        Vec::with_capacity(difference_count_estimate)
+    } else {
+        Vec::new()
+    };
+    let mut b_newer = if want_b {
+        Vec::with_capacity(difference_count_estimate)
+    } else {
+        Vec::new()
+    };
+    for i in la.present.ones() {
+        let ts_a = la.ts[i];
+        if lb.present.contains(i) {
+            let ts_b = lb.ts[i];
+            if ts_a == ts_b {
+                intersection += 1;
+            } else {
                 a_only_count += 1;
                 b_only_count += 1;
                 if ts_a > ts_b {
                     if want_a {
-                        let (scid, dir) = unpack_cu_key(*packed);
-                        a_newer.push(synth_chan_update(scid, dir, *ts_a, *size_a));
+                        let (scid, dir) = unpack_cu_key(keys.key_at(i));
+                        a_newer.push(synth_chan_update(scid, dir, ts_a, keys.size_of(i, ts_a)));
                     }
                 } else if want_b {
-                    let (scid, dir) = unpack_cu_key(*packed);
-                    b_newer.push(synth_chan_update(scid, dir, *ts_b, *size_b));
+                    let (scid, dir) = unpack_cu_key(keys.key_at(i));
+                    b_newer.push(synth_chan_update(scid, dir, ts_b, keys.size_of(i, ts_b)));
                 }
             }
-            None => {
-                a_only_count += 1;
-                if want_a {
-                    let (scid, dir) = unpack_cu_key(*packed);
-                    a_newer.push(synth_chan_update(scid, dir, *ts_a, *size_a));
-                }
+        } else {
+            a_only_count += 1;
+            if want_a {
+                let (scid, dir) = unpack_cu_key(keys.key_at(i));
+                a_newer.push(synth_chan_update(scid, dir, ts_a, keys.size_of(i, ts_a)));
             }
         }
     }
-    for (packed, (ts_b, size_b)) in lb {
-        if la.contains_key(packed) {
-            continue;
-        }
+    for i in lb.present.difference(&la.present) {
         b_only_count += 1;
         if want_b {
-            let (scid, dir) = unpack_cu_key(*packed);
-            b_newer.push(synth_chan_update(scid, dir, *ts_b, *size_b));
+            let ts_b = lb.ts[i];
+            let (scid, dir) = unpack_cu_key(keys.key_at(i));
+            b_newer.push(synth_chan_update(scid, dir, ts_b, keys.size_of(i, ts_b)));
         }
     }
     DiffResult {
@@ -287,44 +677,53 @@ fn diff_chan_updates(la: &ChanUpdatesMap, lb: &ChanUpdatesMap, which: WhichSide)
     }
 }
 
-fn diff_node_anns(la: &NodeAnnsMap, lb: &NodeAnnsMap, which: WhichSide) -> DiffResult {
+fn diff_node_anns(la: &DenseTsMap, lb: &DenseTsMap, which: WhichSide) -> DiffResult {
     let want_a = which.want_a();
     let want_b = which.want_b();
+    let keys = &la.keys;
     let mut a_only_count = 0usize;
     let mut b_only_count = 0usize;
     let mut intersection = 0usize;
     let difference_count_estimate = 256;
-    let mut a_newer = if want_a { Vec::with_capacity(difference_count_estimate) } else { Vec::new() };
-    let mut b_newer = if want_b { Vec::with_capacity(difference_count_estimate) } else { Vec::new() };
-    for (origin, (ts_a, size_a)) in la {
-        match lb.get(origin) {
-            Some((ts_b, _)) if ts_b == ts_a => intersection += 1,
-            Some((ts_b, size_b)) => {
+    let mut a_newer = if want_a {
+        Vec::with_capacity(difference_count_estimate)
+    } else {
+        Vec::new()
+    };
+    let mut b_newer = if want_b {
+        Vec::with_capacity(difference_count_estimate)
+    } else {
+        Vec::new()
+    };
+    for i in la.present.ones() {
+        let ts_a = la.ts[i];
+        if lb.present.contains(i) {
+            let ts_b = lb.ts[i];
+            if ts_a == ts_b {
+                intersection += 1;
+            } else {
                 a_only_count += 1;
                 b_only_count += 1;
                 if ts_a > ts_b {
                     if want_a {
-                        a_newer.push(synth_node_ann(*origin, *ts_a, *size_a));
+                        a_newer.push(synth_node_ann(keys.key_at(i), ts_a, keys.size_of(i, ts_a)));
                     }
                 } else if want_b {
-                    b_newer.push(synth_node_ann(*origin, *ts_b, *size_b));
+                    b_newer.push(synth_node_ann(keys.key_at(i), ts_b, keys.size_of(i, ts_b)));
                 }
             }
-            None => {
-                a_only_count += 1;
-                if want_a {
-                    a_newer.push(synth_node_ann(*origin, *ts_a, *size_a));
-                }
+        } else {
+            a_only_count += 1;
+            if want_a {
+                a_newer.push(synth_node_ann(keys.key_at(i), ts_a, keys.size_of(i, ts_a)));
             }
         }
     }
-    for (origin, (ts_b, size_b)) in lb {
-        if la.contains_key(origin) {
-            continue;
-        }
+    for i in lb.present.difference(&la.present) {
         b_only_count += 1;
         if want_b {
-            b_newer.push(synth_node_ann(*origin, *ts_b, *size_b));
+            let ts_b = lb.ts[i];
+            b_newer.push(synth_node_ann(keys.key_at(i), ts_b, keys.size_of(i, ts_b)));
         }
     }
     DiffResult {
@@ -336,32 +735,38 @@ fn diff_node_anns(la: &NodeAnnsMap, lb: &NodeAnnsMap, which: WhichSide) -> DiffR
     }
 }
 
-fn diff_chan_anns(la: &ChanAnnsMap, lb: &ChanAnnsMap, which: WhichSide) -> DiffResult {
+fn diff_chan_anns(la: &DenseChanAnns, lb: &DenseChanAnns, which: WhichSide) -> DiffResult {
     let want_a = which.want_a();
     let want_b = which.want_b();
+    let keys = &la.keys;
     let mut a_only_count = 0usize;
     let mut intersection = 0usize;
     let difference_count_estimate = 128;
-    let mut a_newer = if want_a { Vec::with_capacity(difference_count_estimate) } else { Vec::new() };
-    let mut b_newer = if want_b { Vec::with_capacity(difference_count_estimate) } else { Vec::new() };
-    for (scid, size_a) in la {
-        if lb.contains_key(scid) {
+    let mut a_newer = if want_a {
+        Vec::with_capacity(difference_count_estimate)
+    } else {
+        Vec::new()
+    };
+    let mut b_newer = if want_b {
+        Vec::with_capacity(difference_count_estimate)
+    } else {
+        Vec::new()
+    };
+    for i in la.present.ones() {
+        if lb.present.contains(i) {
             intersection += 1;
         } else {
             a_only_count += 1;
             if want_a {
-                a_newer.push(synth_chan_ann(*scid, *size_a));
+                a_newer.push(synth_chan_ann(keys.key_at(i), keys.size_at(i)));
             }
         }
     }
     let mut b_only_count = 0usize;
-    for (scid, size_b) in lb {
-        if la.contains_key(scid) {
-            continue;
-        }
+    for i in lb.present.difference(&la.present) {
         b_only_count += 1;
         if want_b {
-            b_newer.push(synth_chan_ann(*scid, *size_b));
+            b_newer.push(synth_chan_ann(keys.key_at(i), keys.size_at(i)));
         }
     }
     DiffResult {
@@ -395,20 +800,20 @@ pub fn originate_stamp(
             let scid = msg.scid.expect("ChannelUpdate must carry scid");
             msg.origin = None;
             msg.timestamp = now_secs;
-            let mut m = state.chan_updates.write();
-            m.insert(pack_cu_key(scid, msg.direction), (now_secs, msg.size_bytes));
+            state
+                .chan_updates
+                .write()
+                .insert(pack_cu_key(scid, msg.direction), now_secs);
         }
         GossipKind::NodeAnnouncement => {
             msg.origin = Some(self_id);
             msg.timestamp = now_secs;
-            let mut m = state.node_anns.write();
-            m.insert(self_id, (now_secs, msg.size_bytes));
+            state.node_anns.write().insert(self_id, now_secs);
         }
         GossipKind::ChannelAnnouncement => {
             let scid = msg.scid.expect("ChannelAnnouncement must carry scid");
             msg.origin = None;
-            let mut m = state.chan_anns.write();
-            if m.insert(scid, msg.size_bytes).is_some() {
+            if !state.chan_anns.write().insert_present(scid) {
                 // Already broadcast this scid — drop.
                 return false;
             }
@@ -464,25 +869,39 @@ pub fn synth_chan_ann(scid: Scid, size_bytes: u16) -> Gossip {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Barrier;
+    use std::sync::{Barrier, LazyLock};
     use std::thread;
 
+    /// Shared key registry covering every key the tests below touch:
+    /// chan_updates/chan_anns scids `0..=400` and node_anns origins
+    /// `0..=400` plus `{555, 666, 777}`. The version table is empty
+    /// (no events) — tests never assert on synthesised `size_bytes`.
+    static TEST_KEYS: LazyLock<KeyRegistry> = LazyLock::new(|| {
+        let mut cu = Vec::new();
+        for scid in 0..=400u64 {
+            cu.push(pack_cu_key(scid, 0));
+            cu.push(pack_cu_key(scid, 1));
+        }
+        let mut na: Vec<u64> = (0..=400u64).collect();
+        na.extend([555u64, 666, 777]);
+        let ca: Vec<u64> = (0..=400u64).collect();
+        KeyRegistry::from_keys(cu, na, ca)
+    });
+
     fn st(idx: NodeIdx) -> SharedNodeState {
-        NodeState::new(idx)
+        NodeState::new(&TEST_KEYS, idx)
     }
 
-    fn write_cu(s: &SharedNodeState, scid: Scid, dir: Direction, ts: u32, size: u16) {
-        s.chan_updates
-            .write()
-            .insert(pack_cu_key(scid, dir), (ts, size));
+    fn write_cu(s: &SharedNodeState, scid: Scid, dir: Direction, ts: u32, _size: u16) {
+        s.chan_updates.write().insert(pack_cu_key(scid, dir), ts);
     }
 
-    fn write_na(s: &SharedNodeState, origin: NodeId, ts: u32, size: u16) {
-        s.node_anns.write().insert(origin, (ts, size));
+    fn write_na(s: &SharedNodeState, origin: NodeId, ts: u32, _size: u16) {
+        s.node_anns.write().insert(origin, ts);
     }
 
-    fn write_ca(s: &SharedNodeState, scid: Scid, size: u16) {
-        s.chan_anns.write().insert(scid, size);
+    fn write_ca(s: &SharedNodeState, scid: Scid, _size: u16) {
+        s.chan_anns.write().insert_present(scid);
     }
 
     #[test]
@@ -671,7 +1090,6 @@ mod tests {
             h.join().unwrap();
         }
     }
-
 
     // ---------------------------------------------------------------
     // Side-coverage tests: each kind exercises `WhichSide::Both` and

@@ -50,12 +50,12 @@ use crate::metrics::{MsgStats, NodeCounters, OverflowEvent};
 /// Doubled from the previous 65 536 — peak per-stream buffer ~22 MB,
 /// total peak across 6 streams ~140 MB. Trade is fewer encode calls
 /// in exchange for slightly more RAM.
-const FLUSH_EVERY: usize = 131_072;
+const FLUSH_EVERY: usize = 65_536;
 
 /// Per-file channel depth. Bounded so backpressure surfaces as
 /// wall-time, not RAM growth. With one channel per output file a
 /// stalled writer only blocks its own producer code path.
-const PER_STREAM_DEPTH: usize = 256_000;
+const PER_STREAM_DEPTH: usize = 64_000;
 
 /// Output multiplex sender — cloneable. Holds one
 /// `crossbeam_channel::Sender` per output Parquet file; `send` does a
@@ -790,7 +790,7 @@ pub fn spawn(paths: OutputPaths, percentiles: Vec<f64>) -> Writer {
     let zstd_fast = Compression::ZSTD(ZstdLevel::try_new(1).expect("ZstdLevel(1)"));
     let zstd_default = Compression::ZSTD(ZstdLevel::default());
 
-    let (msg_tx, msg_rx) = bounded::<MsgStats>(PER_STREAM_DEPTH);
+    let (msg_tx, msg_rx) = bounded::<MsgStats>(PER_STREAM_DEPTH*2);
     let msg_path = paths.msg_stats.clone();
     let msg_join = thread::spawn(move || run_msg_stats(msg_path, percentiles, msg_rx));
 

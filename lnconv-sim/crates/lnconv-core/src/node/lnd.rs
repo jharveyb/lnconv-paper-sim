@@ -260,11 +260,11 @@ impl LndNode {
                 let scid = g.scid.expect("ChannelUpdate must carry scid");
                 let key = crate::state::pack_cu_key(scid, g.direction);
                 let supersedes = m
-                    .get(&key)
-                    .map(|(stored, _)| g.timestamp > *stored)
+                    .get_ts(key)
+                    .map(|stored| g.timestamp > stored)
                     .unwrap_or(true);
                 if supersedes {
-                    m.insert(key, (g.timestamp, g.size_bytes));
+                    m.insert(key, g.timestamp);
                     self.metrics_local.first_seen_pending.push(FirstSeenEntry {
                         gossip: *g,
                         time_ns: now_ns,
@@ -294,11 +294,11 @@ impl LndNode {
             for g in gs {
                 let origin = g.origin.expect("NodeAnnouncement must carry origin");
                 let supersedes = m
-                    .get(&origin)
-                    .map(|(stored, _)| g.timestamp > *stored)
+                    .get_ts(origin)
+                    .map(|stored| g.timestamp > stored)
                     .unwrap_or(true);
                 if supersedes {
-                    m.insert(origin, (g.timestamp, g.size_bytes));
+                    m.insert(origin, g.timestamp);
                     self.metrics_local.first_seen_pending.push(FirstSeenEntry {
                         gossip: *g,
                         time_ns: now_ns,
@@ -327,7 +327,7 @@ impl LndNode {
             let mut m = self.state.chan_anns.write();
             for g in gs {
                 let scid = g.scid.expect("ChannelAnnouncement must carry scid");
-                if m.insert(scid, g.size_bytes).is_none() {
+                if m.insert_present(scid) {
                     self.metrics_local.first_seen_pending.push(FirstSeenEntry {
                         gossip: *g,
                         time_ns: now_ns,

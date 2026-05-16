@@ -22,6 +22,9 @@ rustworkx-core = "0.17"
 petgraph = "0.8"
 statrs = "0.18"
 nohash-hasher = "0.2"
+# Pinned to whatever petgraph 0.8 brings in transitively (0.5.x) so the
+# workspace and petgraph agree on the FixedBitSet type.
+fixedbitset = "0.5"
 parking_lot = { version = "0.12", features = ["hardware-lock-elision"] }
 csv = "1"
 twox-hash = { version = "2", features = ["xxhash3_64", "std", "alloc"] }
@@ -35,18 +38,8 @@ duckdb = { version = "1", features = ["bundled", "parquet"] }
 crossbeam-channel = "0.5"
 divan = "0.1"
 
-# Add more perf-related settings
 [profile.release]
-# defaults
-opt-level = 3
 strip = "debuginfo"
-debug-assertions = false
-overflow-checks = false
-
-# custom
-lto = "fat"
-codegen-units = 1
-panic = "abort"
 debug = "line-tables-only"
 
 # Bench profile mirrors release-tuning so microbench results reflect

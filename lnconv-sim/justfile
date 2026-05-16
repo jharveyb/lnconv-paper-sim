@@ -7,6 +7,9 @@ build-release-debug:
 build-all: build-release build-release-debug
         cargo-build
 
+bench:
+        cargo bench -p lnconv-core --bench diff
+
 sample-stagger: build-release-debug
         rm -f perf/snapsnap-stagger-short.json.gz
         samply record -o perf/snapsnap-stagger-short.json.gz ./target/bench-release/lnconv -c configs/ln-snapsnap-stagger-short.toml
