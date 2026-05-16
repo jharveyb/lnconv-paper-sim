@@ -175,12 +175,18 @@ impl AggregatorState {
             (crate::message::SketchKind::NodeAnns.as_u8(), &node_anns),
             (crate::message::SketchKind::ChanAnns.as_u8(), &chan_anns),
         ] {
-            let n = s.intersection.len().min(s.a_only.len()).min(s.b_only.len());
+            let n = s
+                .intersection
+                .len()
+                .min(s.difference.len())
+                .min(s.a_only.len())
+                .min(s.b_only.len());
             for i in 0..n {
                 let row = NodeReservoirRow {
                     node_idx: idx,
                     kind: kind_code,
                     intersection: s.intersection[i],
+                    difference: s.difference[i],
                     a_only: s.a_only[i],
                     b_only: s.b_only[i],
                     total_seen: s.total_seen,

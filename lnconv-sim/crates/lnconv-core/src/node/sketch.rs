@@ -365,8 +365,8 @@ impl SketchNode {
             WhichSide::B
         };
         let diff = compute_diff(peer_state, &self.state, sketch.kind, which);
-        let total_diff = diff.a_only_count + diff.b_only_count;
-        let overflow = total_diff > sketch.capacity as usize;
+        let difference = diff.difference;
+        let overflow = difference > sketch.capacity as usize;
         self.metrics_local.sketches_received += 1;
         // Per-kind reconciliation stats.
         let kind_stats = match sketch.kind {
@@ -375,11 +375,15 @@ impl SketchNode {
             SketchKind::ChanAnns => &mut self.metrics_local.chan_anns_stats,
         };
         kind_stats.intersection += diff.intersection as u64;
+        kind_stats.difference += diff.difference as u64;
         kind_stats.a_only += diff.a_only_count as u64;
         kind_stats.b_only += diff.b_only_count as u64;
         kind_stats
             .rounds_intersection
             .observe(diff.intersection as u32);
+        kind_stats
+            .rounds_difference
+            .observe(diff.difference as u32);
         kind_stats
             .rounds_a_only
             .observe(diff.a_only_count as u32);
@@ -393,8 +397,8 @@ impl SketchNode {
                 SketchKind::NodeAnns => self.metrics_local.overflowed_node_anns += 1,
                 SketchKind::ChanAnns => self.metrics_local.overflowed_chan_anns += 1,
             }
-            let amount = (total_diff - sketch.capacity as usize) as u32;
-            let total_diff_u32 = total_diff as u32;
+            let amount = (difference - sketch.capacity as usize) as u32;
+            let difference_u32 = difference as u32;
             let time_ns = _cx
                 .time()
                 .duration_since(MonotonicTime::EPOCH)
@@ -405,7 +409,7 @@ impl SketchNode {
                 peer_id: sketch.from,
                 kind: sketch.kind,
                 amount,
-                total_diff: total_diff_u32,
+                difference: difference_u32,
             });
             return;
         }

@@ -617,6 +617,7 @@ struct PerKindAgg {
     intersection: MmStats,
     a_only: MmStats,
     b_only: MmStats,
+    difference: MmStats,
 }
 
 impl<'a> TryFrom<&Row<'a>> for PerKindAgg {
@@ -627,6 +628,7 @@ impl<'a> TryFrom<&Row<'a>> for PerKindAgg {
             intersection: MmStats::read(row, 1),
             a_only: MmStats::read(row, 6),
             b_only: MmStats::read(row, 11),
+            difference: MmStats::read(row, 16),
         })
     }
 }
@@ -643,6 +645,7 @@ fn print_sketch_reconciliation_per_kind(conn: &Connection) -> Result<()> {
         let i_col = format!("{prefix}_intersection");
         let a_col = format!("{prefix}_a_only");
         let b_col = format!("{prefix}_b_only");
+        let d_col = format!("{prefix}_difference");
         let sql = format!(
             "WITH latest AS (
                 SELECT *, ROW_NUMBER() OVER (PARTITION BY node_idx ORDER BY time_ns DESC) AS rn
@@ -655,7 +658,9 @@ fn print_sketch_reconciliation_per_kind(conn: &Connection) -> Result<()> {
               MIN({a_col}), quantile_cont({a_col}, 0.5), quantile_cont({a_col}, 0.95),
                 MAX({a_col}), SUM({a_col}),
               MIN({b_col}), quantile_cont({b_col}, 0.5), quantile_cont({b_col}, 0.95),
-                MAX({b_col}), SUM({b_col})
+                MAX({b_col}), SUM({b_col}),
+              MIN({d_col}), quantile_cont({d_col}, 0.5), quantile_cont({d_col}, 0.95),
+                MAX({d_col}), SUM({d_col})
             FROM finals"
         );
         let mut stmt = conn.prepare(&sql)?;
@@ -679,6 +684,7 @@ fn print_sketch_reconciliation_per_kind(conn: &Connection) -> Result<()> {
         };
         for (label, st) in [
             ("intersection", &agg.intersection),
+            ("difference", &agg.difference),
             ("a_only", &agg.a_only),
             ("b_only", &agg.b_only),
         ] {
@@ -698,7 +704,7 @@ struct RoundsDistribution {
     kind: u8,
     n: i64,
     /// 4 sets of (min, p50, p95, p99, max, mean) for intersection,
-    /// a_only, b_only, total_diff respectively.
+    /// difference, a_only, b_only respectively.
     cols: [RoundCol; 4],
 }
 
@@ -743,25 +749,21 @@ impl<'a> TryFrom<&Row<'a>> for RoundsDistribution {
 
 fn print_sketch_rounds_distribution(conn: &Connection) -> Result<()> {
     let sql = "
-        WITH d AS (
-            SELECT kind, intersection, a_only, b_only, (a_only + b_only) AS total_diff
-            FROM reservoirs
-        )
         SELECT
             kind, COUNT(*),
             MIN(intersection), quantile_cont(intersection, 0.5),
               quantile_cont(intersection, 0.95), quantile_cont(intersection, 0.99),
               MAX(intersection), AVG(intersection),
+            MIN(difference), quantile_cont(difference, 0.5),
+              quantile_cont(difference, 0.95), quantile_cont(difference, 0.99),
+              MAX(difference), AVG(difference),
             MIN(a_only), quantile_cont(a_only, 0.5),
               quantile_cont(a_only, 0.95), quantile_cont(a_only, 0.99),
               MAX(a_only), AVG(a_only),
             MIN(b_only), quantile_cont(b_only, 0.5),
               quantile_cont(b_only, 0.95), quantile_cont(b_only, 0.99),
-              MAX(b_only), AVG(b_only),
-            MIN(total_diff), quantile_cont(total_diff, 0.5),
-              quantile_cont(total_diff, 0.95), quantile_cont(total_diff, 0.99),
-              MAX(total_diff), AVG(total_diff)
-        FROM d GROUP BY kind ORDER BY kind";
+              MAX(b_only), AVG(b_only)
+        FROM reservoirs GROUP BY kind ORDER BY kind";
     let mut stmt = conn.prepare(sql)?;
     let rows: Vec<RoundsDistribution> = stmt
         .query_and_then([], |r| RoundsDistribution::try_from(r))?
@@ -777,7 +779,7 @@ fn print_sketch_rounds_distribution(conn: &Connection) -> Result<()> {
     for r in rows {
         let kind = sketch_kind_from_u8(r.kind).as_label();
         for (label, col) in
-            ["intersection", "a_only", "b_only", "total_diff"].iter().zip(&r.cols)
+            ["intersection", "difference", "a_only", "b_only"].iter().zip(&r.cols)
         {
             println!(
                 "  {:<14} {:>11} | {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10.1}",

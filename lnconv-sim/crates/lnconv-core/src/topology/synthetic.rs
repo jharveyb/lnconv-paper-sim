@@ -158,7 +158,7 @@ where
             // counterparties, but here we expect those nodes to connect to us, so we don't
             // need to add them as strangers ourselves.
             0
-        } else {
+        } else if c >= k.div_ceil(2) {
             // Halved (round
             // up) so OR-semantics edge union doesn't double mean
             // degree to ≈ 2k. Without inbound strangers these nodes
@@ -166,6 +166,8 @@ where
             // that's deemed acceptable because c >= 2 already gives
             // two natural channel-counterparty back-picks.
             (k - c).div_ceil(2)
+        } else {
+            (k - c - 1)
         };
         let strangers = if stranger_count > 0 {
             let mut excluded: HashSet<NodeIndex> = counterparties;

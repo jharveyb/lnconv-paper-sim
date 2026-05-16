@@ -64,11 +64,18 @@
 //!
 //! [`compute_diff`] returns both:
 //!
-//! * **Strict-difference counts** (`a_only_count` / `b_only_count` /
-//!   `intersection`) — same-key-different-ts pairs count as one
-//!   element on each side. Used for sketch capacity-overflow check
-//!   and per-direction metrics; matches how a real minisketch
-//!   would decode the symmetric difference.
+//! * **Diff counts** — `a_only_count` / `b_only_count` are keys
+//!   present on exactly one side (entirely absent from the other);
+//!   `intersection` is same-key-same-ts. `difference` is the full
+//!   `(key, ts)`-element symmetric-difference cardinality: one-sided
+//!   keys contribute 1 each, same-key-different-ts keys contribute
+//!   2 (one `(key, ts_a)` element on A, one `(key, ts_b)` on B —
+//!   each is a distinct sketch element). `difference` is what the
+//!   sketch capacity-overflow check compares against; `a_only` /
+//!   `b_only` are the directional breakdown for metrics. The wire
+//!   reply only ships the strictly-newer side of each mismatch
+//!   (see `a_newer` / `b_newer` below), but both sides still occupy
+//!   sketch capacity at diff time.
 //! * **Newer-only Gossips** (`a_newer` / `b_newer`) — items where
 //!   the named side has the strictly-newer version, eligible to be
 //!   sent back. The caller passes [`WhichSide`] to choose which
@@ -536,17 +543,30 @@ impl WhichSide {
 /// always populated; `a_newer` and `b_newer` are only populated for
 /// the side(s) requested via [`WhichSide`].
 pub struct DiffResult {
-    /// Number of items present in `a` but absent (or under a
-    /// different ts) in `b`. Includes `a`'s stale entries against
-    /// newer `b` entries.
+    /// Number of keys present **only** in `a` — entirely absent from
+    /// `b`. Keys present on both sides under a different ts are *not*
+    /// counted here; see `difference`.
     pub a_only_count: usize,
-    /// Number of items present in `b` but absent (or under a
-    /// different ts) in `a`. Includes `b`'s stale entries against
-    /// newer `a` entries.
+    /// Number of keys present **only** in `b` — entirely absent from
+    /// `a`. Keys present on both sides under a different ts are *not*
+    /// counted here; see `difference`.
     pub b_only_count: usize,
     /// Items where both sides have the same key with the same `ts`
     /// (or, for `chan_anns`, same key — no `ts`).
     pub intersection: usize,
+    /// Total symmetric-difference element count over `(key, ts)`
+    /// pairs — the number of sketch elements that would need to be
+    /// reconciled. A ts-mismatched key contributes **2** (one
+    /// `(key, ts_a)` element on A's side and one `(key, ts_b)` on B's
+    /// side — the sketch carries each separately, which is why
+    /// `state` keeps the per-side "only send newer" filter so stale
+    /// versions aren't actually transmitted). A key present on only
+    /// one side contributes 1. This is the quantity checked against
+    /// the sketch capacity. Equivalent to the old
+    /// `a_only_count + b_only_count` accounting, but tracked
+    /// independently now that those two fields only count one-sided
+    /// keys. Always `>= a_only_count + b_only_count`.
+    pub difference: usize,
     /// Subset of the diff that is **strictly newer on `a`'s side**.
     /// Empty when caller passed `WhichSide::B`.
     pub a_newer: Vec<Gossip>,
@@ -607,6 +627,7 @@ pub fn compute_diff(
             a_only_count: res.b_only_count,
             b_only_count: res.a_only_count,
             intersection: res.intersection,
+            difference: res.difference,
             a_newer: res.b_newer,
             b_newer: res.a_newer,
         }
@@ -622,6 +643,7 @@ fn diff_chan_updates(la: &DenseTsMap, lb: &DenseTsMap, which: WhichSide) -> Diff
     let mut a_only_count = 0usize;
     let mut b_only_count = 0usize;
     let mut intersection = 0usize;
+    let mut difference = 0usize;
     let difference_count_estimate = 512;
     let mut a_newer = if want_a {
         Vec::with_capacity(difference_count_estimate)
@@ -640,8 +662,15 @@ fn diff_chan_updates(la: &DenseTsMap, lb: &DenseTsMap, which: WhichSide) -> Diff
             if ts_a == ts_b {
                 intersection += 1;
             } else {
-                a_only_count += 1;
-                b_only_count += 1;
+                // Same key, different ts: two sketch elements to
+                // reconcile (one `(key, ts_a)` on A, one
+                // `(key, ts_b)` on B — each is its own `(key, value)`
+                // tuple in the sketch). Not an `a_only`/`b_only`
+                // key, since both sides do have the key. The wire
+                // reply only sends the strictly-newer side
+                // (`a_newer` / `b_newer`), but capacity-wise both
+                // elements have to fit.
+                difference += 2;
                 if ts_a > ts_b {
                     if want_a {
                         let (scid, dir) = unpack_cu_key(keys.key_at(i));
@@ -654,6 +683,7 @@ fn diff_chan_updates(la: &DenseTsMap, lb: &DenseTsMap, which: WhichSide) -> Diff
             }
         } else {
             a_only_count += 1;
+            difference += 1;
             if want_a {
                 let (scid, dir) = unpack_cu_key(keys.key_at(i));
                 a_newer.push(synth_chan_update(scid, dir, ts_a, keys.size_of(i, ts_a)));
@@ -662,6 +692,7 @@ fn diff_chan_updates(la: &DenseTsMap, lb: &DenseTsMap, which: WhichSide) -> Diff
     }
     for i in lb.present.difference(&la.present) {
         b_only_count += 1;
+        difference += 1;
         if want_b {
             let ts_b = lb.ts[i];
             let (scid, dir) = unpack_cu_key(keys.key_at(i));
@@ -672,6 +703,7 @@ fn diff_chan_updates(la: &DenseTsMap, lb: &DenseTsMap, which: WhichSide) -> Diff
         a_only_count,
         b_only_count,
         intersection,
+        difference,
         a_newer,
         b_newer,
     }
@@ -684,6 +716,7 @@ fn diff_node_anns(la: &DenseTsMap, lb: &DenseTsMap, which: WhichSide) -> DiffRes
     let mut a_only_count = 0usize;
     let mut b_only_count = 0usize;
     let mut intersection = 0usize;
+    let mut difference = 0usize;
     let difference_count_estimate = 256;
     let mut a_newer = if want_a {
         Vec::with_capacity(difference_count_estimate)
@@ -702,8 +735,10 @@ fn diff_node_anns(la: &DenseTsMap, lb: &DenseTsMap, which: WhichSide) -> DiffRes
             if ts_a == ts_b {
                 intersection += 1;
             } else {
-                a_only_count += 1;
-                b_only_count += 1;
+                // Same key, different ts: two sketch elements (one
+                // per `(key, ts)` tuple). See `diff_chan_updates`
+                // for the full rationale.
+                difference += 2;
                 if ts_a > ts_b {
                     if want_a {
                         a_newer.push(synth_node_ann(keys.key_at(i), ts_a, keys.size_of(i, ts_a)));
@@ -714,6 +749,7 @@ fn diff_node_anns(la: &DenseTsMap, lb: &DenseTsMap, which: WhichSide) -> DiffRes
             }
         } else {
             a_only_count += 1;
+            difference += 1;
             if want_a {
                 a_newer.push(synth_node_ann(keys.key_at(i), ts_a, keys.size_of(i, ts_a)));
             }
@@ -721,6 +757,7 @@ fn diff_node_anns(la: &DenseTsMap, lb: &DenseTsMap, which: WhichSide) -> DiffRes
     }
     for i in lb.present.difference(&la.present) {
         b_only_count += 1;
+        difference += 1;
         if want_b {
             let ts_b = lb.ts[i];
             b_newer.push(synth_node_ann(keys.key_at(i), ts_b, keys.size_of(i, ts_b)));
@@ -730,6 +767,7 @@ fn diff_node_anns(la: &DenseTsMap, lb: &DenseTsMap, which: WhichSide) -> DiffRes
         a_only_count,
         b_only_count,
         intersection,
+        difference,
         a_newer,
         b_newer,
     }
@@ -741,6 +779,7 @@ fn diff_chan_anns(la: &DenseChanAnns, lb: &DenseChanAnns, which: WhichSide) -> D
     let keys = &la.keys;
     let mut a_only_count = 0usize;
     let mut intersection = 0usize;
+    let mut difference = 0usize;
     let difference_count_estimate = 128;
     let mut a_newer = if want_a {
         Vec::with_capacity(difference_count_estimate)
@@ -757,6 +796,7 @@ fn diff_chan_anns(la: &DenseChanAnns, lb: &DenseChanAnns, which: WhichSide) -> D
             intersection += 1;
         } else {
             a_only_count += 1;
+            difference += 1;
             if want_a {
                 a_newer.push(synth_chan_ann(keys.key_at(i), keys.size_at(i)));
             }
@@ -765,6 +805,7 @@ fn diff_chan_anns(la: &DenseChanAnns, lb: &DenseChanAnns, which: WhichSide) -> D
     let mut b_only_count = 0usize;
     for i in lb.present.difference(&la.present) {
         b_only_count += 1;
+        difference += 1;
         if want_b {
             b_newer.push(synth_chan_ann(keys.key_at(i), keys.size_at(i)));
         }
@@ -773,6 +814,7 @@ fn diff_chan_anns(la: &DenseChanAnns, lb: &DenseChanAnns, which: WhichSide) -> D
         a_only_count,
         b_only_count,
         intersection,
+        difference,
         a_newer,
         b_newer,
     }
@@ -949,8 +991,11 @@ mod tests {
         write_cu(&b, 100, 0, 11, 64);
         let d = compute_diff(&a, &b, SketchKind::ChanUpdates, WhichSide::Both);
         assert_eq!(d.intersection, 0);
-        assert_eq!(d.a_only_count, 1);
-        assert_eq!(d.b_only_count, 1);
+        // Same key, different ts: two sketch elements (`(key, ts_a)`
+        // + `(key, ts_b)`), not an a-only/b-only key.
+        assert_eq!(d.a_only_count, 0);
+        assert_eq!(d.b_only_count, 0);
+        assert_eq!(d.difference, 2);
         assert!(d.a_newer.is_empty());
         assert_eq!(d.b_newer.len(), 1);
         assert_eq!(d.b_newer[0].timestamp, 11);
@@ -963,8 +1008,11 @@ mod tests {
         write_cu(&a, 100, 0, 10, 64);
         write_cu(&b, 100, 0, 15, 64);
         let d = compute_diff(&a, &b, SketchKind::ChanUpdates, WhichSide::Both);
-        let total = d.a_only_count + d.b_only_count;
-        assert_eq!(total, 2);
+        // A ts-mismatched key contributes 2 to `difference` — both
+        // `(key, ts_a)` and `(key, ts_b)` occupy a sketch slot.
+        assert_eq!(d.difference, 2);
+        assert_eq!(d.a_only_count, 0);
+        assert_eq!(d.b_only_count, 0);
         assert_eq!(d.b_newer.len(), 1);
     }
 
@@ -991,8 +1039,11 @@ mod tests {
         write_na(&a, 555, 100, 200);
         write_na(&b, 555, 200, 200);
         let d = compute_diff(&a, &b, SketchKind::NodeAnns, WhichSide::Both);
-        assert_eq!(d.a_only_count, 1);
-        assert_eq!(d.b_only_count, 1);
+        // Same key, different ts: two sketch elements, no
+        // a-only/b-only.
+        assert_eq!(d.a_only_count, 0);
+        assert_eq!(d.b_only_count, 0);
+        assert_eq!(d.difference, 2);
         assert!(d.a_newer.is_empty());
         assert_eq!(d.b_newer.len(), 1);
         assert_eq!(d.b_newer[0].timestamp, 200);

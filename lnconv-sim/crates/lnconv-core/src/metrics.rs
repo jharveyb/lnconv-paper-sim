@@ -138,6 +138,7 @@ pub struct NodeCounters {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct KindCounters {
     pub intersection: u64,
+    pub difference: u64,
     pub a_only: u64,
     pub b_only: u64,
 }
@@ -146,6 +147,7 @@ impl From<&SketchKindStats> for KindCounters {
     fn from(s: &SketchKindStats) -> Self {
         Self {
             intersection: s.intersection,
+            difference: s.difference,
             a_only: s.a_only,
             b_only: s.b_only,
         }
@@ -158,6 +160,7 @@ impl From<&SketchKindStats> for KindCounters {
 #[derive(Debug, Default)]
 pub struct KindReservoirSamples {
     pub intersection: Vec<u32>,
+    pub difference: Vec<u32>,
     pub a_only: Vec<u32>,
     pub b_only: Vec<u32>,
     /// Total observation count (so the writer can record how many
@@ -178,9 +181,11 @@ pub struct KindReservoirSamples {
 #[derive(Clone, Debug, Default)]
 pub struct SketchKindStats {
     pub intersection: u64,
+    pub difference: u64,
     pub a_only: u64,
     pub b_only: u64,
     pub rounds_intersection: Reservoir<u32>,
+    pub rounds_difference: Reservoir<u32>,
     pub rounds_a_only: Reservoir<u32>,
     pub rounds_b_only: Reservoir<u32>,
 }
@@ -192,11 +197,13 @@ impl SketchKindStats {
         let cap = cap as usize;
         Self {
             intersection: 0,
+            difference: 0,
             a_only: 0,
             b_only: 0,
             rounds_intersection: Reservoir::new(cap, seed ^ 0xA1),
             rounds_a_only: Reservoir::new(cap, seed ^ 0xA2),
             rounds_b_only: Reservoir::new(cap, seed ^ 0xA3),
+            rounds_difference: Reservoir::new(cap, seed ^ 0xA4),
         }
     }
 
@@ -211,12 +218,15 @@ impl SketchKindStats {
         let intersection =
             std::mem::replace(&mut self.rounds_intersection, Reservoir::new(0, 0))
                 .into_inner();
+        let difference =
+            std::mem::replace(&mut self.rounds_difference, Reservoir::new(0, 0)).into_inner();
         let a_only =
             std::mem::replace(&mut self.rounds_a_only, Reservoir::new(0, 0)).into_inner();
         let b_only =
             std::mem::replace(&mut self.rounds_b_only, Reservoir::new(0, 0)).into_inner();
         KindReservoirSamples {
             intersection,
+            difference,
             a_only,
             b_only,
             total_seen,
@@ -262,12 +272,12 @@ pub struct OverflowEvent {
     /// `NodeId` of the peer that sent the overflowing sketch.
     pub peer_id: NodeId,
     pub kind: SketchKind,
-    /// `total_diff - sketch.capacity` — how far over the configured
+    /// `difference - sketch.capacity` — how far over the configured
     /// capacity the actual diff went.
     pub amount: u32,
-    /// `a_only + b_only` — the strict-diff total that triggered the
-    /// overflow. Useful context for tuning capacity.
-    pub total_diff: u32,
+    /// The symmetric-difference key count that triggered the overflow
+    /// (`DiffResult::difference`). Useful context for tuning capacity.
+    pub difference: u32,
 }
 
 #[derive(Clone, Debug, Default)]

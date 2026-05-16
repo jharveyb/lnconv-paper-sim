@@ -138,12 +138,15 @@ pub struct NodeCountersRow {
     pub overflowed_node_anns: u64,
     pub overflowed_chan_anns: u64,
     pub chan_updates_intersection: u64,
+    pub chan_updates_difference: u64,
     pub chan_updates_a_only: u64,
     pub chan_updates_b_only: u64,
     pub node_anns_intersection: u64,
+    pub node_anns_difference: u64,
     pub node_anns_a_only: u64,
     pub node_anns_b_only: u64,
     pub chan_anns_intersection: u64,
+    pub chan_anns_difference: u64,
     pub chan_anns_a_only: u64,
     pub chan_anns_b_only: u64,
 }
@@ -172,12 +175,15 @@ impl NodeCountersRow {
             overflowed_node_anns: c.overflowed_node_anns,
             overflowed_chan_anns: c.overflowed_chan_anns,
             chan_updates_intersection: c.chan_updates.intersection,
+            chan_updates_difference: c.chan_updates.difference,
             chan_updates_a_only: c.chan_updates.a_only,
             chan_updates_b_only: c.chan_updates.b_only,
             node_anns_intersection: c.node_anns.intersection,
+            node_anns_difference: c.node_anns.difference,
             node_anns_a_only: c.node_anns.a_only,
             node_anns_b_only: c.node_anns.b_only,
             chan_anns_intersection: c.chan_anns.intersection,
+            chan_anns_difference: c.chan_anns.difference,
             chan_anns_a_only: c.chan_anns.a_only,
             chan_anns_b_only: c.chan_anns.b_only,
         }
@@ -190,6 +196,7 @@ pub struct NodeReservoirRow {
     /// `0 = chan_updates`, `1 = node_anns`, `2 = chan_anns`.
     pub kind: u8,
     pub intersection: u32,
+    pub difference: u32,
     pub a_only: u32,
     pub b_only: u32,
     pub total_seen: u64,
@@ -202,7 +209,7 @@ pub struct OverflowEventRow {
     pub peer_id: NodeId,
     pub kind: u8,
     pub amount: u32,
-    pub total_diff: u32,
+    pub difference: u32,
 }
 
 impl OverflowEventRow {
@@ -213,7 +220,7 @@ impl OverflowEventRow {
             peer_id: e.peer_id,
             kind: e.kind.as_u8(),
             amount: e.amount,
-            total_diff: e.total_diff,
+            difference: e.difference,
         }
     }
 }
@@ -356,12 +363,15 @@ impl WriteRow for NodeCountersRow {
             Field::new("overflowed_node_anns", DataType::UInt64, false),
             Field::new("overflowed_chan_anns", DataType::UInt64, false),
             Field::new("chan_updates_intersection", DataType::UInt64, false),
+            Field::new("chan_updates_difference", DataType::UInt64, false),
             Field::new("chan_updates_a_only", DataType::UInt64, false),
             Field::new("chan_updates_b_only", DataType::UInt64, false),
             Field::new("node_anns_intersection", DataType::UInt64, false),
+            Field::new("node_anns_difference", DataType::UInt64, false),
             Field::new("node_anns_a_only", DataType::UInt64, false),
             Field::new("node_anns_b_only", DataType::UInt64, false),
             Field::new("chan_anns_intersection", DataType::UInt64, false),
+            Field::new("chan_anns_difference", DataType::UInt64, false),
             Field::new("chan_anns_a_only", DataType::UInt64, false),
             Field::new("chan_anns_b_only", DataType::UInt64, false),
         ]))
@@ -392,12 +402,15 @@ impl WriteRow for NodeCountersRow {
         let mut o_na = UInt64Builder::with_capacity(n);
         let mut o_ca = UInt64Builder::with_capacity(n);
         let mut cu_i = UInt64Builder::with_capacity(n);
+        let mut cu_d = UInt64Builder::with_capacity(n);
         let mut cu_a = UInt64Builder::with_capacity(n);
         let mut cu_b = UInt64Builder::with_capacity(n);
         let mut na_i = UInt64Builder::with_capacity(n);
+        let mut na_d = UInt64Builder::with_capacity(n);
         let mut na_a = UInt64Builder::with_capacity(n);
         let mut na_b = UInt64Builder::with_capacity(n);
         let mut ca_i = UInt64Builder::with_capacity(n);
+        let mut ca_d = UInt64Builder::with_capacity(n);
         let mut ca_a = UInt64Builder::with_capacity(n);
         let mut ca_b = UInt64Builder::with_capacity(n);
         for r in rows {
@@ -422,12 +435,15 @@ impl WriteRow for NodeCountersRow {
             o_na.append_value(r.overflowed_node_anns);
             o_ca.append_value(r.overflowed_chan_anns);
             cu_i.append_value(r.chan_updates_intersection);
+            cu_d.append_value(r.chan_updates_difference);
             cu_a.append_value(r.chan_updates_a_only);
             cu_b.append_value(r.chan_updates_b_only);
             na_i.append_value(r.node_anns_intersection);
+            na_d.append_value(r.node_anns_difference);
             na_a.append_value(r.node_anns_a_only);
             na_b.append_value(r.node_anns_b_only);
             ca_i.append_value(r.chan_anns_intersection);
+            ca_d.append_value(r.chan_anns_difference);
             ca_a.append_value(r.chan_anns_a_only);
             ca_b.append_value(r.chan_anns_b_only);
         }
@@ -453,12 +469,15 @@ impl WriteRow for NodeCountersRow {
             Arc::new(o_na.finish()),
             Arc::new(o_ca.finish()),
             Arc::new(cu_i.finish()),
+            Arc::new(cu_d.finish()),
             Arc::new(cu_a.finish()),
             Arc::new(cu_b.finish()),
             Arc::new(na_i.finish()),
+            Arc::new(na_d.finish()),
             Arc::new(na_a.finish()),
             Arc::new(na_b.finish()),
             Arc::new(ca_i.finish()),
+            Arc::new(ca_d.finish()),
             Arc::new(ca_a.finish()),
             Arc::new(ca_b.finish()),
         ];
@@ -472,6 +491,7 @@ impl WriteRow for NodeReservoirRow {
             Field::new("node_idx", DataType::UInt32, false),
             Field::new("kind", DataType::UInt8, false),
             Field::new("intersection", DataType::UInt32, false),
+            Field::new("difference", DataType::UInt32, false),
             Field::new("a_only", DataType::UInt32, false),
             Field::new("b_only", DataType::UInt32, false),
             Field::new("total_seen", DataType::UInt64, false),
@@ -483,6 +503,7 @@ impl WriteRow for NodeReservoirRow {
         let mut node_idx = UInt32Builder::with_capacity(n);
         let mut kind = UInt8Builder::with_capacity(n);
         let mut intersection = UInt32Builder::with_capacity(n);
+        let mut difference = UInt32Builder::with_capacity(n);
         let mut a_only = UInt32Builder::with_capacity(n);
         let mut b_only = UInt32Builder::with_capacity(n);
         let mut total_seen = UInt64Builder::with_capacity(n);
@@ -490,6 +511,7 @@ impl WriteRow for NodeReservoirRow {
             node_idx.append_value(r.node_idx);
             kind.append_value(r.kind);
             intersection.append_value(r.intersection);
+            difference.append_value(r.difference);
             a_only.append_value(r.a_only);
             b_only.append_value(r.b_only);
             total_seen.append_value(r.total_seen);
@@ -498,6 +520,7 @@ impl WriteRow for NodeReservoirRow {
             Arc::new(node_idx.finish()),
             Arc::new(kind.finish()),
             Arc::new(intersection.finish()),
+            Arc::new(difference.finish()),
             Arc::new(a_only.finish()),
             Arc::new(b_only.finish()),
             Arc::new(total_seen.finish()),
@@ -514,7 +537,7 @@ impl WriteRow for OverflowEventRow {
             Field::new("peer_id", DataType::UInt64, false),
             Field::new("kind", DataType::UInt8, false),
             Field::new("amount", DataType::UInt32, false),
-            Field::new("total_diff", DataType::UInt32, false),
+            Field::new("difference", DataType::UInt32, false),
         ]))
     }
 
@@ -525,14 +548,14 @@ impl WriteRow for OverflowEventRow {
         let mut peer_id = UInt64Builder::with_capacity(n);
         let mut kind = UInt8Builder::with_capacity(n);
         let mut amount = UInt32Builder::with_capacity(n);
-        let mut total_diff = UInt32Builder::with_capacity(n);
+        let mut difference = UInt32Builder::with_capacity(n);
         for r in rows {
             time_ns.append_value(r.time_ns);
             receiver_idx.append_value(r.receiver_idx);
             peer_id.append_value(r.peer_id);
             kind.append_value(r.kind);
             amount.append_value(r.amount);
-            total_diff.append_value(r.total_diff);
+            difference.append_value(r.difference);
         }
         let columns: Vec<ArrayRef> = vec![
             Arc::new(time_ns.finish()),
@@ -540,7 +563,7 @@ impl WriteRow for OverflowEventRow {
             Arc::new(peer_id.finish()),
             Arc::new(kind.finish()),
             Arc::new(amount.finish()),
-            Arc::new(total_diff.finish()),
+            Arc::new(difference.finish()),
         ];
         RecordBatch::try_new(Self::schema(), columns).expect("OverflowEventRow batch")
     }
