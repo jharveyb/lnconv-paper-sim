@@ -7,10 +7,10 @@ channels_csv = "init_data/channel_list.csv"
 enforce_hub_cap = true
 
 [topology.k]
-sketch = 4
+sketch = 7
 
 [topology.max_peer]
-sketch = 8
+sketch = 125
 
 [algo]
 kind = "sketch"

@@ -10,7 +10,7 @@ enforce_hub_cap = true
 sketch = 5
 
 [topology.max_peer]
-sketch = 8
+sketch = 125
 
 [algo]
 kind = "sketch"
