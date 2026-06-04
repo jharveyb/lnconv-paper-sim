@@ -158,14 +158,15 @@ where
             // counterparties, but here we expect those nodes to connect to us, so we don't
             // need to add them as strangers ourselves.
             0
-        } else if c >= k.div_ceil(2) {
+        } else if c > 2 {
             // Halved (round
-            // up) so OR-semantics edge union doesn't double mean
+            // down) so OR-semantics edge union doesn't double mean
             // degree to ≈ 2k. Without inbound strangers these nodes
             // can land slightly below k (e.g. k=4,c=2 → 3 outgoing);
-            // that's deemed acceptable because c >= 2 already gives
+            // that's deemed acceptable because c > 2 already gives
             // two natural channel-counterparty back-picks.
-            (k - c).div_ceil(2)
+            (k - c) / 2
+            // Nodes without many channels (1 or 2 channels)
         } else {
             (k - c - 1)
         };
