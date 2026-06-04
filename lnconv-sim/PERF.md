@@ -95,7 +95,7 @@ cargo bench -p lnconv-core --bench diff 2>&1 | tee /tmp/before.txt
 git stash pop
 cargo bench -p lnconv-core --bench diff 2>&1 | tee /tmp/after.txt
 
-diff -u /tmp/before.txt /tmp/after.txt
+diff -u --color=always /tmp/before.txt /tmp/after.txt
 ```
 
 ### When to add benches for a new helper
